@@ -1,0 +1,164 @@
+# StrikeEdge backend — test suites
+
+StrikeEdge is the standalone Box-arbitrage backend extracted from CalSpread. PostgreSQL is
+the operational authority; MongoDB is an async replica fed by a bounded outbox. The test
+suites below reflect that architecture. Where CalSpread proved a guarantee against MongoDB,
+StrikeEdge proves the SAME guarantee against PostgreSQL.
+
+Run everything with a local PostgreSQL and (for the outbox projector) MongoDB reachable:
+
+```
+export DATABASE_URL=postgres://strikedge:strikedge@127.0.0.1:55432/strikedge
+export MONGODB_URI=mongodb://127.0.0.1:57017/strikedge_test
+npm run build
+npm run test:unit        # tests/box/**   — pure/offline Box engine unit suite
+npm run test:pg          # tests/pg/**     — real-PostgreSQL integration (fails loud if PG is down)
+npm run test:projector   # tests/projector/** — Mongo outbox projector
+npm run test:tokens      # tests/tokens/** — broker-token acquisition/rotation/redaction
+npm run test:access      # tests/access/** — site passcode gate (replaces the admin-token layer)
+npm run test:switch      # tests/switch/** — broker switch / durable generation
+npm run test:shutdown    # tests/shutdown/** — graceful shutdown coordinator + declared order
+```
+
+## What each suite covers
+
+| Suite | Directory | Covers |
+|-------|-----------|--------|
+| unit | `tests/box/` | The Box engine: math, execution, order manager, calibration, reservations (algorithm), Dhan support, projection bookkeeping, config invariants. Pure/offline except the daily-risk index probe (see below), which reads a throwaway PostgreSQL schema. |
+| pg | `tests/pg/` | Real-PostgreSQL authority: reservation port (fences, all-or-none, TTL/expiry, release, GC), order-intent CAS, residual-projection CAS, trades/crash-recovery, one-shot session. Fails LOUDLY if PostgreSQL is unreachable — it never skips silently. |
+| projector | `tests/projector/` | The bounded Mongo outbox projector and its resilience/secret-redaction guarantees. |
+| tokens | `tests/tokens/` | Outbound broker-token acquisition, key rotation, IST clock, redaction, provider client. |
+| access | `tests/access/` | The site passcode gate (`src/access/*`) — cookies, CSRF, rate limit, session store, middleware. |
+| switch | `tests/switch/` | Broker switching and durable generation fencing. |
+| shutdown | `tests/shutdown/` | The `ShutdownCoordinator` behaviour and the declared step ORDER in `src/index.ts`. |
+
+## Test files removed during the extraction, and why
+
+Three ported CalSpread test files targeted modules that StrikeEdge deliberately did NOT copy.
+Deleting them is correct: a test importing a `dist/*.js` that will never exist is not coverage.
+
+| Removed file | Why | Where the coverage lives now |
+|--------------|-----|------------------------------|
+| `tests/box/adminToken.test.mjs` | StrikeEdge REPLACED CalSpread's admin-token layer with the site passcode gate. `src/adminToken.ts` was not copied, so `dist/adminToken.js` never exists. | `tests/access/` (19 tests) — the passcode gate that supersedes the admin token bearer credential. |
+| `tests/box/tokenRouteAuth.test.mjs` | StrikeEdge is a CONSUMER of CalSpread's broker-token routes, not a host of them. `src/tokenRouteAuth.ts` was not copied. | `tests/tokens/providerClient.test.mjs` — the outbound counterpart (StrikeEdge calling the token provider). |
+| `tests/box/mongoReservationIntegration.test.mjs` | Exercised the DELETED `src/box/reservations/mongoStore.ts` (MI1–MI10). PostgreSQL owns reservations now; the Mongo store no longer exists, so these could never pass again. | `tests/pg/reservations.test.mjs` — see the one-to-one map below. |
+
+### Tests trimmed (not deleted)
+
+- **`tests/box/dhanSupport.test.mjs`** — the six `/* history */` tests exercised
+  `dhanCandlesToRows` / `chunkDateRange` from `src/brokers/history.ts`, the Kite historical-charts
+  provider that StrikeEdge does not ship. Only those six were removed:
+  "Dhan's COLUMN-wise candles transpose into rows", "candles come back oldest-first",
+  "a candle with a bad timestamp is dropped", "missing columns become 0",
+  "long ranges chunk", "a range within the limit is a single chunk".
+  Every other Dhan assertion (segments, token identity, CSV parsing, charges, auth, errors,
+  instrument-master quality filtering) is in scope and retained — the file passes with 38 tests.
+
+- **`tests/box/executionAttemptProjection.test.mjs`** — the five `real Mongo:` env-gated tests were
+  removed with the Mongo store and their SQL equivalents written (see map). The offline
+  "every daily-risk seed branch is bounded and index-ordered" test was REWRITTEN (see below).
+
+## The obsolete Mongo integration tests → their PostgreSQL equivalents
+
+All 17 previously-skipped tests were `BOX_TEST_MONGODB_URI`-gated tests of stores that no longer
+exist (the Mongo reservation store and the Mongo order-intent/projection CAS). A test that skips
+because its subject was deleted looks like coverage while proving nothing, so each was deleted and
+mapped one-to-one to a real-PostgreSQL test. Where no equivalent existed, the missing test was
+WRITTEN (marked ✚).
+
+### From `mongoReservationIntegration.test.mjs` (10) → `tests/pg/reservations.test.mjs`
+
+| Deleted Mongo case | PostgreSQL equivalent |
+|--------------------|-----------------------|
+| MI1 unique multikey index enforces one contract, one reservation | "concurrent acquisition of an overlapping set is all-or-none: one winner" (UNIQUE(deployment,broker,instrument_key); the loser leaves NO key rows) |
+| MI2 the unique index is actually created and unique | "ensureReady verifies the schema and answers the clock" + the all-or-none test proving the unique key rejects the overlap |
+| MI3 200 concurrent overlapping acquisitions, exactly one winner | "concurrent acquisition of an overlapping set is all-or-none: one winner" (a single transaction rolls back on the first conflicting key) |
+| MI4 unrelated boxes execute concurrently | "concurrent acquisition of an overlapping set is all-or-none" (non-overlapping keys both insert) + "deleteByOwnerPrefix removes only this process's leases" |
+| MI5 crashed worker's lease reclaimed after TTL, not before | "expiry boundary: a lapsed lease cannot be renewed" + "deleteExpired garbage-collects only lapsed owners, never live ones" (expiry decided from the stored `expiresAt`, not a background monitor) |
+| MI6 a stale owner cannot release the new owner's reservation | "release requires exact owner AND fence" (wrong fence releases nothing) |
+| MI7 renewal keeps a challenger out until the renewed expiry passes | "renewal is guarded by owner + fence + not-expired" |
+| MI8 fencing token monotonic; server clock is authority | "fences are strictly increasing and monotonic" + "ensureReady … answers the clock" (`serverTimeMs` from `clock_timestamp()`) |
+| MI9 measured durable acquisition latency | Not reproduced — a benchmark, not a correctness guarantee. Latency is not a behaviour to pin; it is reported at runtime. (Justified omission, not a coverage gap.) |
+| MI10 cleanup — drop throwaway collections | N/A — the pg harness gives each file its own schema and `teardown()` drops it. |
+
+### From `fillAttribution.test.mjs` A11/A11b (2) → `tests/pg/orderIntentCas.test.mjs`
+
+| Deleted Mongo case | PostgreSQL equivalent |
+|--------------------|-----------------------|
+| A11 concurrent guarded updates report deltas that sum to the final cumulative quantity | "two concurrent CAS writers: exactly one wins the same fill" + "concurrent DISTINCT fills: deltas sum to final cumulative" (durable deltas summed under `SELECT … FOR UPDATE`) |
+| A11b the pre-image is stamped by the same atomic write; a replay reports a zero-width transition | "idempotent audit replay does not double-append or double-count" (replay reports current−previous = 0) |
+
+### From `executionAttemptProjection.test.mjs` real-Mongo (5)
+
+| Deleted Mongo case | PostgreSQL equivalent |
+|--------------------|-----------------------|
+| real Mongo: concurrent projection writers apply one charge/version | ✚ `tests/pg/projectionCas.test.mjs` "concurrent projection writers apply one version and record the charge exactly once" |
+| real Mongo: a physically legacy row accepts one version-zero CAS | ✚ `tests/pg/projectionCas.test.mjs` "a legacy row with a NULL projection_version accepts exactly one version-zero CAS" |
+| real Mongo: recovery index established and duplicate unresolved rows fail closed | `tests/pg/tradesAndRecovery.test.mjs` "single unresolved crash-recovery attempt: the partial unique index admits exactly one" (`box_single_unresolved_crash_recovery` partial UNIQUE index) |
+| real Mongo: crash-only recovery adopts existing boundary across snapshot changes | `tests/pg/tradesAndRecovery.test.mjs` "single unresolved crash-recovery attempt …" (a second `ensureBoxRecoveryExecutionAttempt` adopts the same row rather than minting a competitor) |
+| real Mongo: the bounded daily-risk seed is indexed and counts an overlapping row once | ✚ replaced by `tests/box/executionAttemptProjection.test.mjs` "the daily-risk seed's supporting indexes actually exist in PostgreSQL (pg_indexes)" — asserts the indexes against `pg_indexes`, plus the dedup-by-id assertion in the SQL-source test |
+
+## Tests WRITTEN to close a coverage gap
+
+- ✚ **`tests/pg/projectionCas.test.mjs`** (new file, 3 tests). The residual-projection CAS
+  (`applyBoxExecutionAttemptProjection`) had NO PostgreSQL test — only the two deleted Mongo ones.
+  Added: concurrent writers apply one version/charge exactly once; a legacy (NULL identity)
+  row accepts exactly one version-zero CAS; a stale expected version is rejected without mutating
+  the row.
+- ✚ **`tests/box/executionAttemptProjection.test.mjs`** "the daily-risk seed's supporting indexes
+  actually exist in PostgreSQL (pg_indexes)" — proves, against PostgreSQL's own catalog, the three
+  indexes the seed's `ORDER BY` relies on.
+
+## The rewritten daily-risk seed test
+
+`tests/box/executionAttemptProjection.test.mjs` — "every daily-risk seed branch is bounded and
+index-ordered (SQL source)" + the pg_indexes probe. The original asserted on the literal Mongoose
+query text (`.sort()/.limit()/$or`) and a `boxExecutionAttemptSchema.index(...)` call in the old
+`model.ts`; both are gone by design. The rewrite pins the SAME behavioural guarantee against the
+SQL implementation (`loadBoxLiveRiskSeed`, migration 002):
+
+1. **Bounded** — no `$or`; every one of the three attempt reads carries `LIMIT $n`
+   (`BOX_DAILY_RISK_SEED_LIMIT`), so no branch can scan the whole table.
+2. **Index-ordered** — each bounded read is ordered so truncation drops the least significant rows:
+   - day-scoped: `WHERE flatten_charge_day = $1 ORDER BY flatten_charges_for_day DESC`
+   - resolved-today: `WHERE resolved_at >= $1 ORDER BY resolved_at DESC`
+   - still-unresolved: `WHERE resolved = false ORDER BY resolved_at DESC`
+3. **Deduplicated by id** — overlapping branches merge via `attemptsById.set(r._id, r)`, so a day
+   is never charged twice.
+4. **Indexes actually exist** — asserted by querying `pg_indexes` (strictly stronger than matching
+   source text): `box_execution_attempt_flatten_charge_day (flatten_charge_day, flatten_charges_for_day DESC)`,
+   `box_execution_attempts_resolved_at_idx (resolved_at DESC)`,
+   `box_execution_attempts_resolved_idx (resolved, resolved_at DESC)`.
+
+## A behavioural fix made in `src/box/repository.ts`
+
+The projection-CAS pg test revealed a genuine gap in `applyBoxExecutionAttemptProjection`. The
+version-zero legacy-adoption fallback compared the stored residual to the command's expected
+residual with a raw `JSON.stringify(...) === JSON.stringify(...)`. PostgreSQL stores
+`residual_exposure` as `jsonb`, which does NOT preserve object key order, so that byte-for-byte
+comparison never matched a multi-field leg — a legacy row could never be adopted in production.
+The fix compares residual CONTENT via `residualProjectionIdentity(...)`, which canonicalises the
+field set and array order (the same order-independent identity used everywhere else). This
+restores the exact guarantee the deleted Mongo test proved.
+
+## The shutdown suite (`tests/shutdown/coordinator.test.mjs`)
+
+`ShutdownCoordinator` is driven directly with recording/fake steps (importing `src/index.ts` would
+boot a server). A separate group parses the declared step names out of `src/index.ts` to pin the
+ordering that cannot be executed offline. Cases:
+
+- steps run in the declared order;
+- a second signal is idempotent and BOTH callers observe the same result object;
+- a step that throws does not prevent later steps (especially the database closes);
+- PostgreSQL is closed LAST, after every other step including a throwing one;
+- the deadline is honoured and produces a NON-ZERO exit code (virtual clock);
+- SIGTERM NEVER calls anything that could flatten a position (flatten spy asserted uncalled);
+- the Mongo flush is BOUNDED — one `runOnce()` pass, not drain-until-empty;
+- (source) the declared order matches the specified order:
+  block new Box entry → stop scanner discovery → stop mutating HTTP → stop token polling →
+  stop market-data subscriptions/socket → stop monitoring/timers → flush bounded Mongo outbox →
+  close HTTP/SSE → close Mongo → close PostgreSQL last;
+- (source) PostgreSQL is the last declared step and Mongo precedes it;
+- (source) the outbox flush is declared as BOUNDED;
+- (source) NO declared step names a flatten/liquidate/close-position action.
+```
