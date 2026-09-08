@@ -1,0 +1,300 @@
+# StrikeEdge extraction manifest
+
+This is the authoritative record of how StrikeEdge was extracted from CalSpread:
+what was copied, what was adapted, what was deliberately left behind, and every
+contract that changed. It is generated against the source trees and verified
+against the target code, not from memory.
+
+## 1. Commit SHAs
+
+| Repo | Role | SHA |
+| --- | --- | --- |
+| `Cal_Spread` | CalSpread frontend (source, READ ONLY) | `3ac5abe07a9e580a0ecc0c8c173aff7dff346184` |
+| `Cal_Spread_Backend` | CalSpread backend (source, READ ONLY) | `803ffe58a25d5ad5d42023d8c063d419b058da56` |
+| `Strikedge_B` | StrikeEdge backend (target) | HEAD at time of writing: `ec944b6b613b0fa2addbcc1c04e18d91e1d4f52d` |
+
+The **final** target SHA is the last commit on `main`; this document is committed
+before that final commit, so treat the tip of `main` as the definitive target.
+
+## 2. Copied source files
+
+Classification is mechanical: each `src/**` file in the target was compared with
+`Cal_Spread_Backend/src/<same path>` using `diff -q`. Identical ⇒ **verbatim**;
+present-but-different ⇒ **adapted**; absent in source ⇒ **new**.
+
+### 2a. Copied verbatim (byte-for-byte identical to source)
+
+These carry the CalSpread behaviour unchanged. The Box strategy core — the
+mathematics, execution simulation, calibration, order lifecycle, reservations
+port, charge cards and broker adapters — is here, which is why the migration
+fixtures still pin the same numbers.
+
+```
+boundedCache.ts, hub.ts, indexSpot.ts, marketDataSession.ts, ratelimit.ts,
+shutdown.ts, ticker.ts, trackedTimers.ts
+
+box/LIVE_EXECUTION.md, box/boxCapital.ts, box/brokerAdapter.ts,
+box/brokerContext.ts, box/brokerPacing.ts, box/brokerTimingStore.ts,
+box/calibratedLatencySource.ts, box/calibrationPersistence.ts,
+box/chargeReconciler.ts, box/charges.ts, box/config.ts, box/dhanBrokerAdapter.ts,
+box/entrySubmissionOrder.ts, box/executionAttemptProjection.ts,
+box/executionCalibration.ts, box/executionClock.ts, box/executionCoordinator.ts,
+box/executionEnvironment.ts, box/executionFaults.ts, box/executionGateway.ts,
+box/executionOutcomes.ts, box/executionPolicy.ts, box/executionSchedulingPolicy.ts,
+box/executionShortfall.ts, box/executionSimulator.ts, box/executionTiming.ts,
+box/instrumentKey.ts, box/instrumentReservations.ts, box/instruments.ts,
+box/kiteBrokerAdapter.ts, box/latencyModel.ts, box/latencySource.ts,
+box/legExecutor.ts, box/liquidityLedger.ts, box/liveEntryGuard.ts,
+box/liveModeTransition.ts, box/localCharges.ts, box/marginReplay.ts, box/math.ts,
+box/metrics.ts, box/orderLifecycle.ts, box/orderManager.ts, box/orderPricing.ts,
+box/pairedComparison.ts, box/paperLegTimeline.ts, box/paperScheduler.ts,
+box/parityReport.ts, box/partialEntryRecovery.ts, box/partialExitPnl.ts,
+box/pnlArchive.ts, box/pnlSnapshot.ts, box/positionMonitor.ts, box/positions.ts,
+box/queueCalibration.ts, box/quotes.ts, box/residualFlatten.ts, box/scanner.ts,
+box/serialize.ts, box/shadowMode.ts, box/singleLotInvariant.ts, box/stressProfile.ts,
+box/tradingSession.ts, box/tradingSessionStore.ts, box/types.ts, box/underlyingLock.ts
+
+box/reservations/chained.ts, box/reservations/core.ts, box/reservations/durable.ts,
+box/reservations/identity.ts, box/reservations/inProcess.ts,
+box/reservations/memoryStore.ts, box/reservations/port.ts, box/reservations/types.ts
+
+brokers/boardDiagnostics.ts, brokers/dhan/charges.ts, brokers/dhan/client.ts,
+brokers/dhan/correlation.ts, brokers/dhan/errors.ts, brokers/dhan/feed.ts,
+brokers/dhan/feedDecoder.ts, brokers/dhan/http.ts, brokers/dhan/instruments.ts,
+brokers/dhan/segments.ts, brokers/feedHealth.ts, brokers/instrumentProvider.ts,
+brokers/marketDataLane.ts, brokers/quoteProvider.ts, brokers/subscriptions.ts,
+brokers/types.ts, brokers/zerodha/feed.ts, brokers/zerodha/liveAdapter.ts
+```
+
+### 2b. Copied and adapted (what changed, one line each)
+
+| File | What changed |
+| --- | --- |
+| `box/repository.ts` | The whole Mongo/Mongoose repository was rewritten onto PostgreSQL (`UPDATE … RETURNING`, `SELECT … FOR UPDATE`, `ON CONFLICT`, transactional outbox enqueue). Behaviour preserved; storage completely different. See §5. |
+| `box/model.ts` | Mongoose schemas/models replaced by PostgreSQL row types and (de)serialisation; opaque `_id` strings preserved so legacy ids stay importable. |
+| `box/pnlCache.ts` | **Redis removed.** The Upstash day-P&L mirror is gone; every method degrades to the neutral value it already returned when Redis was down. Pure planning/partitioning helpers unchanged; exported surface preserved so no caller changed. |
+| `box/closedCache.ts` | **Redis removed.** The Upstash "closed today" mirror is gone; the cache reports itself disabled and reads fall through to PostgreSQL (`loadBoxTradesClosedSince`). Exported surface preserved. |
+| `box/engine.ts` | Small wiring changes to consume the PostgreSQL persistence/closed-today path instead of Mongo+Redis (~14 lines). Strategy logic unchanged. |
+| `box/index.ts` | `registerBoxModule` wiring adjusted for StrikeEdge's collaborators and the new persistence readiness (~19 lines). |
+| `box/routes.ts` | Trades-history `source` tier label changed to `"postgres"`; SSE stream (`/api/box/stream`) now guarded by the cookie-session `requireOperator` middleware instead of a query-string token; auth wiring for the new access model. |
+| `box/reservations/index.ts` | Factory now assembles the PostgreSQL-backed `PgReservationPort` instead of the Mongo store (~10 lines). |
+| `brokers/registry.ts` | 2-line adjustment (broker wiring); effectively verbatim. |
+| `brokers/dhan/auth.ts` | Present but the OAuth/login path is dead in StrikeEdge (tokens come from CalSpread); retained only so shared types compile. Not on any live path. |
+| `kite.ts` | Trimmed to the Box-relevant client surface (charges, basket margin, order ops, instruments); calendar/history/analytics helpers dropped (~94 lines). |
+| `index.ts` | **Fully replaced** — see §3. The 5,500+ line CalSpread entrypoint became a small Box-only bootstrap; ~6,000 lines differ. |
+
+### 2c. New files (no source counterpart)
+
+```
+config.ts                         (app config + deployment gates)
+boxSupport.ts                     (the collaborators CalSpread's index.ts injected — see §4)
+brokerRoutes.ts                   (broker status / switch-blockers / select)
+runtime/statusRoutes.ts           (GET /api/runtime/status, /api/export/status)
+
+access/cookies.ts, access/csrf.ts, access/middleware.ts, access/rateLimit.ts,
+access/routes.ts, access/sessionStore.ts     (site-passcode session gate)
+
+brokerState/tokenCrypto.ts, brokerState/brokerSessions.ts   (AES-256-GCM token store)
+
+tokens/brokerTokenService.ts, tokens/tokenProviderClient.ts, tokens/istClock.ts
+                                  (morning token acquisition from CalSpread)
+
+pg/pool.ts, pg/migrate.ts         (PostgreSQL authority)
+box/reservations/pgStore.ts       (PostgreSQL reservation port)
+
+outbox/writer.ts, outbox/mongo.ts, outbox/projector.ts, outbox/status.ts
+                                  (transactional outbox → Mongo reporting replica)
+
+scripts/migrate.ts, scripts/migrateBoxFromMongo.ts, scripts/outboxReplay.ts,
+scripts/rotateBrokerTokenKey.ts
+
+types/charges.ts
+```
+
+## 3. Intentionally excluded source files
+
+Each of the following exists in `Cal_Spread_Backend/src` and is **absent** from
+the target on purpose (verified: all present in source, all absent in target
+except `index.ts`, which was replaced in place).
+
+| Source file | Why excluded |
+| --- | --- |
+| `index.ts` | **Replaced.** CalSpread's entrypoint bundled calendar spreads, analytics, OI capture, Yahoo dividends and admin/token routes into one file. StrikeEdge's `index.ts` is a Box-only bootstrap; the injected collaborators moved to `boxSupport.ts` (§4). |
+| `db.ts` | **Replaced by PostgreSQL.** Mongoose connection management is gone; `pg/pool.ts` is the operational authority. |
+| `redis.ts` | **Upstash removed.** The analytics/P&L Redis caches do not exist in StrikeEdge; durable state is PostgreSQL. |
+| `eodCapture.ts` | End-of-day F&O capture is a calendar-scanner feature, out of scope. |
+| `hourlyCapture.ts` | Intraday OI/chain capture is a calendar-scanner feature, out of scope. |
+| `yahoo.ts` | Yahoo dividend feed is out of scope. |
+| `marketDataRoutes.ts` | The market-data recorder endpoints (calendar analytics) are out of scope. |
+| `adminToken.ts` | Full-admin token auth replaced by the site-passcode session (`access/*`). |
+| `tokenRouteAuth.ts` | StrikeEdge hosts no token routes; it is a **client** of CalSpread's, so the route-auth guard is unneeded. |
+| `brokers/history.ts` | Historical charts/candles are out of scope. |
+| `brokers/routes.ts` | The calendar broker routes (login/history/market-data) are replaced by StrikeEdge's Box-only `brokerRoutes.ts`. |
+| `box/reservations/mongoStore.ts` | The Mongo durable reservation store is replaced by `box/reservations/pgStore.ts` (PostgreSQL). |
+
+## 4. Collaborators CalSpread's `index.ts` passed to `registerBoxModule`
+
+In CalSpread these were closures defined inside the monolithic `index.ts`. In
+StrikeEdge the pure ones live in **`src/boxSupport.ts`** (verbatim ports — the
+board derivation, IST arithmetic, market-hours window and charge folding are
+byte-for-byte, pinned by the migration fixtures), and the stateful ones are
+supplied by the broker registry / access layer.
+
+| Dependency (arg to `registerBoxModule`) | Where it lives now |
+| --- | --- |
+| `istDayKey` | `boxSupport.ts` (verbatim IST day-key). |
+| `isMarketOpen` | `boxSupport.ts` (verbatim NSE hours window). |
+| `makeIdResolver` | `boxSupport.ts` (token → `EXCHANGE:SYMBOL`). |
+| `getBoard` / `deriveFnoBoard` | `boxSupport.ts` (F&O board derivation, verbatim). |
+| `priceChargeGroups` / `makePriceChargeGroups` | `boxSupport.ts` (Zerodha virtual-contract-note batching). |
+| `getBasketMargin` | `kite.ts` client, invoked from `index.ts`. |
+| `getAllInstruments` | `brokers/registry.ts` (`brokerManager.instruments()`). |
+| `kite` / `tickerHub` / `feed.*` | `brokers/registry.ts` (active-broker market-data lane and the dedicated Box feed). |
+| `charges` (active-broker fee schedule) | `brokers/registry.ts` — `LocalChargeCalculator` (Zerodha) or the Dhan charge calculator. |
+| `createLiveAdapter` | `brokers/registry.ts` — refuses to build an adapter for any but the active broker. |
+| `activeBroker` / `brokerGeneration` | `brokers/registry.ts` — stamped on reservations and re-checked before execution. |
+| `requireOperator` / `getOperatorRole` | `access/middleware.ts` — the site-passcode session replacing admin-token auth. |
+
+## 5. Mongo repository operations replaced by PostgreSQL
+
+The full table-by-table, operation-by-operation mapping is in
+**`docs/PG_PERSISTENCE.md`** and is not duplicated here. In summary:
+
+- **`box_trades`** — `create`/`findOneAndUpdate` → `INSERT … RETURNING` /
+  `SELECT … FOR UPDATE` + `UPDATE … RETURNING`; unique-violation → null.
+- **`box_trade_events`** — append-only inserts, idempotent by audit id.
+- **`box_order_intents`** (the CAS core) — Mongo `findOneAndUpdate` guards →
+  `SELECT … FOR UPDATE` + validated predecessor/fill/broker guards +
+  `UPDATE … SET previous_filled_quantity = <locked pre-image> … RETURNING`, with
+  an in-DB immutability constraint and in-code `assertIntentImmutableMatch`.
+- **`box_execution_attempts`** — version/identity/application-guarded projection
+  via `SELECT … FOR UPDATE` + `UPDATE … RETURNING` returning
+  `applied`/`already_applied`/`stale`/`not_found`.
+- **`box_daily_pnl` / `box_pnl_deletions` / `box_pnl_day_states`,
+  `box_settings` / `box_trading_session` / `box_calibration_samples`** — mapped to
+  their PostgreSQL tables (see the doc).
+- **Reservations** — Mongo's UNIQUE MULTIKEY `(deployment, keys)` index becomes a
+  normalised `box_reservation_owners` + `box_reservation_keys` pair implementing
+  the frozen `DurableReservationPort`.
+- Every mutation that needs a Mongo projection enqueues an **outbox** row on the
+  same transactional `client`, which is what makes the projection transactional
+  rather than best-effort.
+
+## 6. Redis-backed features replaced or removed
+
+CalSpread used Upstash Redis (`src/redis.ts`) for analytics caches and two Box
+caches. **StrikeEdge removes Redis entirely.**
+
+| CalSpread Redis feature | StrikeEdge |
+| --- | --- |
+| Analytics OI/chain caches | **Removed** — the analytics feature is out of scope. |
+| `box/pnlCache.ts` — day-P&L mirror | **Redis removed.** Was always best-effort (durable correctness was in Mongo). The durable P&L tier is now PostgreSQL (`box_daily_pnl` + day-state proof). Every method degrades to its old neutral value; the pure planning helpers and the exported surface are unchanged so no caller changed. |
+| `box/closedCache.ts` — closed-today mirror | **Redis removed.** Was always a read-path accelerator. The complete source for "closed today" is now PostgreSQL (`loadBoxTradesClosedSince` / `engine.getClosedToday`); the cache reports itself disabled and reads fall through. |
+
+## 7. HTTP / SSE contract changes
+
+Verified against `src/box/routes.ts`, `src/access/routes.ts`,
+`src/runtime/statusRoutes.ts`, `src/brokerRoutes.ts` (target) and
+`Cal_Spread_Backend/src/index.ts` (source).
+
+### Changed
+
+- **Trades-history `source` tier label.** Was `"memory" | "redis" | "mongo" |
+  "none"`; is now `"memory" | "postgres" | "none"` (`src/box/routes.ts` reports
+  `"postgres"`; also documented in `docs/PG_PERSISTENCE.md`).
+- **SSE authentication.** The Box event stream `GET /api/box/stream` no longer
+  accepts a query-string token; it is guarded by the HttpOnly, same-origin
+  cookie session via the `requireOperator` middleware (401 without a valid
+  session).
+- **Admin auth → site passcode session.** CalSpread's `/api/admin/verify` /
+  admin-token model is replaced by the site-passcode session in `access/*`.
+
+### New endpoints
+
+```
+GET  /api/runtime/status        (src/runtime/statusRoutes.ts)
+GET  /api/export/status         (src/runtime/statusRoutes.ts)
+POST /api/access/verify         (src/access/routes.ts)
+GET  /api/access/status         (src/access/routes.ts)
+POST /api/access/logout         (src/access/routes.ts)
+GET  /api/broker/status         (src/brokerRoutes.ts)
+GET  /api/broker/switch-blockers(src/brokerRoutes.ts)
+POST /api/broker/select         (src/brokerRoutes.ts)
+```
+
+The Box endpoints (`/api/box/*`: status, config, opportunities, chains, trades,
+trades/open, trades/history, execution-*, session arm/disarm, live
+reconcile/cancel-working/flatten, stream, events, trades/:id/close) are carried
+over.
+
+### Removed endpoints
+
+All of CalSpread's non-Box surface is gone. Verified present in the source
+`index.ts` and absent from the target:
+
+```
+/api/login, /api/logout, /api/profile, /api/session, /api/status,
+/api/admin/status, /api/admin/verify, /api/access/verify (old admin form),
+/api/kite/access-token, /api/kite/token, /api/internal/kite-token, /api/rf,
+/api/rf/current, /api/instruments, /api/debug/indices,
+/api/fno-board, /api/fno-stocks, /api/fno-stocks/:symbol,
+/api/history/:symbol, /api/intraday/:symbol, /api/minute/:symbol,
+/api/fivemin/:symbol, /api/dividends, /api/spread-history/:symbol,
+/api/spread-stats/:symbol, /api/option-chain/:underlying,
+/api/option-oi-frame/:underlying, /api/option-oi-series/:underlying,
+/api/option-oi-baseline/:underlying, /api/option-prev-close/:underlying,
+/api/futures-oi-frame/:underlying, /api/trades, /api/trades/:id,
+/api/trades/:id/close  (calendar trades)
+```
+
+That is: every calendar, analytics, history, market-data, Dhan-login and admin
+route. StrikeEdge hosts **no token routes** — it is a client of CalSpread's.
+
+## 8. Known behaviour differences
+
+- **PostgreSQL is required to boot.** CalSpread degraded gracefully with no
+  Mongo (trades feature off); StrikeEdge refuses to start without `DATABASE_URL`
+  because PostgreSQL is the operational authority.
+- **Mongo is now optional and read-only.** With no `MONGODB_URI`, StrikeEdge runs
+  fully; only the reporting projection is skipped. In CalSpread, Mongo was the
+  store of record.
+- **No Redis warm-load.** A restart no longer warm-loads caches from Redis; the
+  durable read comes straight from PostgreSQL, so the first read after boot is a
+  DB query rather than a cache hit. Correctness is identical; latency profile
+  differs.
+- **No broker OAuth.** StrikeEdge cannot log a user into Zerodha/Dhan; it depends
+  on CalSpread's token routes being reachable each morning. If CalSpread is down
+  at 09:00 IST, StrikeEdge has no token until it recovers.
+- **Single active broker.** Exactly one of Zerodha/Dhan is active; switching is
+  explicit and blocker-gated. CalSpread's broker handling differed.
+- **Auth model.** One site passcode + runtime arming replaces the two-tier
+  admin/access secrets. The passcode grants UI access only and arms nothing.
+- **Multi-worker safety** now rests on the PostgreSQL durable reservation tier
+  and globally-unique owner ids rather than a Mongo unique index.
+
+## 9. The unavoidable four-leg broker risk
+
+A Box is four option legs. **A four-leg Box entry is NOT atomic at Zerodha or at
+Dhan.** Neither broker offers an all-or-nothing multi-leg primitive, so between
+the first accepted leg and the fourth there is a real, unavoidable window in
+which the position is partially on.
+
+StrikeEdge **bounds** that exposure — it does not eliminate it:
+
+- **Hedge-first submission ordering** submits the legs that reduce risk before
+  the legs that add it, so a partial fill leans safe rather than naked.
+- **Durable order intents** in PostgreSQL are written before the broker POST and
+  drive deterministic recovery/residual-flatten after a crash or a rejected leg,
+  so the system always knows what it tried and can reconcile it.
+
+These make a partial entry *survivable and recoverable*. They cannot make four
+independent broker acknowledgements happen simultaneously, and they cannot
+prevent a broker-side reject, timeout or ambiguous submit from leaving a residual
+leg that must be flattened at whatever the market then offers.
+
+**No test result in this repository may be read as proof of real-money safety.**
+The tests prove the *logic* is deterministic, the recovery paths fire, and the
+gates hold. Real capital adds broker latency, partial fills, rejects, feed gaps
+and slippage that no simulation fully reproduces. Live trading is enabled only
+behind the double deployment gates, the per-broker gate and explicit runtime
+arming — and even then the four-leg risk above remains inherent to the strategy.
