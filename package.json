@@ -15,6 +15,7 @@
     "rotate:broker-token-key": "node dist/scripts/rotateBrokerTokenKey.js",
     "outbox:replay": "node dist/scripts/outboxReplay.js",
     "test:unit": "node --test \"tests/box/*.test.mjs\"",
+    "test:invariants": "node --test \"tests/invariants/*.test.mjs\"",
     "test:pg": "node --test \"tests/pg/*.test.mjs\"",
     "test:projector": "node --test \"tests/projector/*.test.mjs\"",
     "test:tokens": "node --test \"tests/tokens/*.test.mjs\"",
