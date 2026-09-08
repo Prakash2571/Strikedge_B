@@ -137,6 +137,63 @@ export async function enqueueOutbox(client: PoolClient, event: OutboxEvent): Pro
 }
 
 /**
+ * Enqueue a SNAPSHOT projection: one Mongo document per aggregate, latest value wins.
+ *
+ * WHY THIS EXISTS SEPARATELY FROM `enqueueOutbox`
+ * `enqueueOutbox` is for EVENTS — immutable facts that happened once, whose `eventId`
+ * therefore never repeats and whose enqueue is `ON CONFLICT DO NOTHING`.
+ *
+ * A daily P&L row is not an event. It is a mutable snapshot rewritten many times a day as
+ * a position's net P&L moves, and the reporting replica should hold ONE document per
+ * (day, trade_id) carrying the latest figures. With a stable `eventId` and DO NOTHING, the
+ * first write would project and every subsequent update would be silently dropped — the
+ * reporting replica would freeze at the first value it ever saw. With a time-varying
+ * `eventId` it would instead accumulate a new Mongo document per update, which is worse.
+ *
+ * So this keeps the `eventId` stable (it becomes the Mongo `_id`, giving exactly one
+ * document per aggregate) and REVIVES the pending row on conflict: the payload is
+ * replaced, `published_at` is cleared, the attempt counters are reset and a fresh sequence
+ * is taken so ordering still advances.
+ *
+ * A useful side effect: many intraday updates to the same row COLLAPSE into one pending
+ * outbox row, so a Mongo outage cannot make the backlog grow without bound just because
+ * P&L is being recalculated on a timer.
+ *
+ * Clearing `dead_lettered_at` is deliberate. A snapshot that previously exhausted its
+ * attempts is superseded by a newer value, and refusing to retry the newer one would leave
+ * the replica permanently stale for that row.
+ */
+export async function enqueueOutboxSnapshot(
+  client: PoolClient,
+  event: OutboxEvent,
+): Promise<void> {
+  assertNoSecretFields(event.payload);
+  await client.query(
+    `INSERT INTO mongo_outbox
+       (event_id, aggregate_type, aggregate_id, event_type, schema_version, sequence, payload)
+     VALUES ($1, $2, $3, $4, $5, nextval('mongo_outbox_sequence_seq'), $6::jsonb)
+     ON CONFLICT (event_id) DO UPDATE SET
+       payload          = EXCLUDED.payload,
+       event_type       = EXCLUDED.event_type,
+       schema_version   = EXCLUDED.schema_version,
+       sequence         = nextval('mongo_outbox_sequence_seq'),
+       published_at     = NULL,
+       attempts         = 0,
+       next_attempt_at  = clock_timestamp(),
+       last_error       = NULL,
+       dead_lettered_at = NULL`,
+    [
+      event.eventId,
+      event.aggregateType,
+      event.aggregateId,
+      event.eventType,
+      event.schemaVersion ?? 1,
+      JSON.stringify(event.payload),
+    ],
+  );
+}
+
+/**
  * Enqueue several events in one statement, preserving their relative order.
  *
  * Used where one operational transaction produces a small fixed set of projections

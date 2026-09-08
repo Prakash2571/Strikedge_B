@@ -73,14 +73,22 @@ Legend: **Req?** = required. "yes" means the process cannot function without it;
 
 ## Broker selection (`src/brokers/registry.ts`, `src/brokerRoutes.ts`)
 
-Exactly one broker is active at a time. The boot broker is **fixed to `zerodha`**
-in code (`registry.ts` `private active: BrokerId = "zerodha"`); there is **no**
-environment variable to change it and **no** automatic-fallback env switch. A
-switch is always an explicit, blocker-checked `POST /api/broker/select`.
+Exactly one broker is active at a time.
 
-> A previous version of this document listed `DEFAULT_ACTIVE_BROKER` and
-> `AUTO_FALLBACK_TO_DHAN`. Neither is read anywhere in `src`; they were removed.
-> See `docs/DOC_AUDIT.md` finding C-DEFECT-1.
+| Variable | Default | Required | What it does |
+| --- | --- | --- | --- |
+| `DEFAULT_ACTIVE_BROKER` | `zerodha` | no | The broker a **fresh** deployment starts on. Honoured only when PostgreSQL holds no `active_broker` row — `restore()` always overrides it from the durable record, so a restart can never silently revert an operator's switch. An unrecognised value warns and falls back to `zerodha`. |
+| `AUTO_FALLBACK_TO_DHAN` | `false` | no | Whether losing Zerodha may move **speculative entry** to Dhan by itself. Keep it false. False means Zerodha is reported unavailable and Dhan "ready — standby"; nothing scans or enters on Dhan without an operator. It never gates reduction — exits, protective cancellation, emergency flattening and reconciliation always run through whichever broker owns the exposure. |
+
+A broker **switch** is always an explicit, blocker-checked `POST /api/broker/select`.
+Neither variable above can perform one.
+
+> An audit correctly found that these two were documented but unread, and removed them
+> from the docs. That was the wrong direction: both are required by the specification, so
+> they were implemented instead (`defaultActiveBrokerFromEnv` and
+> `autoFallbackToDhanFromEnv` in `src/brokers/registry.ts`, covered by
+> `tests/pg/auditGapFixes.test.mjs`). See `docs/DOC_AUDIT.md` finding C-DEFECT-1 for the
+> original observation.
 
 ## Shared Box live gates — GATE 1 (`src/box/config.ts`)
 

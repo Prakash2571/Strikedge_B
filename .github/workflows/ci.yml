@@ -234,6 +234,15 @@ jobs:
           NODE_OPTIONS: --import ${{ env.EGRESS_GUARD }}
         run: set -o pipefail; npm run test:unit 2>&1 | tee tests-out/unit.log
 
+      # Safety-invariant suite. Added to CI explicitly: it existed as `test:invariants`
+      # but was in neither the aggregate `npm test` nor this workflow, so it had never
+      # actually run anywhere — a test suite nothing executes is the same failure class it
+      # was written to catch.
+      - name: Safety-invariant suite (npm run test:invariants)
+        env:
+          NODE_OPTIONS: --import ${{ env.EGRESS_GUARD }}
+        run: set -o pipefail; npm run test:invariants 2>&1 | tee tests-out/invariants.log
+
       - name: PostgreSQL integration suite (npm run test:pg)
         env:
           NODE_OPTIONS: --import ${{ env.EGRESS_GUARD }}

@@ -1,7 +1,7 @@
 {
   "name": "strikedge_backend",
   "version": "1.0.0",
-  "description": "StrikeEdge — standalone Box-arbitrage backend (Zerodha + Dhan, PostgreSQL authoritative, MongoDB async replica)",
+  "description": "StrikeEdge \u2014 standalone Box-arbitrage backend (Zerodha + Dhan, PostgreSQL authoritative, MongoDB async replica)",
   "main": "dist/index.js",
   "type": "module",
   "scripts": {
@@ -23,7 +23,7 @@
     "test:switch": "node --test \"tests/switch/*.test.mjs\"",
     "test:shutdown": "node --test \"tests/shutdown/*.test.mjs\"",
     "test:integration": "npm run test:pg && npm run test:projector",
-    "test": "npm run build && npm run test:unit && npm run test:tokens && npm run test:access && npm run test:switch && npm run test:shutdown && npm run test:integration"
+    "test": "npm run build && npm run test:unit && npm run test:invariants && npm run test:tokens && npm run test:access && npm run test:switch && npm run test:shutdown && npm run test:integration"
   },
   "keywords": [],
   "author": "",

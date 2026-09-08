@@ -29,7 +29,7 @@ import {
   withClient,
   withTx,
 } from "../pg/pool.js";
-import { enqueueOutbox } from "../outbox/writer.js";
+import { enqueueOutbox, enqueueOutboxSnapshot } from "../outbox/writer.js";
 import { LEGACY_BROKER, type BrokerId } from "../brokers/types.js";
 import {
   MAX_FLATTEN_APPLICATION_IDS,
@@ -2751,9 +2751,26 @@ export async function upsertBoxDailyPnl(doc: IBoxDailyPnl): Promise<void> {
   });
 }
 
+/**
+ * Write one daily-P&L row AND its Mongo projection, in one transaction.
+ *
+ * THE PROJECTION WAS MISSING. `box_daily_pnl` is an allow-listed outbox aggregate
+ * (`src/outbox/writer.ts`), is collection-mapped in `src/outbox/mongo.ts`, and is
+ * documented as projected in `docs/MONGO_PROJECTION.md` — but no code path ever enqueued
+ * it, so daily P&L never reached the reporting replica at all. The only writer of that
+ * Mongo collection was the legacy import. Nothing failed and no test noticed, because
+ * PostgreSQL (the authority) was always correct: the loss was silent and would only have
+ * surfaced later as unanalysable history.
+ *
+ * A P&L row is a SNAPSHOT, not an event — it is rewritten as net P&L moves — so it uses
+ * `enqueueOutboxSnapshot`, giving exactly one Mongo document per (day, trade_id) that
+ * carries the latest figures. See that function for why a plain event enqueue would have
+ * frozen the replica at the first value it saw.
+ */
 async function upsertDailyPnlRow(doc: IBoxDailyPnl): Promise<void> {
-  await query(
-    `INSERT INTO box_daily_pnl
+  await withTx(async (client) => {
+    await client.query(
+      `INSERT INTO box_daily_pnl
        (day, trade_id, underlying, direction, lower_strike, upper_strike, expiry, status,
         gross_pnl, net_pnl, realisable_net_pnl, realised_net_pnl, opened_at, closed_at, updated_at,
         summary, archived_at)
@@ -2766,14 +2783,33 @@ async function upsertDailyPnlRow(doc: IBoxDailyPnl): Promise<void> {
        realised_net_pnl = EXCLUDED.realised_net_pnl, opened_at = EXCLUDED.opened_at,
        closed_at = EXCLUDED.closed_at, updated_at = EXCLUDED.updated_at,
        summary = EXCLUDED.summary, archived_at = now()`,
-    [
-      doc.day, doc.trade_id, doc.underlying ?? "", doc.direction ?? "LONG_BOX",
-      doc.lower_strike ?? 0, doc.upper_strike ?? 0, doc.expiry ?? "", doc.status ?? "open",
-      doc.gross_pnl ?? null, doc.net_pnl ?? null, doc.realisable_net_pnl ?? null,
-      doc.realised_net_pnl ?? null, doc.opened_at ?? null, doc.closed_at ?? null,
-      doc.updated_at ?? null, jsonb(doc.summary ?? null),
-    ],
-  );
+      [
+        doc.day, doc.trade_id, doc.underlying ?? "", doc.direction ?? "LONG_BOX",
+        doc.lower_strike ?? 0, doc.upper_strike ?? 0, doc.expiry ?? "", doc.status ?? "open",
+        doc.gross_pnl ?? null, doc.net_pnl ?? null, doc.realisable_net_pnl ?? null,
+        doc.realised_net_pnl ?? null, doc.opened_at ?? null, doc.closed_at ?? null,
+        doc.updated_at ?? null, jsonb(doc.summary ?? null),
+      ],
+    );
+
+    // Same transaction as the operational write: the projection intent and the fact it
+    // describes are either both durable or neither is.
+    await enqueueOutboxSnapshot(client, {
+      // Stable, so Mongo holds ONE document per trade per day, overwritten in place.
+      eventId: `box_daily_pnl:${doc.day}:${doc.trade_id}`,
+      aggregateType: "box_daily_pnl",
+      aggregateId: `${doc.day}:${doc.trade_id}`,
+      eventType: "daily_pnl_snapshot",
+      schemaVersion: BOX_PROJECTION_SCHEMA_VERSION,
+      payload: {
+        ...doc,
+        source_id: `${doc.day}:${doc.trade_id}`,
+        day: doc.day,
+        trade_id: doc.trade_id,
+        projection_schema_version: BOX_PROJECTION_SCHEMA_VERSION,
+      },
+    });
+  });
 }
 
 /** The persisted documents for an exact day. Errors deliberately propagate. */

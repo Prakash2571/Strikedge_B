@@ -213,8 +213,50 @@ function pickLegPrice(order: BoxMarginOrder): number {
   return 0.05;
 }
 
+/**
+ * The broker a FRESH deployment starts on, from `DEFAULT_ACTIVE_BROKER`.
+ *
+ * This variable was specified and documented but never read — the initial broker was
+ * hardcoded to Zerodha, so an operator who set `DEFAULT_ACTIVE_BROKER=dhan` got Zerodha
+ * and no warning. It is honoured ONLY when there is no durable `active_broker` row:
+ * `restore()` always overrides it from PostgreSQL, because the operator's last real
+ * selection outranks a config default and a restart must never silently revert a broker
+ * switch. So this decides the FIRST boot of a new deployment and nothing else.
+ *
+ * An unrecognised value falls back to Zerodha with a warning rather than failing startup:
+ * a typo here must not take down a process whose durable record is about to override it.
+ */
+function defaultActiveBrokerFromEnv(env: NodeJS.ProcessEnv = process.env): BrokerId {
+  const raw = (env.DEFAULT_ACTIVE_BROKER ?? "").trim().toLowerCase();
+  if (!raw) return "zerodha";
+  if ((BROKER_IDS as readonly string[]).includes(raw)) return raw as BrokerId;
+  console.warn(
+    `[Broker] DEFAULT_ACTIVE_BROKER="${raw}" is not a known broker (${BROKER_IDS.join(", ")}) — defaulting to zerodha.`,
+  );
+  return "zerodha";
+}
+
+/**
+ * Whether losing Zerodha may move SPECULATIVE ENTRY to Dhan by itself.
+ *
+ * Defaults FALSE and is expected to stay false. With it false, an unavailable Zerodha
+ * means "report Zerodha unavailable and Dhan ready in standby" — it does NOT start
+ * scanning or entering on Dhan, because an automatic venue change is a trading decision
+ * and belongs to an operator. This never affects REDUCTION: whichever broker owns exposure
+ * keeps its adapter for exits, protective cancellation and reconciliation regardless.
+ */
+function autoFallbackToDhanFromEnv(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = (env.AUTO_FALLBACK_TO_DHAN ?? "").trim().toLowerCase();
+  return raw === "true" || raw === "1" || raw === "yes";
+}
+
 export class ActiveBrokerManager {
-  private active: BrokerId = "zerodha";
+  private active: BrokerId = defaultActiveBrokerFromEnv();
+  /**
+   * Read once at construction so a mid-session env mutation cannot change trading
+   * behaviour without a restart.
+   */
+  private readonly autoFallbackToDhan: boolean = autoFallbackToDhanFromEnv();
   private probe: ExposureProbe | null = null;
   private hooks: SwitchHooks | null = null;
 
@@ -531,6 +573,30 @@ export class ActiveBrokerManager {
    * from the wrong venue — the trades would even be stamped `broker: "zerodha"`,
    * making the mistake invisible afterwards.
    */
+  /**
+   * May speculative ENTRY move to Dhan on its own because Zerodha is unavailable?
+   *
+   * Answers the `AUTO_FALLBACK_TO_DHAN` policy question in one place so the boot wiring and
+   * the runtime status agree. `false` (the default and the expectation) means an
+   * unavailable Zerodha leaves Dhan in standby: reported as ready, not scanned, not entered.
+   *
+   * Deliberately says nothing about reduction. Exits, protective cancellation, emergency
+   * residual flattening and reconciliation always run through whichever broker owns the
+   * exposure, and no policy flag may gate them.
+   */
+  mayAutoFallbackToDhan(): boolean {
+    return this.autoFallbackToDhan;
+  }
+
+  /**
+   * The broker the process would start on before any durable record is consulted.
+   * Exposed for diagnostics and tests, so `DEFAULT_ACTIVE_BROKER` is observable rather
+   * than an invisible constructor detail.
+   */
+  configuredDefaultBroker(): BrokerId {
+    return defaultActiveBrokerFromEnv();
+  }
+
   async restore(): Promise<void> {
     const saved = await loadActiveBroker().catch(() => null);
     if (saved && (BROKER_IDS as readonly string[]).includes(saved.broker)) {
