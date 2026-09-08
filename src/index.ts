@@ -445,10 +445,28 @@ const tokenService = new BrokerTokenAcquisitionService({
     installZerodhaToken: (apiKey, accessToken) => {
       kite.installProvidedToken(apiKey, accessToken);
     },
-    installDhanToken: () => {
-      // Dhan's client reads its session from the encrypted store on demand, so the
-      // durable write in `persist.saveDhan` IS the installation. Nothing to do here,
-      // and deliberately nothing that could open a socket for a standby broker.
+    installDhanToken: async () => {
+      /**
+       * The durable write in `persist.saveDhan` has already happened; this makes the
+       * RUNNING manager see it.
+       *
+       * This was previously a no-op on the reasoning that "the client reads its session
+       * from the store on demand". It does not: `ActiveBrokerManager` only read
+       * `broker_sessions` inside `restore()`, which runs once at boot. On a normal
+       * morning — process up before 09:00 IST, Dhan token acquired at 09:00 — the token
+       * was durable while the manager still held no token, so Dhan reported itself
+       * unauthenticated for the rest of the day and could not be selected without a
+       * restart.
+       *
+       * No token is passed in: the manager re-reads and decrypts from PostgreSQL, which
+       * keeps the authority in one place and keeps plaintext out of this interface.
+       */
+      const adopted = await brokerManager.adoptStoredDhanSession();
+      console.log(
+        adopted
+          ? "[Token] dhan session installed into the running broker manager."
+          : "[Token] dhan session persisted but not adoptable (absent or expired) — Dhan stays unauthenticated.",
+      );
     },
     isActiveBroker: (broker) => brokerManager.activeBroker === broker,
     onActiveBrokerReady: async (broker) => {

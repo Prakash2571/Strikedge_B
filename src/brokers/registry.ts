@@ -547,25 +547,54 @@ export class ActiveBrokerManager {
       this.gen = saved.generation;
     }
     // Rehydrate a still-valid Dhan session so a restart does not force a re-login.
-    const session = await loadDhanSession().catch(() => null);
-    if (session) {
-      if (isDhanTokenExpired(session.expiry_time)) {
-        await clearDhanSession().catch(() => undefined);
-        this.dhanProblems = ["Dhan session expired — reconnect Dhan"];
-      } else {
-        this.dhanAccessToken = session.access_token;
-        this.dhanTokenExpiry = session.expiry_time;
-        this.dhanSessionMeta = {
-          clientId: session.dhan_client_id,
-          clientName: session.dhan_client_name,
-          clientUcc: session.dhan_client_ucc,
-          powerOfAttorney: session.given_power_of_attorney,
-          loginDay: session.login_date,
-          loginAt: session.login_at ? new Date(session.login_at).getTime() : Date.now(),
-        };
-      }
-    }
+    await this.adoptStoredDhanSession();
     if (this.active === "dhan") this.dhanProblems = this.computeDhanProblems();
+  }
+
+  /**
+   * Read the encrypted Dhan session out of PostgreSQL and install it in memory.
+   *
+   * WHY THIS IS PUBLIC AND NOT JUST PART OF `restore()`
+   * It used to be inlined in `restore()`, which runs ONCE at boot — and that was a
+   * real bug in the StrikeEdge token flow. The daily acquisition service persists a
+   * freshly fetched Dhan token to `broker_sessions` and then calls back to say it is
+   * installed; with rehydration reachable only from boot, that callback had nothing to
+   * call. The token was durable but the RUNNING manager still held
+   * `dhanAccessToken = null`, so on any normal morning (process up before 09:00 IST,
+   * token acquired at 09:00) Dhan reported itself unauthenticated for the whole
+   * session and could not be selected as the active broker without a process restart.
+   *
+   * Now the acquisition service calls this after every successful Dhan persist, so the
+   * durable write and the in-memory install are the same event from the caller's point
+   * of view. It re-reads from the store rather than accepting a token argument
+   * deliberately: PostgreSQL is the authority, decryption stays inside the session
+   * provider, and no plaintext token has to be threaded through another interface.
+   *
+   * Idempotent, and safe to call when no session is stored (it then changes nothing).
+   * An EXPIRED stored session is cleared rather than adopted — a dead token installed
+   * in memory would make `authenticated` true for one expiry check and then fail at the
+   * broker, which is strictly worse than reporting the truth.
+   */
+  async adoptStoredDhanSession(): Promise<boolean> {
+    const session = await loadDhanSession().catch(() => null);
+    if (!session) return false;
+    if (isDhanTokenExpired(session.expiry_time)) {
+      await clearDhanSession().catch(() => undefined);
+      this.dhanProblems = ["Dhan session expired — reconnect Dhan"];
+      return false;
+    }
+    this.dhanAccessToken = session.access_token;
+    this.dhanTokenExpiry = session.expiry_time;
+    this.dhanSessionMeta = {
+      clientId: session.dhan_client_id,
+      clientName: session.dhan_client_name,
+      clientUcc: session.dhan_client_ucc,
+      powerOfAttorney: session.given_power_of_attorney,
+      loginDay: session.login_date,
+      loginAt: session.login_at ? new Date(session.login_at).getTime() : Date.now(),
+    };
+    this.dhanProblems = this.computeDhanProblems();
+    return true;
   }
 
   /**
