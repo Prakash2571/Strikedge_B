@@ -1,140 +1,142 @@
 #!/usr/bin/env bash
 #
 # CI defence-in-depth — STATIC scan for hardcoded LIVE broker hostnames in the
-# tracked test tree. Node-independent (pure git + grep + sed), so it holds even
-# if the runtime egress guard (.github/ci/no-egress-guard.mjs) were ever bypassed
-# or removed.
-#
-# WHY A PATH ALLOW-LIST AND NOT "ban every mention in code"
-#   The suite is made hermetic by an INTERCEPTOR (tests/helpers/hermeticNetwork.mjs)
-#   that recognises the live broker hostnames and serves a checked-in fixture INSTEAD
-#   of dialling them. That interceptor — and the regression test that drives it — must,
-#   by construction, contain the hostnames as executable string literals. So "no live
-#   hostname anywhere in executable code" is not a property this codebase can satisfy:
-#   the very mechanism that keeps it hermetic names those hosts on purpose.
-#
-#   The provable invariant is therefore narrower and honest:
-#     * The hermetic-infrastructure files (the interceptor + its own regression test)
-#       are the ONLY places a live broker hostname may appear as executable code. They
-#       are named on FILE_ALLOWLIST below. They run under the runtime egress guard, so
-#       even their literals never reach the network.
-#     * EVERY OTHER tracked test file must not reference a live broker hostname in
-#       executable (non-comment) code. A new suite that hardcodes images.dhan.co in a
-#       fetch — i.e. re-introduces a real dial-out path — is flagged RED.
+# tracked test tree. Node-independent (git + awk only), so it holds even if the
+# runtime egress guard (.github/ci/no-egress-guard.mjs) were bypassed or removed.
 #
 # WHAT IT DOES
 #   * Looks ONLY at tracked files under tests/ (git ls-files), so build output,
 #     node_modules or local scratch cannot trip it.
-#   * Skips the FILE_ALLOWLIST entries entirely (they are the interception seam).
-#   * For every other test file, ignores matches inside comments (a `//` line comment,
-#     a line inside a `/* … */` block, or a JSDoc `*` continuation line) and inside
-#     Markdown prose (`.md` files are documentation, never executable), then flags any
-#     remaining reference to a LIVE broker hostname.
-#   * Exits non-zero (RED) if any such reference remains.
+#   * Flags any reference to a LIVE broker hostname:
+#         images.dhan.co  api.dhan.co  auth.dhan.co  api.kite.trade  calspread.online
+#   * Ignores matches inside a COMMENT — a `//` line comment, a line within a
+#     `/* … */` block, or a line whose first non-space character is `*` (the JSDoc
+#     banner style these suites use). A test that documents "never contacts
+#     calspread.online" in prose is fine; a test that puts one in executable code
+#     is not.
+#   * Ignores Markdown entirely (prose by definition).
+#   * Ignores the files on FILE_ALLOWLIST below.
+#   * Exits non-zero (RED) if any non-comment, non-allow-listed reference remains.
 #
-# Live broker hostnames a hermetic test must never dial:
-#     images.dhan.co  api.dhan.co  auth.dhan.co  api.kite.trade  calspread.online
+# THE ALLOW-LIST — and why each entry is safe
+#   These two files ARE the hermetic interception seam. They must NAME the live
+#   hostnames in executable code, because that is how they recognise a request and
+#   answer it from `tests/fixtures/dhan-scrip-master-detailed.sample.csv` instead of
+#   letting it out. Banning the names outright is incompatible with an
+#   interceptor-based design. Both also run under the armed runtime guard, so their
+#   literals provably never dial out.
 #
-# TO ADD AN ALLOWED DESTINATION
-#   If a NEW file must legitimately reference a broker host as executable code (e.g. a
-#   second interceptor), add its repo-relative path to FILE_ALLOWLIST below with a
-#   one-line justification. Do NOT relax the hostname pattern — narrow the allowance to
-#   the specific file that owns the interception, so the blast radius stays visible.
+#   To add an allowed destination:
+#     * loopback (127.0.0.0/8, ::1, localhost) needs nothing — already allowed;
+#     * a broker-SHAPED endpoint should be served by a local mock or by the
+#       hermetic helper's fixture table;
+#     * a genuinely NEW interception seam gets its path added below, with a
+#       justification. Never relax the hostname pattern itself.
 #
-# Usage:  no-live-hostnames.sh [root]     (root defaults to the repo cwd)
+# WHY THIS IS ONE awk PASS
+#   The first version of this script ran `printf | grep` and `printf | sed`
+#   pipelines PER LINE — up to six forks a line across roughly 40,000 lines of test
+#   code, i.e. on the order of 240,000 process spawns. It took 4m55s in CI and
+#   5m02s locally (3m22s of it in `sys`), making a text scan the slowest job in the
+#   pipeline by two orders of magnitude. awk tracks block-comment state natively,
+#   so the whole scan is one process and the semantics above are unchanged.
 
 set -euo pipefail
 
 ROOT="${1:-.}"
 cd "$ROOT"
 
-# Live broker hostnames that a hermetic test must never reach.
-HOSTS='images\.dhan\.co|api\.dhan\.co|auth\.dhan\.co|api\.kite\.trade|calspread\.online'
+# Deliberately a plain ERE shared by the matcher and the reporter, so the hostname
+# named in a failure is always one the scan actually matched.
+#
+# The dots are DOUBLE-escaped. `awk -v` processes escape sequences in the value it
+# assigns, so a shell-side `\.` arrives at awk as a bare `.` — which both emits
+# "escape sequence `\.' treated as plain `.'" on every run AND quietly loosens the
+# pattern, since `.` matches any character (`imagesXdhanYco` would have matched).
+# `\\.` in the shell arrives as `\.`, giving awk a literal dot.
+HOSTS='images\\.dhan\\.co|api\\.dhan\\.co|auth\\.dhan\\.co|api\\.kite\\.trade|calspread\\.online'
 
-# Files that ARE the hermetic interception seam and therefore MUST name these hosts as
-# executable code. Each is exercised under the runtime egress guard, so its literals are
-# served from fixtures and never dial out. Keep this list minimal and justified.
 FILE_ALLOWLIST=(
-  # The fetch interceptor: matches the live hostnames to serve checked-in fixtures.
   "tests/helpers/hermeticNetwork.mjs"
-  # The interceptor's own regression test: drives fetch() at those hosts to prove the
-  # interceptor serves the fixture rather than the network.
   "tests/box/hermeticNetwork.test.mjs"
 )
 
-is_allowlisted_file() {
-  local file="$1" entry
-  for entry in "${FILE_ALLOWLIST[@]}"; do
-    [ "$entry" = "$file" ] && return 0
-  done
-  return 1
-}
+# Tracked, non-Markdown files under tests/. `git ls-files` means an untracked local
+# scratch file cannot fail the build, and a deleted-but-tracked path is filtered by
+# awk's own existence check via the shell test below.
+mapfile -t FILES < <(git ls-files -- 'tests' | grep -v '\.md$' || true)
 
-# All tracked test files.
-mapfile -t FILES < <(git ls-files 'tests/**' 2>/dev/null || git ls-files | grep '^tests/')
-
-violations=0
+# Drop the allow-listed paths and anything no longer on disk.
+SCAN=()
 for f in "${FILES[@]}"; do
   [ -f "$f" ] || continue
-  if is_allowlisted_file "$f"; then
-    continue
-  fi
-  # Markdown is documentation, never executable — skip it wholesale.
-  case "$f" in
-    *.md) continue ;;
-  esac
-
-  # Track whether we are inside a /* … */ block so multi-line banners are ignored.
-  in_block=0
-  lineno=0
-  while IFS= read -r line || [ -n "$line" ]; do
-    lineno=$((lineno + 1))
-    stripped="$line"
-
-    # Handle block-comment state transitions (coarse but sufficient for these
-    # single-purpose test files, which only use banner-style /** … */ blocks).
-    if [ "$in_block" -eq 1 ]; then
-      if printf '%s' "$line" | grep -q '\*/'; then in_block=0; fi
-      continue
-    fi
-    if printf '%s' "$line" | grep -qE '/\*'; then
-      # A block opens on this line; if it does not also close, enter block state.
-      printf '%s' "$line" | grep -qE '\*/' || in_block=1
-      # Drop the block-comment portion before scanning the rest of the line.
-      stripped="$(printf '%s' "$line" | sed -E 's#/\*.*$##')"
-    fi
-
-    # Drop `//` line comments, but NOT the `//` inside a URL scheme (`https://`,
-    # `http://`). Only a `//` that is at line start or preceded by whitespace or a
-    # non-`:` character begins a comment; `://` never does. This keeps a real
-    # `fetch("https://images.dhan.co/…")` intact so it is still scanned, while a
-    # trailing `// … images.dhan.co …` comment is dropped.
-    stripped="$(printf '%s' "$stripped" | sed -E 's#(^|[^:])//.*$#\1#')"
-    # Drop JSDoc `*` continuation lines.
-    if printf '%s' "$stripped" | grep -qE '^[[:space:]]*\*'; then
-      continue
-    fi
-
-    # Now test only the executable remainder of the line.
-    if printf '%s' "$stripped" | grep -qE "$HOSTS"; then
-      host="$(printf '%s' "$stripped" | grep -oE "$HOSTS" | head -n1)"
-      echo "FAIL: live broker hostname '${host}' in executable code: ${f}:${lineno}"
-      echo "      ${line}"
-      violations=$((violations + 1))
-    fi
-  done < "$f"
+  skip=0
+  for entry in "${FILE_ALLOWLIST[@]}"; do
+    [ "$entry" = "$f" ] && skip=1 && break
+  done
+  [ "$skip" -eq 0 ] && SCAN+=("$f")
 done
 
-if [ "$violations" -ne 0 ]; then
-  echo ""
-  echo "${violations} hardcoded live-broker hostname reference(s) found in executable test code."
-  echo "Hermetic tests must drive the interceptor in tests/helpers/hermeticNetwork.mjs (which"
-  echo "serves a checked-in fixture) rather than dialling a broker. If a reference is legitimate"
-  echo "prose, keep it inside a comment; if a NEW file genuinely owns an interception seam, add"
-  echo "its path to FILE_ALLOWLIST in .github/ci/no-live-hostnames.sh with a justification."
-  exit 1
+if [ "${#SCAN[@]}" -eq 0 ]; then
+  echo "OK: no tracked test files to scan."
+  exit 0
 fi
 
-echo "OK: no hardcoded live-broker hostnames in executable test code."
-echo "    (comments and Markdown prose are ignored; the hermetic interception seam"
-echo "     — ${FILE_ALLOWLIST[*]} — is allow-listed by path.)"
+# One awk process for the entire tree.
+#
+#   FNR==1  resets the block-comment state per file, so an unterminated `/*` in one
+#           file cannot silently blind the scan for every file after it.
+#   in_block  suppresses lines inside `/* … */`.
+#   The `//` strip is URL-safe: it requires the slashes NOT to be preceded by a
+#           colon, so `https://host` survives and only a real line comment is cut.
+#           (The original used a plain `s#//.*##`, which turned `https://` into
+#           `https:` and could HIDE a violation.)
+#   A line whose first non-space character is `*` is JSDoc continuation prose.
+#
+# The ORIGINAL line is printed in the report, not the stripped one, so the operator
+# sees exactly what is in the file.
+if awk -v hosts="$HOSTS" '
+  FNR == 1 { in_block = 0 }
+  {
+    original = $0
+    line = $0
+
+    if (in_block) {
+      if (line ~ /\*\//) { in_block = 0 }
+      next
+    }
+
+    if (line ~ /\/\*/) {
+      if (line !~ /\*\//) { in_block = 1 }
+      sub(/\/\*.*$/, "", line)
+    }
+
+    # URL-safe // comment strip.
+    line = gensub(/(^|[^:])\/\/.*$/, "\\1", 1, line)
+
+    if (line ~ /^[[:space:]]*\*/) { next }
+
+    if (match(line, hosts)) {
+      host = substr(line, RSTART, RLENGTH)
+      printf "FAIL: live broker hostname %c%s%c in executable code: %s:%d\n", 39, host, 39, FILENAME, FNR
+      printf "      %s\n", original
+      violations++
+    }
+  }
+  END { exit (violations > 0 ? 1 : 0) }
+' "${SCAN[@]}"; then
+  echo "OK: no hardcoded live-broker hostnames in executable test code."
+  echo "    (comments and Markdown prose are ignored; the hermetic interception seam"
+  echo "     — ${FILE_ALLOWLIST[*]} — is allow-listed by path.)"
+  exit 0
+fi
+
+cat <<'EOF'
+
+Hardcoded live-broker hostname reference(s) found in executable test code.
+Hermetic tests must drive the interceptor in tests/helpers/hermeticNetwork.mjs (which
+serves a checked-in fixture) rather than dialling a broker. If a reference is legitimate
+prose, keep it inside a comment; if a NEW file genuinely owns an interception seam, add
+its path to FILE_ALLOWLIST in .github/ci/no-live-hostnames.sh with a justification.
+EOF
+exit 1
