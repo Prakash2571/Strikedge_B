@@ -1,18 +1,22 @@
-import crypto from "node:crypto";
 
 /**
- * Minimal Kite Connect v3 client implemented with native `fetch` and
- * `node:crypto` so it needs no external dependencies.
+ * Minimal Kite Connect v3 client implemented with native `fetch` so it needs no
+ * external dependencies.
+ *
+ * StrikeEdge does NOT perform Zerodha OAuth: the api key and access token are
+ * provisioned by the CalSpread token provider and installed via
+ * `KiteClient.installProvidedToken`. The request-token exchange and the login-URL
+ * builder have been removed accordingly.
  *
  * Docs: https://kite.trade/docs/connect/v3/
  */
 
 const KITE_API_ROOT = "https://api.kite.trade";
-const KITE_LOGIN_ROOT = "https://kite.zerodha.com/connect/login";
 
 export interface KiteConfig {
   apiKey: string;
-  apiSecret: string;
+  /** Unused in StrikeEdge (no OAuth checksum); kept optional for config compatibility. */
+  apiSecret?: string;
 }
 
 export interface SessionData {
@@ -373,70 +377,40 @@ export class KiteError extends Error {
 
 export class KiteClient {
   private apiKey: string;
-  private apiSecret: string;
   private accessToken: string | null = null;
 
   constructor(config: KiteConfig) {
-    if (!config.apiKey || !config.apiSecret) {
-      throw new KiteError(
-        "KITE_API_KEY and KITE_API_SECRET must be set in the environment (.env).",
-        500,
-      );
-    }
-    this.apiKey = config.apiKey;
-    this.apiSecret = config.apiSecret;
-  }
-
-  /** Step 1: URL the user must visit to log in to Zerodha. */
-  getLoginUrl(): string {
-    const params = new URLSearchParams({ api_key: this.apiKey, v: "3" });
-    return `${KITE_LOGIN_ROOT}?${params.toString()}`;
+    // NO OAUTH IN STRIKEEDGE. The api key and access token are installed by the
+    // broker token acquisition service (`installProvidedToken`), which fetches them
+    // from the CalSpread provider. `api_secret` is therefore unused — there is no
+    // request-token checksum to compute — and an empty api key at construction is
+    // fine because the installer supplies it before the first authenticated call.
+    this.apiKey = config.apiKey ?? "";
   }
 
   /**
-   * Step 2/3: exchange the `request_token` returned on the redirect URL for an
-   * `access_token`. The checksum is SHA-256(api_key + request_token + api_secret).
+   * Install the api key + access token provisioned by the token acquisition
+   * service. This REPLACES the Zerodha OAuth login flow: StrikeEdge never exchanges
+   * a request token itself.
    */
-  async generateSession(requestToken: string): Promise<SessionData> {
-    if (!requestToken) {
-      throw new KiteError("Missing request_token.", 400);
-    }
+  installProvidedToken(apiKey: string, accessToken: string): void {
+    if (apiKey) this.apiKey = apiKey;
+    this.accessToken = accessToken;
+  }
 
-    const checksum = crypto
-      .createHash("sha256")
-      .update(this.apiKey + requestToken + this.apiSecret)
-      .digest("hex");
-
-    const body = new URLSearchParams({
-      api_key: this.apiKey,
-      request_token: requestToken,
-      checksum,
-    });
-
-    const res = await fetch(`${KITE_API_ROOT}/session/token`, {
-      method: "POST",
-      headers: {
-        "X-Kite-Version": "3",
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      body: body.toString(),
-    });
-
-    const json = (await res.json()) as {
-      status: string;
-      data?: SessionData;
-      message?: string;
-    };
-
-    if (!res.ok || json.status !== "success" || !json.data) {
-      throw new KiteError(
-        json.message ?? `Failed to generate session (HTTP ${res.status}).`,
-        res.status || 500,
-      );
-    }
-
-    this.accessToken = json.data.access_token;
-    return json.data;
+  /**
+   * Step 2/3 — DISABLED IN STRIKEEDGE.
+   *
+   * The Zerodha request-token exchange is removed: StrikeEdge never performs its
+   * own broker OAuth. The access token is provisioned by the CalSpread token
+   * provider and installed via {@link installProvidedToken}. Retained as a throwing
+   * stub so any lingering caller fails loudly rather than silently doing nothing.
+   */
+  async generateSession(_requestToken: string): Promise<SessionData> {
+    throw new KiteError(
+      "Zerodha OAuth login is disabled in StrikeEdge: the access token is provisioned by the CalSpread token provider, not by a request-token exchange.",
+      400,
+    );
   }
 
   /** Allow restoring a previously obtained access token (e.g. from a store). */

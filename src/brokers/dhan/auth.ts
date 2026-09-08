@@ -144,66 +144,45 @@ async function authFetch<T>(
 }
 
 /**
- * STEP 1 — generate a consent and return the browser login URL.
+ * STEP 1 — DISABLED IN STRIKEEDGE.
  *
- * Full-admin only at the route layer: it spends the app credentials and begins an
- * authentication the operator must finish in a browser.
+ * StrikeEdge never performs its own Dhan consent flow. The Dhan access token is
+ * fetched from the CalSpread provider (`src/tokens/tokenProviderClient.ts`),
+ * validated, encrypted and stored locally. This function is retained only so the
+ * ported `ActiveBrokerManager` compiles against the same surface; calling it is a
+ * configuration error, because it would begin a browser OAuth StrikeEdge must not
+ * own.
  */
 export async function generateDhanConsent(
-  creds: DhanAppCredentials,
-  timeoutMs = 10_000,
+  _creds: DhanAppCredentials,
+  _timeoutMs = 10_000,
 ): Promise<{ consentAppId: string; loginUrl: string }> {
-  const url = `${DHAN_AUTH_ROOT}/app/generate-consent?client_id=${encodeURIComponent(creds.clientId)}`;
-  const body = await authFetch<{
-    consentAppId?: string;
-    consentAppStatus?: string;
-  }>(url, creds, "POST", timeoutMs);
-
-  const consentAppId = body?.consentAppId;
-  if (!consentAppId || typeof consentAppId !== "string") {
-    throw new DhanError(
-      "Dhan did not return a consentAppId. Check DHAN_API_KEY / DHAN_API_SECRET and that the app is active.",
-      502,
-      "NO_CONSENT",
-      body,
-    );
-  }
-  return { consentAppId, loginUrl: dhanLoginUrl(consentAppId) };
+  throw new DhanError(
+    "Dhan consent login is disabled in StrikeEdge: the access token is provisioned by the CalSpread token provider, not by a Dhan consent flow.",
+    400,
+    "CONSENT_DISABLED",
+    null,
+  );
 }
 
 /**
- * STEP 3 — exchange the redirect's `tokenId` for an access token.
+ * STEP 3 — DISABLED IN STRIKEEDGE.
  *
- * The tokenId is SINGLE-USE, which is why the route in front of this must carry the
- * same StrictMode double-invoke protection the Zerodha flow already has: consuming
- * it twice fails the second time and would otherwise look like a broken login.
+ * See {@link generateDhanConsent}. There is no redirect `tokenId` to consume
+ * because StrikeEdge never initiates the browser login. Retained for the ported
+ * manager's type surface only.
  */
 export async function consumeDhanConsent(
-  creds: DhanAppCredentials,
-  tokenId: string,
-  timeoutMs = 10_000,
+  _creds: DhanAppCredentials,
+  _tokenId: string,
+  _timeoutMs = 10_000,
 ): Promise<DhanConsentSession> {
-  const url = `${DHAN_AUTH_ROOT}/app/consumeApp-consent?tokenId=${encodeURIComponent(tokenId)}`;
-  const body = await authFetch<Record<string, unknown>>(url, creds, "GET", timeoutMs);
-
-  const accessToken = typeof body.accessToken === "string" ? body.accessToken : "";
-  if (!accessToken) {
-    throw new DhanError(
-      "Dhan did not return an access token for this tokenId. It may already have been used or expired.",
-      502,
-      "NO_ACCESS_TOKEN",
-      // Deliberately not echoing the body: it is an auth response.
-      null,
-    );
-  }
-  return {
-    accessToken,
-    dhanClientId: str(body.dhanClientId) || creds.clientId,
-    dhanClientName: str(body.dhanClientName),
-    dhanClientUcc: str(body.dhanClientUcc),
-    givenPowerOfAttorney: body.givenPowerOfAttorney === true || body.givenPowerOfAttorney === "true",
-    expiryTime: parseExpiry(body.expiryTime),
-  };
+  throw new DhanError(
+    "Dhan consent login is disabled in StrikeEdge: the access token is provisioned by the CalSpread token provider, not by a Dhan consent flow.",
+    400,
+    "CONSENT_DISABLED",
+    null,
+  );
 }
 
 /**
