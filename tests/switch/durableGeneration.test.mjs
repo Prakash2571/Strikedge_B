@@ -92,3 +92,66 @@ test("concurrent switches cannot land on the same generation", async () => {
 test("saveActiveBroker rejects an invalid broker name", async () => {
   await assert.rejects(() => store.saveActiveBroker("etrade", "op"), /invalid broker/i);
 });
+
+/**
+ * The durable `active_broker` record OUTRANKS `DEFAULT_ACTIVE_BROKER`.
+ *
+ * `DEFAULT_ACTIVE_BROKER` was specified and documented with ZERO references in `src` — the
+ * initial broker was hardcoded, so setting it did nothing. It is now honoured, and this is
+ * the load-bearing half of that change: it decides the FIRST boot of a fresh deployment and
+ * nothing else. A restart must never silently revert an operator's broker switch because a
+ * config default disagrees with it, since new trades would then be stamped with a broker the
+ * operator did not choose — a mistake that becomes invisible once written.
+ *
+ * Lives in the switch suite rather than tests/pg because it needs migrations 005/006
+ * (broker_sessions, active_broker), which the pg harness deliberately does not apply.
+ */
+test("the durable active_broker record outranks DEFAULT_ACTIVE_BROKER", async () => {
+  const sessions = await import("../../dist/brokerState/brokerSessions.js");
+  const registryMod = await import("../../dist/brokers/registry.js");
+
+  await sessions.saveActiveBroker("dhan", "test-operator");
+
+  const saved = process.env.DEFAULT_ACTIVE_BROKER;
+  process.env.DEFAULT_ACTIVE_BROKER = "zerodha";
+  let mgr;
+  try {
+    mgr = new registryMod.ActiveBrokerManager({
+      kite: {
+        getApiKey: () => "",
+        getAccessToken: () => null,
+        clearSession: () => {},
+        getInstruments: async () => [],
+        getQuoteFull: async () => ({}),
+      },
+      tickerHub: {
+        addTickListener: () => () => {},
+        addConnectionListener: () => () => {},
+        retain: () => () => {},
+        seed: () => {},
+        ingestExternalTicks: () => {},
+        setExternalConnected: () => {},
+        getLatestTick: () => null,
+        subscribeTokens: () => {},
+        unsubscribeTokens: () => {},
+        subscribedCount: () => 0,
+        isConnected: () => false,
+      },
+      boxConfig: () => ({}),
+      istDayKey: () => "2026-09-08",
+      zerodhaCredentials: () => ({ apiKey: "", accessToken: null }),
+      onDhanTicks: () => {},
+    });
+  } finally {
+    if (saved === undefined) delete process.env.DEFAULT_ACTIVE_BROKER;
+    else process.env.DEFAULT_ACTIVE_BROKER = saved;
+  }
+
+  assert.equal(mgr.activeBroker, "zerodha", "starts on the configured default");
+  await mgr.restore();
+  assert.equal(
+    mgr.activeBroker,
+    "dhan",
+    "restore() must adopt the durable selection over the config default",
+  );
+});
