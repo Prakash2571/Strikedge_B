@@ -16,9 +16,15 @@
 -- All timestamps are timestamptz, all money/quantities are numeric.
 
 -- A named domain for the broker discriminator so every table agrees on the values.
+-- The guard is schema-aware (current_schema) so applying the migration into a fresh
+-- schema — as the test harness does for isolation — always creates the domain there.
 DO $$
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'box_broker') THEN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_type t
+    JOIN pg_namespace n ON n.oid = t.typnamespace
+    WHERE t.typname = 'box_broker' AND n.nspname = current_schema()
+  ) THEN
     CREATE DOMAIN box_broker AS text
       CHECK (VALUE IN ('zerodha', 'dhan'));
   END IF;

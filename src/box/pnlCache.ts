@@ -29,7 +29,7 @@ import {
  */
 export type RedisCommand = [command: string, ...args: (string | number)[]];
 
-const dayKey = (day: string): string => `box:pnl:day:${day}`;
+const dayKey = (day: string): string => `calspread:box:pnl:day:${day}`;
 
 export interface CachedDay {
   rows: BoxDailyPnlRow[];
