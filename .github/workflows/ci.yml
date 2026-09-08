@@ -1,0 +1,352 @@
+name: CI
+
+# Every push to main and every pull request must install cleanly, typecheck/build, and pass ALL
+# seven test suites — including the ones that need a real database. StrikeEdge's whole reason to
+# exist is that PostgreSQL is the operational authority and MongoDB is the async replica, so a CI
+# run that "passed" only because the databases were missing (and the suites quietly skipped) would
+# be a lie. This workflow provisions REAL service containers and then FAILS the build if any
+# database-dependent suite reports even one skipped test. See job `no-silent-skips`.
+#
+# NO SECRETS, NO BROKER. This workflow requires NO repository secret and contacts NO real broker.
+#   * The token suite drives a LOCAL mock HTTP server (127.0.0.1, node:http) — nothing here ever
+#     reaches calspread.online or any Zerodha/Dhan endpoint.
+#   * Any broker passcode/secret referenced below is an OBVIOUSLY FAKE test value, inline and
+#     constant. If a step ever needs a genuine credential, that is a bug in the test, not something
+#     to paper over with a GitHub secret.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Read-only token: this workflow reads the repo and runs tests. It writes nothing back.
+permissions:
+  contents: read
+
+# One in-flight run per ref; a newer push cancels the older run rather than queueing behind it.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Toolchain and service images are pinned EXPLICITLY by full version / digest-style tag rather than
+# by floating major, so a silent upstream bump cannot change install or runtime behaviour under us.
+# Node 22.23.2 bundles npm 11.4.2; the npm pin is applied anyway so a change to the bundled version
+# cannot silently alter `npm ci` behaviour.
+env:
+  NODE_VERSION: 22.23.2
+  NPM_VERSION: 11.4.2
+  POSTGRES_IMAGE: postgres:17.2-alpine
+  MONGO_IMAGE: mongo:7.0.14
+  # The exact endpoints the test helpers default to (see tests/pg/helpers.mjs,
+  # tests/projector/helpers.mjs, tests/tokens/helpers.mjs, tests/access/helpers.mjs). We map the
+  # service containers onto these host ports so the suites talk to the real databases.
+  DATABASE_URL: postgres://strikedge:strikedge@127.0.0.1:55432/strikedge
+  MONGODB_URI: mongodb://127.0.0.1:57017/strikedge_test
+  # Fake, constant test key material. NEVER a real secret.
+  #   * SITE_ACCESS_SECRET — the access suite mostly sets its own per-test secret via a helper env
+  #     override, but a repo-level fake is provided so nothing depends on a real value.
+  #   * BROKER_TOKEN_ENCRYPTION_KEY — src/brokerState/tokenCrypto.ts accepts 64-char hex OR base64
+  #     that decodes to exactly 32 bytes. This is 64 hex chars = 32 bytes: an obviously-fake all-zero
+  #     -ish pattern, valid as key material but plainly not a production key.
+  SITE_ACCESS_SECRET: ci-fake-site-access-secret-not-a-real-passcode
+  BROKER_TOKEN_ENCRYPTION_KEY: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+
+jobs:
+  # ── 1. Clean dependency installation ────────────────────────────────────────────────────
+  #
+  # STRICT `npm ci`, with NO `npm install` fallback. `npm ci || npm install` would turn a lockfile
+  # that disagrees with package.json into a warning annotation and a GREEN build. `npm ci` is the
+  # only install command here, so a stale or incomplete lockfile now fails the pipeline.
+  install:
+    name: 1. Clean install (strict npm ci)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      - name: Pin npm
+        run: npm install -g npm@${{ env.NPM_VERSION }}
+      - name: Record toolchain versions
+        run: |
+          echo "node: $(node -v)"
+          echo "npm:  $(npm -v)"
+      - name: npm ci
+        run: npm ci
+      # `npm ci` already refuses a lockfile that disagrees with package.json. This additionally
+      # proves the install did not need to REWRITE the lockfile: if `npm ci` ever leaves the working
+      # tree dirty, the committed lockfile was not a faithful resolution.
+      - name: Lockfile must be complete and in sync
+        run: git diff --exit-code -- package-lock.json
+      - name: Upload npm logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-logs-install
+          path: ~/.npm/_logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ── 2. Build (tsc -b, which is also the typecheck) ──────────────────────────────────────
+  #
+  # `npm run build` and `npm run typecheck` are the SAME command (`tsc -b`) in package.json, so a
+  # single build step covers both. `noEmitOnError` in tsconfig means a type error produces no dist/.
+  build:
+    name: 2. Build / typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      - name: Pin npm
+        run: npm install -g npm@${{ env.NPM_VERSION }}
+      - run: npm ci
+      - name: npm run build
+        run: npm run build
+      # A type error leaves NO dist/ (noEmitOnError). Asserting the entrypoint exists turns "the
+      # build silently emitted nothing" into a failure rather than an empty success.
+      - name: Build output must exist
+        run: test -f dist/index.js
+      - name: Upload npm logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-logs-build
+          path: ~/.npm/_logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ── 3. Full test matrix against REAL PostgreSQL + MongoDB ───────────────────────────────
+  #
+  # All seven suites run here, in the required order, against pinned service containers. The
+  # database-dependent suites (pg / projector / tokens / access / switch) connect to the real
+  # services; the Box unit suite and the shutdown suite run alongside them.
+  #
+  # SKIP DETECTION (the core anti-silent-skip requirement): each suite's stdout+stderr is captured
+  # to tests-out/<suite>.log. After the suites run, the `no-silent-skips` step reads the LAST
+  # "skipped N" summary line node --test prints (spec reporter emits "ℹ skipped N" in non-TTY CI;
+  # the TAP reporter emits "# skipped N" — both are matched) and FAILS the build if N != 0 for any
+  # database-dependent suite, or if the line is MISSING entirely (which would mean the suite never
+  # ran). So a future test that starts skipping because a database went missing turns the build RED
+  # rather than passing green.
+  test:
+    name: 3. Tests (real PostgreSQL + MongoDB)
+    runs-on: ubuntu-latest
+    needs: [install, build]
+    services:
+      # PostgreSQL — StrikeEdge's operational authority. Mapped to host port 55432 to match the
+      # DATABASE_URL the test helpers default to. Health-checked with pg_isready so the test steps
+      # only start once the server genuinely accepts connections.
+      postgres:
+        image: postgres:17.2-alpine
+        env:
+          POSTGRES_USER: strikedge
+          POSTGRES_PASSWORD: strikedge
+          POSTGRES_DB: strikedge
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U strikedge -d strikedge"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      # MongoDB — the async read replica. Mapped to host port 57017 to match MONGODB_URI. Health-
+      # checked with a real ping so the projector suite only starts once Mongo answers.
+      mongodb:
+        image: mongo:7.0.14
+        ports:
+          - 57017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ ping: 1 }).ok' | grep -q 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      - name: Pin npm
+        run: npm install -g npm@${{ env.NPM_VERSION }}
+      - run: npm ci
+      - name: npm run build
+        run: npm run build
+
+      # Belt-and-braces readiness gate on top of the container health checks: block until BOTH
+      # databases actually answer from inside the job's network namespace before any test runs. A
+      # health check that is "starting" is not the same as "reachable from here".
+      - name: Wait for PostgreSQL and MongoDB to be genuinely ready
+        run: |
+          set -euo pipefail
+          echo "Waiting for PostgreSQL on 127.0.0.1:55432 ..."
+          for i in $(seq 1 60); do
+            if node --input-type=module -e "import pg from 'pg'; const c=new pg.Client({connectionString:process.env.DATABASE_URL}); await c.connect(); await c.query('select 1'); await c.end();" 2>/dev/null; then
+              echo "PostgreSQL is ready."; break
+            fi
+            if [ "$i" -eq 60 ]; then echo "PostgreSQL never became ready"; exit 1; fi
+            sleep 2
+          done
+          echo "Waiting for MongoDB on 127.0.0.1:57017 ..."
+          for i in $(seq 1 60); do
+            if node --input-type=module -e "import {MongoClient} from 'mongodb'; const c=new MongoClient(process.env.MONGODB_URI,{serverSelectionTimeoutMS:2000}); await c.connect(); await c.db().command({ping:1}); await c.close();" 2>/dev/null; then
+              echo "MongoDB is ready."; break
+            fi
+            if [ "$i" -eq 60 ]; then echo "MongoDB never became ready"; exit 1; fi
+            sleep 2
+          done
+
+      # Run every suite, in the required order, capturing each one's output to a per-suite log so the
+      # no-silent-skips step can assert on the skip counts afterwards. `set -o pipefail` + `tee`
+      # preserves each suite's real exit status, so a genuine test FAILURE still fails this step
+      # immediately; the log capture is only for the skip audit.
+      - name: Prepare capture dir
+        run: mkdir -p tests-out
+
+      - name: Box unit suite (npm run test:unit)
+        run: set -o pipefail; npm run test:unit 2>&1 | tee tests-out/unit.log
+
+      - name: PostgreSQL integration suite (npm run test:pg)
+        run: set -o pipefail; npm run test:pg 2>&1 | tee tests-out/pg.log
+
+      - name: Mongo outbox/projector suite (npm run test:projector)
+        run: set -o pipefail; npm run test:projector 2>&1 | tee tests-out/projector.log
+
+      - name: Dual-token suite (npm run test:tokens)
+        run: set -o pipefail; npm run test:tokens 2>&1 | tee tests-out/tokens.log
+
+      - name: Broker-switch suite (npm run test:switch)
+        run: set -o pipefail; npm run test:switch 2>&1 | tee tests-out/switch.log
+
+      - name: Access-gate suite (npm run test:access)
+        run: set -o pipefail; npm run test:access 2>&1 | tee tests-out/access.log
+
+      - name: Shutdown suite (npm run test:shutdown)
+        run: set -o pipefail; npm run test:shutdown 2>&1 | tee tests-out/shutdown.log
+
+      # ── The anti-silent-skip gate ──────────────────────────────────────────────────────
+      #
+      # MECHANISM: node --test prints a summary line "ℹ skipped N" (spec reporter, the default in
+      # non-TTY CI) or "# skipped N" (TAP reporter). For every DB-dependent suite we take the LAST
+      # such line in its captured log and require N == 0. If the line is missing, we treat that as a
+      # failure too — a missing summary means the suite did not actually run (e.g. the glob matched
+      # no files), which for a required DB suite is exactly the silent-skip failure mode we are
+      # guarding against. Because DATABASE_URL / MONGODB_URI point at the real service containers
+      # above, the only way these suites can skip is if a database becomes unreachable — and this
+      # step makes that turn the build RED instead of green.
+      - name: Fail if any database suite skipped tests (no silent skips)
+        run: |
+          set -euo pipefail
+          # These suites MUST touch a real database and MUST NOT skip. (The Box unit suite is not in
+          # this list: its own owner enforces zero skips within the suite; here we guard the ones
+          # that would silently skip specifically because a database is absent.)
+          db_suites="pg projector tokens switch access"
+          fail=0
+          for suite in $db_suites; do
+            log="tests-out/${suite}.log"
+            if [ ! -f "$log" ]; then
+              echo "FAIL: ${suite}: no captured log — suite did not run."
+              fail=1; continue
+            fi
+            # Match both reporter styles; take the last summary occurrence; extract the integer.
+            skipped="$(grep -aoE '(#|ℹ) skipped [0-9]+' "$log" | tail -n1 | grep -oE '[0-9]+' || true)"
+            if [ -z "${skipped}" ]; then
+              echo "FAIL: ${suite}: no 'skipped N' summary line found — did the suite run at all?"
+              fail=1; continue
+            fi
+            if [ "${skipped}" != "0" ]; then
+              echo "FAIL: ${suite}: reported ${skipped} skipped test(s). A DB suite must never skip;"
+              echo "      a skip here almost always means the database was unreachable."
+              fail=1; continue
+            fi
+            echo "OK: ${suite}: 0 skipped."
+          done
+          if [ "${fail}" -ne 0 ]; then
+            echo "One or more database suites skipped tests — failing the build."
+            exit 1
+          fi
+          echo "All database suites reported 0 skipped tests."
+
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: tests-out/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ── 4. Safety defaults in the example configuration ─────────────────────────────────────
+  #
+  # Proves the shipped example config is SAFE BY DEFAULT: it must not turn live trading on. Two
+  # independent guarantees are asserted against .env.example:
+  #     BOX_EXECUTION_MODE      is NOT `live`   (default is paper_latency; see src/box/config.ts)
+  #     BOX_LIVE_TRADING_ENABLED is NOT `true`  (default is false)
+  #
+  # NOTE: .env.example is authored by another agent and may not exist yet at the time this workflow
+  # first lands. This step FAILS if the file is missing, on purpose — a repo that ships a runnable
+  # backend without a safe example config is itself a problem worth flagging. If you are seeing this
+  # fail only because .env.example has not been written yet, that is the expected cross-dependency,
+  # not a defect in this workflow.
+  safety-defaults:
+    name: 4. Safety defaults (example config never live)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: .env.example must exist and must not enable live trading
+        run: |
+          set -euo pipefail
+          if [ ! -f .env.example ]; then
+            echo "FAIL: .env.example does not exist. It is authored by another agent; this workflow"
+            echo "      depends on it. Until it lands, this safety check cannot pass."
+            exit 1
+          fi
+          # Extract the effective (last, uncommented) value for each key. Tolerates surrounding
+          # whitespace and optional quotes. Comments (# ...) are ignored.
+          value_of() {
+            grep -E "^[[:space:]]*$1[[:space:]]*=" .env.example \
+              | sed -E "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//" \
+              | sed -E 's/[[:space:]]*#.*$//' \
+              | sed -E 's/^["'\'']//; s/["'\'']$//' \
+              | tail -n1
+          }
+          mode="$(value_of BOX_EXECUTION_MODE || true)"
+          live="$(value_of BOX_LIVE_TRADING_ENABLED || true)"
+          echo "BOX_EXECUTION_MODE=${mode:-<unset>}"
+          echo "BOX_LIVE_TRADING_ENABLED=${live:-<unset>}"
+          fail=0
+          # Case-insensitive compare so `Live`/`TRUE` cannot sneak through.
+          if printf '%s' "${mode}" | grep -qiE '^live$'; then
+            echo "FAIL: BOX_EXECUTION_MODE is 'live' in the example config."; fail=1
+          fi
+          if printf '%s' "${live}" | grep -qiE '^true$'; then
+            echo "FAIL: BOX_LIVE_TRADING_ENABLED is 'true' in the example config."; fail=1
+          fi
+          [ "${fail}" -eq 0 ] && echo "OK: example configuration is paper-safe by default."
+          exit "${fail}"
+
+  # ── 5. No committed secrets ─────────────────────────────────────────────────────────────
+  #
+  # Fails if a real .env or an obvious credential/key file was accidentally committed. .env.example
+  # is explicitly allowed (it is a template, not a secret).
+  no-committed-secrets:
+    name: 5. No committed secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Grep the tree for committed env/credential files
+        run: |
+          set -euo pipefail
+          # Only look at TRACKED files, so build output or local scratch cannot cause a false alarm.
+          offenders="$(git ls-files \
+            | grep -E '(^|/)\.env($|\.[^/]*$)|(^|/)\.env\.[^/]*$|(^|/)(credentials|secrets)\.(json|ya?ml|txt)$|\.(pem|key|pfx|p12)$' \
+            | grep -Ev '(^|/)\.env\.example$' \
+            || true)"
+          if [ -n "${offenders}" ]; then
+            echo "FAIL: the repository contains committed secret/credential files:"
+            echo "${offenders}"
+            exit 1
+          fi
+          echo "OK: no committed .env or credential files (only .env.example, which is a template)."
