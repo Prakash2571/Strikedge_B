@@ -32,6 +32,70 @@ npm run test:shutdown    # tests/shutdown/** — graceful shutdown coordinator +
 | switch | `tests/switch/` | Broker switching and durable generation fencing. |
 | shutdown | `tests/shutdown/` | The `ShutdownCoordinator` behaviour and the declared step ORDER in `src/index.ts`. |
 
+## Hermetic network — tests NEVER contact a real broker
+
+Every test runs offline against loopback services only (PostgreSQL, MongoDB). No test may
+reach a live broker endpoint. This is enforced, not merely intended.
+
+**Why.** Three suites used to make 24 real outbound HTTPS calls per run — 23 to
+`images.dhan.co` for the ~201,075-row Dhan scrip master, 1 to `api.kite.trade` for the
+Zerodha instrument dump — through the REAL code paths:
+
+- `DhanInstrumentStore.fetchMaster()` (`src/brokers/dhan/instruments.ts`) downloads the
+  scrip master on every `switchBroker("dhan", …)` and every `InstrumentProvider.load()`
+  while Dhan is active.
+- `KiteClient.getInstruments()` (`src/kite.ts`) downloads the Zerodha dump whenever
+  `InstrumentProvider.load()` runs while Zerodha is active (e.g. a morning switch back).
+
+That made the suite **non-deterministic** (the live master changes daily), **slow**
+(~4.5 s per parse, ~90 s of a CI run) and **network-dependent** (a slow or unreachable
+`images.dhan.co` turned CI red for reasons unrelated to the code). A trading system's
+tests must not have those properties, and the CI workflow's claim that it never contacts
+a real broker must be true.
+
+**How.** `tests/helpers/hermeticNetwork.mjs` installs a `globalThis.fetch` interceptor —
+a production-faithful seam that needs NO change to `src/`, because both code paths already
+go through `fetch`. It:
+
+1. serves the Dhan scrip master (detailed AND fallback URL) from the trimmed, checked-in
+   fixture `tests/fixtures/dhan-scrip-master-detailed.sample.csv`;
+2. serves the Zerodha instrument dump from a minimal CSV stub with the exact Kite header;
+3. always allows loopback (`127.0.0.1` / `localhost` / `::1`);
+4. **fails closed** — a request to any other host THROWS, naming the URL, so an accidental
+   future dial-out is a red test rather than a silent egress.
+
+Suites that drive these paths (`tests/box/singleBroker.test.mjs`,
+`tests/switch/managerSwitch.test.mjs`, `tests/tokens/morningDefault.test.mjs`) arm the
+guard in a `before()` hook and `restore()` it in `after()` so it cannot leak between files.
+`tests/box/hermeticNetwork.test.mjs` is the regression guard: it proves the fail-closed
+throw fires, that both broker URLs are served from fixtures, and that a real
+`DhanInstrumentStore` load touches only `images.dhan.co` (intercepted, never forwarded).
+
+**Fixture provenance.** See `tests/fixtures/README.md`. The fixture is a TRIMMED SAMPLE of
+the live master (14 data rows vs ~201k), with the exact upstream header row so the
+header-driven parser maps every column by name exactly as in production. It is derived
+from real rows, not invented.
+
+**Adding a new stub.** If a new test exercises a code path that calls another broker
+endpoint, register it explicitly rather than letting it dial out:
+
+```js
+import { installHermeticNetwork } from "../helpers/hermeticNetwork.mjs";
+
+let hermetic;
+before(() => { hermetic = installHermeticNetwork(); });
+after(() => { hermetic?.restore(); });
+
+// inside a test, before the code path runs:
+hermetic.stub("api.dhan.co", (url, init) =>
+  new Response(JSON.stringify({ /* whatever the endpoint returns */ }), { status: 200 }));
+```
+
+`stub(matcher, responder)` accepts a substring/host string or a `(url) => boolean`
+predicate. If you find yourself stubbing a broker's *data* dump broadly, prefer adding a
+checked-in fixture (as with the scrip master) so the assertion tests real shape. Never
+weaken the guard to "pass through" an unknown host.
+
 ## Test files removed during the extraction, and why
 
 Three ported CalSpread test files targeted modules that StrikeEdge deliberately did NOT copy.
