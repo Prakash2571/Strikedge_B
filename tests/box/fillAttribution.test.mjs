@@ -36,7 +36,7 @@
  * BOX_TEST_MONGODB_URI is set.
  */
 
-import test, { after } from "node:test";
+import test from "node:test";
 import assert from "node:assert/strict";
 
 import { BoxOrderManager } from "../../dist/box/orderManager.js";
@@ -429,110 +429,4 @@ test("A10: a refused (stale) durable write adds no exposure on top of the reconc
     journal.updates.some((u) => u.applied === false),
     "the refusal is real, not an artefact of the assertion",
   );
-});
-
-/* ══════════════════ A11. REAL MongoDB atomicity ══════════════════ */
-
-const URI = (process.env.BOX_TEST_MONGODB_URI ?? "").trim();
-const mongoSkip = URI
-  ? false
-  : "set BOX_TEST_MONGODB_URI to a throwaway database to run the real MongoDB attribution tests";
-
-let mongoCtx = null;
-async function mongoContext() {
-  if (mongoCtx === null) {
-    process.env.BOX_MONGODB_URI = URI;      // db.ts reads URIs at module load
-    const [db, repo, model] = await Promise.all([
-      import("../../dist/db.js"),
-      import("../../dist/box/repository.js"),
-      import("../../dist/box/model.js"),
-    ]);
-    await db.initBoxConnection();
-    await model.BoxOrderIntent.deleteMany({});
-    mongoCtx = { repo, model };
-  }
-  return mongoCtx;
-}
-
-test("A11 (real Mongo): concurrent guarded updates report deltas that sum to the final cumulative quantity", async (t) => {
-  if (mongoSkip) return t.skip(mongoSkip);
-  const { repo, model } = await mongoContext();
-  await model.BoxOrderIntent.deleteMany({});
-
-  const base = {
-    client_order_id: "BOX:mongo-attr:ENTRY:k1_ce:attempt-1",
-    broker_order_id: null, broker_mode: "live", trade_id: "mongo-attr", attempt_id: "attempt-1",
-    role: "k1_ce", purpose: "ENTRY", phase: "entry", exchange: "NFO", tradingsymbol: "SYM-k1_ce",
-    token: 1001, side: "BUY", quantity: 75, reference_price: 100, tick_size: 0.05,
-    max_chase_ticks: 2, limit_price: 100.1, state: "SUBMITTING", filled_quantity: 0,
-    average_price: null, broker_tag: null, reject_family: null, reject_reason: null,
-    created_at: new Date(), updated_at: new Date(), terminal_at: null, audit: [],
-  };
-  await repo.createBoxOrderIntent(base);
-
-  // Eight genuinely concurrent cumulative snapshots, arriving out of order.
-  const snapshots = [40, 40, 55, 10, 75, 55, 75, 30];
-  const results = await Promise.all(snapshots.map((filled, i) =>
-    repo.updateBoxOrderIntent(
-      base.client_order_id,
-      { state: filled >= 75 ? "COMPLETE" : "PARTIALLY_FILLED", filled_quantity: filled, average_price: 100, updated_at: new Date() },
-      { audit_id: `mongo-${i}`, at: new Date(), from: "SUBMITTING", to: "PARTIALLY_FILLED", broker_order_id: null, message: "race", fill_id: null, payload: null },
-    ),
-  ));
-
-  const attributed = results.reduce(
-    (sum, r) => sum + (r.applied ? (r.current_filled_quantity ?? 0) - (r.previous_filled_quantity ?? 0) : 0),
-    0,
-  );
-  const stored = await repo.findBoxOrderIntentByClientId(base.client_order_id);
-  assert.equal(stored.filled_quantity, 75, "the largest cumulative quantity wins in Mongo");
-  assert.equal(attributed, 75, `summed authoritative deltas must equal 75, got ${attributed}`);
-  assert.ok(
-    results.some((r) => r.applied === false) || results.every((r) => typeof r.previous_filled_quantity === "number"),
-    "every write reports its transition",
-  );
-  await model.BoxOrderIntent.deleteMany({});
-});
-
-test("A11b (real Mongo): the pre-image is stamped by the same atomic write, so a replay reports a zero-width transition", async (t) => {
-  if (mongoSkip) return t.skip(mongoSkip);
-  const { repo, model } = await mongoContext();
-  await model.BoxOrderIntent.deleteMany({});
-
-  const id = "BOX:mongo-attr2:ENTRY:k2_ce:attempt-1";
-  await repo.createBoxOrderIntent({
-    client_order_id: id, broker_order_id: null, broker_mode: "live", trade_id: "mongo-attr2",
-    attempt_id: "attempt-1", role: "k2_ce", purpose: "ENTRY", phase: "entry", exchange: "NFO",
-    tradingsymbol: "SYM-k2_ce", token: 1002, side: "BUY", quantity: 75, reference_price: 100,
-    tick_size: 0.05, max_chase_ticks: 2, limit_price: 100.1, state: "SUBMITTING",
-    filled_quantity: 0, average_price: null, broker_tag: null, reject_family: null,
-    reject_reason: null, created_at: new Date(), updated_at: new Date(), terminal_at: null, audit: [],
-  });
-  const audit = (n) => ({ audit_id: n, at: new Date(), from: "SUBMITTING", to: "COMPLETE", broker_order_id: null, message: "m", fill_id: null, payload: null });
-
-  const first = await repo.updateBoxOrderIntent(id, { state: "COMPLETE", filled_quantity: 40, updated_at: new Date() }, audit("one"));
-  assert.equal(first.applied, true);
-  assert.equal(first.previous_filled_quantity, 0);
-  assert.equal(first.current_filled_quantity, 40, "the real increment");
-
-  const replay = await repo.updateBoxOrderIntent(id, { state: "COMPLETE", filled_quantity: 40, updated_at: new Date() }, audit("two"));
-  assert.equal(replay.applied, true, "the $lte guard is non-strict, so an equal quantity IS applied");
-  assert.equal(replay.previous_filled_quantity, 40, "but the pre-image proves it advanced nothing");
-  assert.equal(replay.current_filled_quantity, 40);
-
-  await model.BoxOrderIntent.deleteMany({});
-});
-
-
-/**
- * Release the Mongo socket the A11 block opened.
- *
- * The connection is a live handle, so leaving it open keeps the test runner alive after the last
- * assertion and a MongoDB-enabled CI job hangs instead of reporting. A no-op when the suite ran
- * offline and never connected.
- */
-after(async () => {
-  if (!URI) return;
-  const { boxConnection } = await import("../../dist/db.js");
-  await boxConnection?.close();
 });

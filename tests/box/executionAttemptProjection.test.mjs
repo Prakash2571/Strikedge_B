@@ -1,6 +1,9 @@
-import test, { after } from "node:test";
+import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, resolve } from "node:path";
+import pg from "pg";
 
 import {
   MAX_FLATTEN_APPLICATION_IDS,
@@ -17,8 +20,11 @@ import {
   transitionResidualProjectionSnapshot,
 } from "../../dist/box/executionAttemptProjection.js";
 
-const URI = (process.env.BOX_TEST_MONGODB_URI ?? "").trim();
-if (URI) process.env.BOX_MONGODB_URI = URI;
+// NOTE: the former `real Mongo:` env-gated tests in this file (concurrent projection CAS,
+// legacy version-zero CAS, recovery-index establishment, crash-only adoption, and the Mongo
+// daily-risk index probe) were removed with the Mongo store. Their SQL equivalents live in
+// tests/pg/ (projectionCas.test.mjs, tradesAndRecovery.test.mjs) and the new pg_indexes probe
+// above. See tests/README.md for the one-to-one map.
 const {
   BOX_RECOVERY_KEY,
   BOX_RECOVERY_UNIQUE_INDEX,
@@ -656,326 +662,106 @@ test("the module-level readiness probe is fail-closed with no Box connection", (
   assert.equal(isBoxRecoveryPersistenceReady(), false);
 });
 
-const mongoSkip = URI
-  ? false
-  : "set BOX_TEST_MONGODB_URI to a throwaway database to run the real MongoDB projection CAS test";
-
-test("real Mongo: concurrent projection writers apply one charge/version", async (t) => {
-  if (mongoSkip) return t.skip(mongoSkip);
-  process.env.BOX_MONGODB_URI = URI;
-  const [db, repo, model] = await Promise.all([
-    import("../../dist/db.js"),
-    import("../../dist/box/repository.js"),
-    import("../../dist/box/model.js"),
-  ]);
-  await db.initBoxConnection();
-  await model.BoxExecutionAttempt.deleteMany({ candidate_key: "projection-cas-test" });
-  const before = residual(75, 1);
-  const created = await model.BoxExecutionAttempt.create({
-    candidate_key: "projection-cas-test",
-    residual_exposure: before,
-    resolved: false,
-    flatten_charges: 0,
-    projection_version: 0,
-    residual_projection_identity: residualProjectionIdentity(before),
-    applied_flatten_applications: [],
-  });
-  const command = createResidualProjectionCommand({
-    attemptId: created._id.toString(),
-    expectedVersion: 0,
-    expectedResidual: before,
-    nextResidual: residual(30, 2),
-    flattenChargeDay: "2026-09-07",
-    flattenChargeDelta: 4.5,
-  });
-
-  const results = await Promise.all([
-    repo.applyBoxExecutionAttemptProjection(created._id.toString(), command),
-    repo.applyBoxExecutionAttemptProjection(created._id.toString(), command),
-  ]);
-  const stored = await model.BoxExecutionAttempt.findById(created._id).lean();
-  assert.deepEqual(results.map((result) => result.status).sort(), ["already_applied", "applied"]);
-  assert.deepEqual(results.map((result) => result.flatten_charge_day), ["2026-09-07", "2026-09-07"]);
-  assert.deepEqual(results.map((result) => result.flatten_charges_for_day), [4.5, 4.5]);
-  assert.equal(stored.projection_version, 1);
-  assert.equal(stored.flatten_charges, 4.5);
-  assert.deepEqual(stored.residual_exposure, residual(30, 2));
-  await model.BoxExecutionAttempt.deleteMany({ candidate_key: "projection-cas-test" });
-});
-
-test("real Mongo: a physically legacy row accepts one version-zero CAS", async (t) => {
-  if (mongoSkip) return t.skip(mongoSkip);
-  const [db, repo, model] = await Promise.all([
-    import("../../dist/db.js"),
-    import("../../dist/box/repository.js"),
-    import("../../dist/box/model.js"),
-  ]);
-  await db.initBoxConnection();
-  await model.BoxExecutionAttempt.deleteMany({ candidate_key: "projection-legacy-cas-test" });
-  const before = residual(75, 1);
-  const id = new model.BoxExecutionAttempt()._id;
-  await model.BoxExecutionAttempt.collection.insertOne({
-    _id: id,
-    candidate_key: "projection-legacy-cas-test",
-    residual_exposure: before,
-    resolved: false,
-    flatten_charges: null,
-    // Deliberately omit projection_version, residual_projection_identity, and the application ring.
-  });
-  const command = createResidualProjectionCommand({
-    attemptId: id.toString(),
-    expectedVersion: 0,
-    expectedResidual: before,
-    nextResidual: residual(35, 2),
-    flattenChargeDay: "2026-09-07",
-    flattenChargeDelta: 6.25,
-  });
-
-  const result = await repo.applyBoxExecutionAttemptProjection(id.toString(), command);
-  const stored = await model.BoxExecutionAttempt.collection.findOne({ _id: id });
-  assert.equal(result.status, "applied");
-  assert.equal(result.flatten_charge_day, "2026-09-07");
-  assert.equal(result.flatten_charges_for_day, 6.25);
-  assert.equal(stored.projection_version, 1);
-  assert.equal(stored.flatten_charges, 6.25);
-  assert.equal(stored.flatten_charge_day, "2026-09-07");
-  assert.equal(stored.flatten_charges_for_day, 6.25);
-  assert.deepEqual(stored.residual_exposure, residual(35, 2));
-  assert.deepEqual(stored.applied_flatten_applications, [command.application_id]);
-  assert.equal((await repo.applyBoxExecutionAttemptProjection(id.toString(), command)).status, "already_applied");
-  await model.BoxExecutionAttempt.deleteMany({ candidate_key: "projection-legacy-cas-test" });
-});
-
-test("real Mongo: recovery index is established and duplicate unresolved rows fail closed", async (t) => {
-  if (mongoSkip) return t.skip(mongoSkip);
-  const [db, repo, model] = await Promise.all([
-    import("../../dist/db.js"),
-    import("../../dist/box/repository.js"),
-    import("../../dist/box/model.js"),
-  ]);
-  await db.initBoxConnection();
-  await model.BoxExecutionAttempt.init();
-  await model.BoxExecutionAttempt.deleteMany({ candidate_key: BOX_RECOVERY_KEY });
-  const dropRecoveryIndex = async () => {
-    try {
-      await model.BoxExecutionAttempt.collection.dropIndex(BOX_RECOVERY_UNIQUE_INDEX);
-    } catch (error) {
-      if (error?.code !== 27 && error?.codeName !== "IndexNotFound") throw error;
-    }
-  };
-
-  await dropRecoveryIndex();
-  await repo.initialiseBoxExecutionAttemptPersistence();
-  const indexes = await model.BoxExecutionAttempt.collection.indexes();
-  assert.equal(boxRecoveryPersistenceValidationError(indexes, []), null);
-
-  await dropRecoveryIndex();
-  const first = residual(75, 1);
-  const second = residual(30, 2);
-  await model.BoxExecutionAttempt.collection.insertMany([
-    {
-      _id: new model.BoxExecutionAttempt()._id,
-      candidate_key: BOX_RECOVERY_KEY,
-      resolved: false,
-      resolved_at: new Date(),
-      residual_exposure: first,
-      projection_version: 0,
-      residual_projection_identity: residualProjectionIdentity(first),
-      flatten_charges: 0,
-    },
-    {
-      _id: new model.BoxExecutionAttempt()._id,
-      candidate_key: BOX_RECOVERY_KEY,
-      resolved: false,
-      resolved_at: new Date(),
-      residual_exposure: second,
-      projection_version: 0,
-      residual_projection_identity: residualProjectionIdentity(second),
-      flatten_charges: 0,
-    },
-  ]);
-  try {
-    await assert.rejects(
-      () => repo.initialiseBoxExecutionAttemptPersistence(),
-      /duplicate unresolved rows require quarantine\/repair/,
-    );
-    await assert.rejects(
-      () => repo.ensureBoxRecoveryExecutionAttempt({
-        id: recoveryExecutionAttemptId(BOX_RECOVERY_KEY, first),
-        recoveryKey: BOX_RECOVERY_KEY,
-        residual: first,
-        executionMode: "live",
-        broker: "zerodha",
-        at: new Date(),
-      }),
-      /quarantined/,
-    );
-    const startupRows = await repo.loadUnresolvedBoxExecutionAttempts();
-    assert.equal(startupRows.some((row) => row.candidate_key === BOX_RECOVERY_KEY), false,
-      "unsafe duplicates are excluded from watchdog adoption");
-  } finally {
-    await model.BoxExecutionAttempt.deleteMany({ candidate_key: BOX_RECOVERY_KEY });
-    await repo.initialiseBoxExecutionAttemptPersistence();
-  }
-});
-
-test("real Mongo: crash-only recovery adopts the existing unresolved boundary across snapshot changes", async (t) => {
-  if (mongoSkip) return t.skip(mongoSkip);
-  process.env.BOX_MONGODB_URI = URI;
-  const [db, repo, model] = await Promise.all([
-    import("../../dist/db.js"),
-    import("../../dist/box/repository.js"),
-    import("../../dist/box/model.js"),
-  ]);
-  await db.initBoxConnection();
-  await model.BoxExecutionAttempt.deleteMany({ candidate_key: "boot-recovery" });
-  await repo.initialiseBoxExecutionAttemptPersistence();
-  const firstResidual = residual(75, 1);
-  const first = await repo.ensureBoxRecoveryExecutionAttempt({
-    id: recoveryExecutionAttemptId("boot-recovery", firstResidual),
-    recoveryKey: "boot-recovery",
-    residual: firstResidual,
-    executionMode: "live",
-    broker: "zerodha",
-    at: new Date(),
-  });
-  const changedResidual = residual(30, 2);
-  const second = await repo.ensureBoxRecoveryExecutionAttempt({
-    id: recoveryExecutionAttemptId("boot-recovery", changedResidual),
-    recoveryKey: "boot-recovery",
-    residual: changedResidual,
-    executionMode: "live",
-    broker: "zerodha",
-    at: new Date(),
-  });
-
-  assert.equal(second._id.toString(), first._id.toString());
-  assert.deepEqual(second.residual_exposure, firstResidual, "the existing durable projection remains authoritative");
-  assert.equal(await model.BoxExecutionAttempt.countDocuments({ candidate_key: "boot-recovery", resolved: false }), 1);
-  await model.BoxExecutionAttempt.deleteMany({ candidate_key: "boot-recovery" });
-});
-
-
 /* ══════════ the daily-risk seed must be bounded and indexed ══════════ */
 
-test("every daily-risk seed branch is bounded and index-ordered", () => {
-  // The seed used to be one unbounded `$or`, so it could scan the whole attempt collection as
-  // stranded unresolved rows accumulated. Asserted on the source because the bound is a property of
-  // the QUERY, not of any result an offline harness can produce.
+/**
+ * REWRITTEN for the PostgreSQL authority.
+ *
+ * The original asserted on the literal Mongoose query text of the old repository
+ * (`.sort()/.limit()/$or`) and on a `boxExecutionAttemptSchema.index(...)` call in the old
+ * `model.ts`. Both are gone by design: reservations, CAS and the daily-risk seed are SQL now.
+ *
+ * The behavioural guarantee is unchanged and is what we pin here:
+ *   1. every daily-risk seed read is BOUNDED (LIMIT), never an unbounded scan;
+ *   2. each bounded read is ORDERED by an indexed column, so truncation drops the least
+ *      significant rows rather than an arbitrary page;
+ *   3. overlapping branches are DEDUPLICATED by id, so a day is never charged twice; and
+ *   4. the supporting indexes ACTUALLY EXIST — asserted by querying PostgreSQL's own
+ *      catalog (`pg_indexes`), which is strictly stronger evidence than matching source text.
+ */
+
+const HERE_EAP = dirname(fileURLToPath(import.meta.url));
+const MIGRATIONS_DIR_EAP = resolve(HERE_EAP, "..", "..", "migrations");
+const PG_URL_EAP = (process.env.DATABASE_URL ?? "postgres://strikedge:strikedge@127.0.0.1:55432/strikedge").trim();
+
+test("every daily-risk seed branch is bounded and index-ordered (SQL source)", () => {
   const repository = readFileSync(new URL("../../src/box/repository.ts", import.meta.url), "utf8");
   const seed = repository.slice(
     repository.indexOf("export async function loadBoxLiveRiskSeed"),
     repository.indexOf("/* ----------------------------- daily P&L archive"),
   );
+
+  // (1) No unbounded multi-branch scan: the Mongo `$or` is gone, and every attempt read is bounded.
   assert.equal(seed.includes("$or"), false, "no unbounded multi-branch scan");
   assert.equal(
-    (seed.match(/\.limit\(BOX_DAILY_RISK_SEED_LIMIT\)/g) ?? []).length,
-    3,
-    "each attempt contribution is bounded",
+    (seed.match(/LIMIT \$\d/g) ?? []).length >= 3,
+    true,
+    "each of the three attempt contributions is bounded by a LIMIT",
   );
-  // And each bound is served in the order that matters, so truncation drops the least significant
-  // rows rather than an arbitrary page.
-  assert.match(seed, /flatten_charge_day: tradingDay \}\)[\s\S]*?\.sort\(\{ flatten_charges_for_day: -1 \}\)/);
-  assert.match(seed, /resolved_at: \{ \$gte: new Date\(sinceMs\) \} \}\)[\s\S]*?\.sort\(\{ resolved_at: -1 \}\)/);
-  assert.match(seed, /resolved: false \}\)[\s\S]*?\.sort\(\{ resolved_at: -1 \}\)/);
-  // Overlapping branches must be merged by identity or the day is charged more than once.
-  assert.match(seed, /attemptsById\.set\(String\(row\._id\), row\)/);
+  assert.match(seed, /BOX_DAILY_RISK_SEED_LIMIT/, "the bound is the shared explicit limit");
 
-  const model = readFileSync(new URL("../../src/box/model.ts", import.meta.url), "utf8");
+  // (2) Each bound is served in the order that matters, so truncation keeps the significant rows.
+  //     day-scoped branch:  WHERE flatten_charge_day = $1  ORDER BY flatten_charges_for_day DESC
   assert.match(
-    model,
-    /boxExecutionAttemptSchema\.index\(\s*\{ flatten_charge_day: 1, flatten_charges_for_day: -1 \}/,
-    "the day-scoped branch needs its own index",
+    seed,
+    /flatten_charge_day = \$1[\s\S]*?ORDER BY flatten_charges_for_day DESC LIMIT/,
+    "the day-scoped branch is ordered by the same-day charge magnitude",
   );
+  //     resolved-today branch:  WHERE resolved_at >= $1  ORDER BY resolved_at DESC
+  assert.match(
+    seed,
+    /resolved_at >= \$1[\s\S]*?ORDER BY resolved_at DESC LIMIT/,
+    "the resolved-today branch is ordered by resolution time",
+  );
+  //     still-unresolved branch:  WHERE resolved = false  ORDER BY resolved_at DESC
+  assert.match(
+    seed,
+    /resolved = false[\s\S]*?ORDER BY resolved_at DESC LIMIT/,
+    "the still-unresolved branch is ordered by resolution time",
+  );
+
+  // (3) Overlapping branches are merged by identity or the day is charged more than once.
+  assert.match(seed, /attemptsById\.set\(r\._id, r\)/, "rows are deduplicated by id before summing");
 });
 
-test("real Mongo: the bounded daily-risk seed is indexed and counts an overlapping row once", async (t) => {
-  if (mongoSkip) return t.skip(mongoSkip);
-  process.env.BOX_MONGODB_URI = URI;
-  const [db, repo, model] = await Promise.all([
-    import("../../dist/db.js"),
-    import("../../dist/box/repository.js"),
-    import("../../dist/box/model.js"),
-  ]);
-  await db.initBoxConnection();
-  await model.BoxExecutionAttempt.init();
-
-  const indexes = await model.BoxExecutionAttempt.collection.indexes();
-  const dayIndex = indexes.find((index) => index.name === "box_execution_attempt_flatten_charge_day");
-  assert.ok(dayIndex, "the day-scoped seed branch must have a supporting index");
-  assert.equal(dayIndex.key.flatten_charge_day, 1);
-  assert.equal(dayIndex.key.flatten_charges_for_day, -1);
-
-  // A future IST day, so rows written by any other test cannot contribute to these totals.
-  const tradingDay = "2099-01-02";
-  const sinceMs = Date.parse(`${tradingDay}T00:00:00+05:30`);
-  const key = "daily-risk-seed-bound-test";
-  await model.BoxExecutionAttempt.deleteMany({ candidate_key: key });
-  const resolvedTodayCharged = new model.BoxExecutionAttempt()._id;
-  const carryoverCharged = new model.BoxExecutionAttempt()._id;
-  const legacyResolvedToday = new model.BoxExecutionAttempt()._id;
-  await model.BoxExecutionAttempt.collection.insertMany([
-    {
-      // In the day-charge branch AND the resolved-today branch: it must be counted once.
-      _id: resolvedTodayCharged,
-      candidate_key: key,
-      resolved: true,
-      resolved_at: new Date(sinceMs + 6 * 60 * 60 * 1_000),
-      net_abort_pnl: -100,
-      flatten_charges: 25,
-      flatten_charge_day: tradingDay,
-      flatten_charges_for_day: 10,
-    },
-    {
-      // In the day-charge branch AND the still-unresolved branch. Its prior-day cumulative history
-      // must not be charged again, only today's bucket.
-      _id: carryoverCharged,
-      candidate_key: key,
-      resolved: false,
-      resolved_at: new Date(sinceMs - 5 * 24 * 60 * 60 * 1_000),
-      net_abort_pnl: -50,
-      flatten_charges: 30,
-      flatten_charge_day: tradingDay,
-      flatten_charges_for_day: 5,
-    },
-    {
-      // Physically legacy: resolved today with no day bucket, so its cumulative charge is the
-      // additive-compatible fallback.
-      _id: legacyResolvedToday,
-      candidate_key: key,
-      resolved: true,
-      resolved_at: new Date(sinceMs + 7 * 60 * 60 * 1_000),
-      net_abort_pnl: -20,
-      flatten_charges: 7,
-    },
-  ]);
-
+test("the daily-risk seed's supporting indexes actually exist in PostgreSQL (pg_indexes)", async () => {
+  // A throwaway schema; apply migrations 002 (which defines the attempt table + its indexes),
+  // then read the catalog directly. This proves the indexes the seed's ORDER BY relies on are
+  // really present — evidence the source-text test could never provide.
+  const schema = `eap_idx_${Date.now().toString(36)}_${Math.floor(Math.random() * 1e6).toString(36)}`;
+  const client = new pg.Client({ connectionString: PG_URL_EAP });
+  await client.connect();
   try {
-    const seed = await repo.loadBoxLiveRiskSeed(sinceMs, tradingDay);
-    assert.equal(seed.realisedPnl, -142, "(-100-10) + (-5) + (-20-7), each row exactly once");
-    assert.equal(seed.rejects, 0);
-    assert.equal(seed.consecutiveFailures, 0);
-    assert.equal(seed.flattenChargeBaselinesForDay[String(resolvedTodayCharged)], 10);
-    assert.equal(seed.flattenChargeBaselinesForDay[String(carryoverCharged)], 5);
-    assert.equal(seed.flattenChargeBaselinesForDay[String(legacyResolvedToday)], undefined);
-    assert.equal(seed.flattenChargeBaselines[String(carryoverCharged)], 30,
-      "the unresolved row's lifetime watermark still seeds idempotency");
-    assert.equal(seed.flattenChargeBaselines[String(resolvedTodayCharged)], undefined);
+    await client.query(`CREATE SCHEMA ${schema}`);
+    await client.query(`SET search_path = ${schema}`);
+    for (const file of ["002_box_core.sql"]) {
+      await client.query(readFileSync(resolve(MIGRATIONS_DIR_EAP, file), "utf8"));
+    }
+
+    const { rows } = await client.query(
+      `SELECT indexname, indexdef FROM pg_indexes
+       WHERE schemaname = $1 AND tablename = 'box_execution_attempts'`,
+      [schema],
+    );
+    const byName = new Map(rows.map((r) => [r.indexname, r.indexdef]));
+
+    // day-scoped branch: (flatten_charge_day, flatten_charges_for_day DESC)
+    const dayIdx = byName.get("box_execution_attempt_flatten_charge_day");
+    assert.ok(dayIdx, "the day-scoped seed branch must have a supporting index");
+    assert.match(dayIdx, /\(flatten_charge_day, flatten_charges_for_day DESC\)/);
+
+    // resolved-today branch: (resolved_at DESC)
+    const resolvedAtIdx = byName.get("box_execution_attempts_resolved_at_idx");
+    assert.ok(resolvedAtIdx, "the resolved-today branch must be served by an index");
+    assert.match(resolvedAtIdx, /\(resolved_at DESC\)/);
+
+    // still-unresolved branch: (resolved, resolved_at DESC)
+    const resolvedIdx = byName.get("box_execution_attempts_resolved_idx");
+    assert.ok(resolvedIdx, "the still-unresolved branch must be served by an index");
+    assert.match(resolvedIdx, /\(resolved, resolved_at DESC\)/);
   } finally {
-    await model.BoxExecutionAttempt.deleteMany({ candidate_key: key });
+    await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`).catch(() => {});
+    await client.end().catch(() => {});
   }
 });
 
-
-/**
- * Release the Mongo socket this file opened.
- *
- * An open connection is a live handle, so without this the runner sits on a drained event loop
- * after the last assertion and the CI job hangs until its wall-clock limit rather than reporting
- * the result it already has. Offline runs never connect, so this is a no-op there.
- */
-after(async () => {
-  if (!URI) return;
-  const { boxConnection } = await import("../../dist/db.js");
-  await boxConnection?.close();
-});
