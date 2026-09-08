@@ -302,3 +302,38 @@ gates hold. Real capital adds broker latency, partial fills, rejects, feed gaps
 and slippage that no simulation fully reproduces. Live trading is enabled only
 behind the double deployment gates, the per-broker gate and explicit runtime
 arming — and even then the four-leg risk above remains inherent to the strategy.
+
+## 10. Test hermeticity
+
+This is a behaviour difference from CalSpread in the test tree, recorded here
+next to §8. The ported CalSpread suite reached **live broker endpoints** while
+running: a full run made 24 outbound HTTPS requests — 23 to `images.dhan.co`
+(the live Dhan scrip master, roughly 201,075 rows at about 4.5s per parse, so
+about 90s of a 2m34s CI job) and 1 to `api.kite.trade`. Those requests
+originated from three files: `tests/box/singleBroker.test.mjs`,
+`tests/tokens/morningDefault.test.mjs` and `tests/switch/managerSwitch.test.mjs`.
+
+StrikeEdge's suite does not. A fetch-interceptor scan across all seven suite
+directories now reports **zero non-loopback requests**. The scrip master the
+tests parse is served from `tests/fixtures/dhan-scrip-master-detailed.sample.csv`,
+a **trimmed sample derived from the real upstream file** — not a live snapshot,
+and deliberately not a checked-in 201k-row blob.
+
+The property is **enforced in CI, not merely asserted in a comment**. A runtime,
+fail-closed network interceptor (`.github/ci/no-egress-guard.mjs`, injected into
+the test process via `NODE_OPTIONS=--import`) throws on any request to a
+non-loopback host — only `127.0.0.0/8`, `::1` and `localhost` are permitted, so
+it composes with the local mock HTTP servers the token/access suites drive on
+`127.0.0.1` and with the PostgreSQL/MongoDB drivers. Alongside it a Node-
+independent static scan (`.github/ci/no-live-hostnames.sh`) fails the build if a
+live broker hostname (`images.dhan.co`, `api.dhan.co`, `auth.dhan.co`,
+`api.kite.trade`, `calspread.online`) appears in executable — as opposed to
+commented — test code. Together they make a regression to live egress turn the
+build red rather than quietly making real HTTPS calls.
+
+Why it matters: the live scrip master changes daily, so a test that parses it
+could pass today and fail tomorrow for reasons entirely unrelated to the code —
+the worst property a trading-system test can have. The move also grew the suite
+from **1,594 to 1,603 tests**, as the hermetic-network helper gained its own
+regression tests. (The 1,594 count in §1 records the state at the first `main`
+push SHA named there; this subsection records the current count.)
