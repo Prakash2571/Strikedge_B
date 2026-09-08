@@ -8,19 +8,19 @@
 import { ChainedInstrumentReservations } from "./chained.js";
 import { DurableInstrumentReservations } from "./durable.js";
 import { InProcessInstrumentReservations } from "./inProcess.js";
-import { MongoReservationPort } from "./mongoStore.js";
+import { PgReservationPort } from "./pgStore.js";
 import { createProcessIdentity, processOwnerPrefix, type ProcessIdentity } from "./identity.js";
 import type { InstrumentReservationStore, ReservationContext } from "./types.js";
 
-// The dependency-free half. Consumers that must NOT pull mongoose in should import
+// The dependency-free half. Consumers that must NOT pull a DB driver in should import
 // `./core.js` (or `../instrumentReservations.js`) rather than this barrel.
 export * from "./core.js";
 export {
-  MongoReservationPort,
+  PgReservationPort,
   RESERVATION_UNIQUE_INDEX,
   RESERVATION_TTL_INDEX,
   RESERVATION_SCOPE_INDEX,
-} from "./mongoStore.js";
+} from "./pgStore.js";
 
 export interface ReservationStackOptions {
   /** Build the durable tier at all. When false the stack is local-only. */
@@ -74,7 +74,7 @@ export function createReservationStack(options: ReservationStackOptions): Reserv
   }
 
   const durable = new DurableInstrumentReservations({
-    port: new MongoReservationPort(),
+    port: new PgReservationPort(),
     context: options.context,
     ownerPrefix: processOwnerPrefix(identity),
     ...(options.skewGraceMs === undefined ? {} : { skewGraceMs: options.skewGraceMs }),

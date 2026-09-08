@@ -120,7 +120,7 @@ import { BoxPositionBook, deriveBoxPositionState, fullLotByRole, isBoxPositionFl
 import { exactEntryFillViolation, singleLotCandidateViolation, singleLotPositionViolation } from "./singleLotInvariant.js";
 import { BoxPositionMonitor } from "./positionMonitor.js";
 import { BoxQuoteStore, SpotStore } from "./quotes.js";
-import { initBoxConnection } from "../db.js";
+import { ensureBoxPersistenceReady } from "./repository.js";
 import {
   appendBoxEvent,
   allocateBoxTradeId,
@@ -938,9 +938,9 @@ export class BoxEngine {
     if (this.started) return;
     this.started = true;
     try {
-    // Open the box database first (BOX_MONGODB_URI when set, otherwise the main
-    // one) so the positions below are read from the right place.
-    await initBoxConnection();
+    // Verify PostgreSQL — StrikeEdge's operational authority — is up and migrated
+    // before the positions below are read from it.
+    await ensureBoxPersistenceReady();
     // Crash-only recovery is safe only behind its explicitly established and verified partial
     // unique index. Failure quarantines that direct path while ordinary residual exits continue.
     try {
@@ -5109,7 +5109,7 @@ export class BoxEngine {
    */
   async getClosedToday(): Promise<{
     trades: SerializedBoxTrade[];
-    source: "memory" | "redis" | "mongo" | "none";
+    source: "memory" | "postgres" | "none";
     day: string;
   }> {
     this.rollClosedTodayDay();
@@ -5132,7 +5132,7 @@ export class BoxEngine {
       if (cached.length > 0 && cached.length >= this.closedTodayCount) {
         this.closedTodayTrades = cached;
         this.closedTodayLoadedFor = day;
-        return { trades: cached, source: "redis", day };
+        return { trades: cached, source: "postgres", day };
       }
       if (cached.length > 0) {
         console.warn(
@@ -5166,7 +5166,7 @@ export class BoxEngine {
           .catch(() => {/* best-effort accelerator */});
       }
     }
-    return { trades: this.closedTodayTrades, source: "mongo", day };
+    return { trades: this.closedTodayTrades, source: "postgres", day };
   }
 
   /** Whether the Redis accelerator for today's closed trades is live. */

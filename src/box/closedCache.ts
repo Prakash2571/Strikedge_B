@@ -1,43 +1,27 @@
 /**
- * Redis (Upstash) mirror of TODAY's closed box trades.
+ * Closed-today trade cache surface — REDIS REMOVED.
  *
- * WHY THIS EXISTS
- * The Closed-trades tab used to be served by one Mongo query over the WHOLE
- * closed book (`loadClosedBoxTrades`), sorted on `closed_at`. That query is both
- * slow and fragile — it is the only read on the page that can fail outright —
- * while the thing the operator actually wants the instant the page opens is a
- * small, bounded set: the trades closed TODAY. So today's trades are mirrored
- * here as they close and read back in one round trip; earlier days stay in Mongo,
- * where taking a moment to load is acceptable.
+ * In CalSpread this mirrored TODAY's closed box trades into Upstash Redis so the
+ * Closed-trades tab could render the current session in one round trip instead of a
+ * whole-book Mongo sort. It was ALWAYS a best-effort read-path accelerator: every
+ * method was a no-op returning a neutral value when Redis was off or unreachable, and
+ * the caller fell back to the definitionally-complete database.
  *
- * BEST-EFFORT, LIKE EVERY OTHER REDIS USE (see redis.ts)
- * Every method is a no-op returning a neutral value when the feature is off or
- * Redis is unreachable, and the caller falls back to Mongo. A cache must never be
- * able to hide trades or take the app down.
- *
- * LAYOUT
- *   calspread:box:trades:closed:<YYYY-MM-DD>   hash  field=trade_id -> trade JSON
- *
- * HSET overwrites a trade's field, so re-mirroring an already-cached trade is
- * idempotent — which is what makes the boot seed and the per-close write safe to
- * run over each other.
+ * StrikeEdge's complete source for "closed today" is now PostgreSQL
+ * (`loadBoxTradesClosedSince`, see `repository.ts` / `engine.getClosedToday`). The Redis
+ * mirror was PURELY A CACHE, so it is removed rather than reimplemented: the cache
+ * reports itself disabled and every read/write degrades to the neutral value, which is
+ * exactly the fall-through the engine already handles. The exported SURFACE is preserved
+ * (`liteClosedTrade`, `sortClosedNewestFirst`, `BoxClosedTradeCache`) so no caller
+ * changes.
  */
 
 import type { BoxConfig } from "./config.js";
-import { hGetAllJson, hashWriteCommands, isRedisEnabled, pipeline } from "../redis.js";
 import type { SerializedBoxTrade } from "./serialize.js";
 
-const dayKey = (day: string): string => `box:trades:closed:${day}`;
-
 /**
- * Strip the audit blobs before caching.
- *
- * `entry_execution`, `entry_legging` and `exit_execution` are Mixed audit records
- * carrying per-leg depth snapshots, and each leg additionally holds its entry/exit
- * depth ladder. They dominate a document's size (tens of KB) and the Closed-trades
- * table renders none of them, so caching them would burn Redis memory and command
- * budget for data nothing reads. The full document is always still in Mongo for
- * anything that needs the audit trail.
+ * Strip the audit blobs before returning a trade. Pure; still used to keep the
+ * "closed today" rows lite whether they came from memory or PostgreSQL.
  */
 export function liteClosedTrade(trade: SerializedBoxTrade): SerializedBoxTrade {
   return {
@@ -49,7 +33,7 @@ export function liteClosedTrade(trade: SerializedBoxTrade): SerializedBoxTrade {
   };
 }
 
-/** Newest-closed first, matching the order the Mongo query returns. */
+/** Newest-closed first. Pure. */
 export function sortClosedNewestFirst(trades: SerializedBoxTrade[]): SerializedBoxTrade[] {
   return [...trades].sort((a, b) => {
     const at = a.closed_at ?? a.opened_at;
@@ -58,69 +42,36 @@ export function sortClosedNewestFirst(trades: SerializedBoxTrade[]): SerializedB
   });
 }
 
+/**
+ * The closed-today cache — now permanently disabled.
+ *
+ * Every method returns the neutral value it already returned when Redis was
+ * unreachable, so the engine transparently reads today's closed trades from
+ * PostgreSQL. Kept so `engine.ts` needs no change.
+ */
 export class BoxClosedTradeCache {
-  constructor(private cfg: BoxConfig) {}
+  constructor(private cfg: BoxConfig) {
+    void this.cfg;
+  }
 
-  /**
-   * On when the feature is enabled AND an Upstash database is configured.
-   *
-   * Unlike the P&L cache this defaults to ON (see config.ts), because it is a
-   * read-path accelerator for a view the operator opens constantly rather than an
-   * opt-in reporting feature. With no Redis configured it simply reports false and
-   * every read falls back to Mongo.
-   */
+  /** Always off: the complete "closed today" source is PostgreSQL, and this was pure cache. */
   enabled(): boolean {
-    return this.cfg.closedCacheEnabled && isRedisEnabled();
+    return false;
   }
 
-  /** Mirror one closed trade. Returns false when disabled or the write missed. */
-  async writeTrade(day: string, trade: SerializedBoxTrade): Promise<boolean> {
-    return this.writeTrades(day, [trade]);
+  async writeTrade(_day: string, _trade: SerializedBoxTrade): Promise<boolean> {
+    return false;
   }
 
-  /** Mirror many closed trades in a single pipeline (used by the boot seed). */
-  async writeTrades(day: string, trades: SerializedBoxTrade[]): Promise<boolean> {
-    if (!this.enabled() || trades.length === 0) return false;
-    const entries = new Map<string, unknown>();
-    for (const trade of trades) entries.set(trade.id, liteClosedTrade(trade));
-    const cmds = hashWriteCommands(dayKey(day), entries, [], this.cfg.closedCacheTtlSec);
-    if (cmds.length === 0) return false;
-    return (await pipeline(cmds)) !== null;
+  async writeTrades(_day: string, _trades: SerializedBoxTrade[]): Promise<boolean> {
+    return false;
   }
 
-  /**
-   * Read a day's cached trades, newest-closed first.
-   *
-   * Returns an empty array both when the cache is off and when the day is simply
-   * not cached — the caller cannot tell the difference and must not need to: it
-   * falls back to Mongo either way.
-   */
-  async readDay(day: string): Promise<SerializedBoxTrade[]> {
-    if (!this.enabled()) return [];
-    const map = await hGetAllJson<SerializedBoxTrade>(dayKey(day));
-    return sortClosedNewestFirst([...map.values()]);
+  async readDay(_day: string): Promise<SerializedBoxTrade[]> {
+    return [];
   }
 
-  /**
-   * Evict one trade from a day's cache (HDEL).
-   *
-   * Needed because a deletion is the ONLY operation that removes a trade. Every
-   * other write path is additive or overwrites in place, which is why this cache
-   * had no eviction until now: HSET made re-mirroring idempotent and nothing ever
-   * disappeared. A deleted trade left behind here would keep being served to the
-   * Closed-trades tab from the fast path — the cache would outlive the record and
-   * quietly contradict Mongo.
-   *
-   * Best-effort like every other method: a failed HDEL returns false and the
-   * caller carries on, because the in-memory list and Mongo have already been
-   * corrected and are authoritative.
-   */
-  async evictTrade(day: string, tradeId: string): Promise<boolean> {
-    if (!this.enabled()) return false;
-    // `hashWriteCommands` takes the stale fields to drop as its third argument, so
-    // an eviction is expressed with no entries to write and one field to delete.
-    const cmds = hashWriteCommands(dayKey(day), new Map(), [tradeId], this.cfg.closedCacheTtlSec);
-    if (cmds.length === 0) return false;
-    return (await pipeline(cmds)) !== null;
+  async evictTrade(_day: string, _tradeId: string): Promise<boolean> {
+    return false;
   }
 }

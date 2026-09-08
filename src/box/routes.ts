@@ -396,7 +396,7 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
         res.json({
           dbEnabled: isBoxDbEnabled(),
           scope: "today",
-          /** Which tier answered: memory | redis | mongo | none. */
+          /** Which tier answered: memory | postgres | none. */
           source,
           day,
           cacheEnabled: engine.isClosedCacheEnabled(),
@@ -417,7 +417,7 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
       res.json({
         dbEnabled: isBoxDbEnabled(),
         scope: "all",
-        source: "mongo",
+        source: "postgres",
         cacheEnabled: engine.isClosedCacheEnabled(),
         /**
          * The audit blobs are projected out of list queries — they are most of a
