@@ -338,6 +338,7 @@ provenance by reading a field that did not exist. Exposing it means adding
 `margin_source` to `src/box/serialize.ts` and the trade response — a deliberate API
 addition, not a silent one, and out of scope for the extraction.
 
+## 8b. Box math parity, verified by regeneration
 
 The 22 golden fixtures under `tests/migration-fixtures/` (113 cases: 42 in
 `box/`, 71 in `box-parity/`) are **byte-for-byte identical** to the CalSpread
