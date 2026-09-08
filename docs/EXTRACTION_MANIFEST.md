@@ -292,7 +292,52 @@ route. StrikeEdge hosts **no token routes** — it is a client of CalSpread's.
   code path moved, and the refusal conditions are unchanged. Pinned by
   `tests/box/scannerStartRefusals.test.mjs` so neither can silently regress.
 
-## 8a. Box math parity, verified by regeneration
+## 8a. Frontend/backend contract drift, found and fixed
+
+The two repositories were built separately and their types for the NEW StrikeEdge
+endpoints drifted badly. Verified by capturing real responses from a running
+backend and comparing them with the frontend's declarations:
+
+| Endpoint | Frontend fields that actually arrived |
+| --- | --- |
+| `GET /api/runtime/status` | 1 of 9 (`residual_exposure`) |
+| `GET /api/export/status` | 1 of 5 (`enabled`) |
+| `GET /api/broker/status` | structurally different — the frontend expected a single CalSpread-shaped broker; the backend returns `{active_broker, generation, brokers[]}` |
+
+`blockers` is `string[]`, not `{reason, detail}[]`. `POST /api/broker/select`
+returns `{ok, broker, blockers}`, not a status object. `last_margin_source`
+existed **nowhere** in the backend — the frontend had invented it.
+
+Every drifted field was either optional or read off a cast `fetch` result, so
+TypeScript could not see any of it. The frontend typechecked, built and passed 38
+tests while every readiness banner stayed dark and the broker panel rendered
+`undefined`. **A green build proved nothing about the contract.**
+
+Fixed by making the frontend types exact (which turned the drift into compiler
+errors) and rewiring the banners and the broker panel. Pinned by
+`Strikedge_F/tests/apiContract.test.mjs`, which asserts against responses captured
+from a running backend and was verified to fail when the old shape is restored.
+Fixture provenance and the re-capture procedure are in
+`Strikedge_F/tests/fixtures/README.md`.
+
+Two states the old shape could not express are now shown: a token-provider
+**configuration error** (fatal — retrying on a timer will never clear it, so it is
+not the same as "waiting") and **dead-lettered projections**. And
+`live_entry.reasons` is now displayed, so "live entry is blocked" says why.
+
+### Known gap: margin provenance is not exposed over HTTP
+
+The margin source (`kite_basket` vs a conservative Dhan per-leg fallback) is
+persisted in PostgreSQL and projected to MongoDB, as required — but it is **not
+present in any HTTP response**, so the dashboard cannot display it. Charge
+provenance (`charge_origin`, `charge_rate_version`) *is* on the serialised trade
+and is displayed.
+
+This is recorded rather than papered over: the frontend previously "showed" margin
+provenance by reading a field that did not exist. Exposing it means adding
+`margin_source` to `src/box/serialize.ts` and the trade response — a deliberate API
+addition, not a silent one, and out of scope for the extraction.
+
 
 The 22 golden fixtures under `tests/migration-fixtures/` (113 cases: 42 in
 `box/`, 71 in `box-parity/`) are **byte-for-byte identical** to the CalSpread
