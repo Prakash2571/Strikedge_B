@@ -77,8 +77,8 @@ cutover), read **`docs/DEPLOYMENT.md`**. For daily operations read
 | `npm run typecheck` | Type-check only. |
 | `npm run migrate` | Apply pending SQL migrations. `-- --check` asserts only. |
 | `npm run migrate:box-from-mongo` | ONE-TIME legacy Box import from Mongo (dry-run by default). |
-| `npm run rotate:broker-token-key` | Re-encrypt stored broker tokens under a new key. |
-| `npm run outbox:replay` | Re-enqueue/replay outbox rows to the Mongo projection. |
+| `npm run rotate:broker-token-key` | Re-encrypt stored broker tokens under a new key. Set `BROKER_TOKEN_OLD_KEY`/`BROKER_TOKEN_NEW_KEY` in the env (never on the CLI); `-- --dry-run` verifies without writing. |
+| `npm run outbox:replay` | Re-enqueue/replay outbox rows to the Mongo projection. **Requires a selector** (`-- --dead-letters` \| `-- --aggregate <type> <id>` \| `-- --event-id <id>`) and is **dry-run** until you add `--apply`. |
 | `npm test` | Full suite: unit, tokens, access, switch, shutdown, integration. |
 | `npm run test:unit` / `test:pg` / `test:projector` / `test:tokens` / `test:access` / `test:switch` / `test:shutdown` | Individual suites. |
 

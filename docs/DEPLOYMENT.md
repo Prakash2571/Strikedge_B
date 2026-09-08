@@ -132,14 +132,21 @@ Atlas from PostgreSQL*, never the reverse.
 ## 8. Outbox replay
 
 If the Mongo projection falls behind or Atlas was down, re-drive it from
-PostgreSQL:
+PostgreSQL. `outbox:replay` **requires a selector** and is **dry-run by default**
+(it prints what it would do and writes nothing without `--apply`):
 
 ```bash
-npm run outbox:replay
+# Dry-run (default): show what WOULD be replayed. Pick exactly one selector:
+npm run outbox:replay -- --dead-letters                 # all dead-lettered rows
+npm run outbox:replay -- --aggregate <type> <id>        # one aggregate
+npm run outbox:replay -- --event-id <id>                # one event
+
+# Actually write:
+npm run outbox:replay -- --dead-letters --apply
 ```
 
-This re-enqueues/replays outbox rows to Atlas. It reads from PostgreSQL (the
-source of truth) and writes to Mongo — never the other way.
+Running it with no selector fails fast (`Choose a selector: …`) and changes
+nothing.
 
 ## 9. Rollback
 

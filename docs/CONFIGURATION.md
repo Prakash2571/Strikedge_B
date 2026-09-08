@@ -50,6 +50,7 @@ Legend: **Req?** = required. "yes" means the process cannot function without it;
 | --- | --- | --- | --- | --- |
 | `KITE_TOKEN_BROKER_URL` | `https://calspread.online/api/kite/token` | no | CalSpread's Zerodha token endpoint. | Wrong URL ⇒ token fetch fails; no Zerodha trading. |
 | `KITE_TOKEN_BROKER_PASSCODE` | — | yes (Zerodha) | Shared passcode for CalSpread token routes. | Unset/wrong ⇒ token fetch rejected. |
+| `KITE_API_KEY` | — | yes (Zerodha-live) | Zerodha API key used by the live order adapter (`src/brokers/zerodha/liveAdapter.ts`). Distinct from `KITE_API_KEY_EXPECTED`. | Unset ⇒ Zerodha live execution throws "KITE_API_KEY is missing" and refuses to go live. |
 | `KITE_API_KEY_EXPECTED` | — | prod | If set, fetched token's api_key must equal this. | Mismatch ⇒ token rejected as foreign (a safety feature). |
 
 ## Dhan token provider (`src/tokens/*`)
@@ -58,6 +59,8 @@ Legend: **Req?** = required. "yes" means the process cannot function without it;
 | --- | --- | --- | --- | --- |
 | `DHAN_TOKEN_URL` | `https://calspread.online/api/dhan/token` | no | CalSpread's Dhan token endpoint. | Wrong URL ⇒ no Dhan trading. |
 | `DHAN_TOKEN_BROKER_PASSCODE` | — | yes (Dhan) | Shared passcode for the Dhan token route. | Unset/wrong ⇒ token fetch rejected. |
+| `DHAN_API_KEY` | — | yes (Dhan-live) | Dhan app API key. Read by `readDhanCredentials()` and required for Dhan live readiness. | Unset ⇒ Dhan reports "not configured"; Dhan live is blocked. |
+| `DHAN_API_SECRET` | — | yes (Dhan-live) | Dhan app secret. Same credential check as above; never leaves the server. | Unset ⇒ Dhan "not configured"; Dhan live blocked. |
 | `DHAN_CLIENT_ID_EXPECTED` | — | prod | If set, fetched token's client_id must equal this. | Mismatch ⇒ token rejected. |
 
 ## Token scheduling (`src/tokens/*`)
@@ -70,10 +73,14 @@ Legend: **Req?** = required. "yes" means the process cannot function without it;
 
 ## Broker selection (`src/brokers/registry.ts`, `src/brokerRoutes.ts`)
 
-| Variable | Default | Req? | What it does | If wrong |
-| --- | --- | --- | --- | --- |
-| `DEFAULT_ACTIVE_BROKER` | `zerodha` | no | Which broker is active at boot. | Unknown ⇒ defaults to zerodha. |
-| `AUTO_FALLBACK_TO_DHAN` | `false` | no | Allow automatic fallback to Dhan. | `true` in production is discouraged; a switch should be explicit. |
+Exactly one broker is active at a time. The boot broker is **fixed to `zerodha`**
+in code (`registry.ts` `private active: BrokerId = "zerodha"`); there is **no**
+environment variable to change it and **no** automatic-fallback env switch. A
+switch is always an explicit, blocker-checked `POST /api/broker/select`.
+
+> A previous version of this document listed `DEFAULT_ACTIVE_BROKER` and
+> `AUTO_FALLBACK_TO_DHAN`. Neither is read anywhere in `src`; they were removed.
+> See `docs/DOC_AUDIT.md` finding C-DEFECT-1.
 
 ## Shared Box live gates — GATE 1 (`src/box/config.ts`)
 
@@ -95,7 +102,7 @@ Legend: **Req?** = required. "yes" means the process cannot function without it;
 | --- | --- | --- | --- | --- |
 | `DHAN_STATIC_PUBLIC_IP` | — | Dhan-live | The whitelisted egress IP presented to Dhan. | Empty while `DHAN_STATIC_IP_EXPECTED=true` ⇒ live blocked. |
 | `DHAN_STATIC_IP_EXPECTED` | `true` | no | Require observed egress IP to match. | `false` disables the guard — do not, in production. |
-| `DHAN_DATA_ENABLED` | `false` | no | Enable the Dhan market-data API. | `false` while Dhan is active ⇒ no Dhan feed. |
+| `DHAN_DATA_ENABLED` | `true` | no | Enable the Dhan market-data API. **An unset/empty value counts as enabled** (`registry.ts`). | `false` while Dhan is active ⇒ no Dhan feed. |
 | `DHAN_CLIENT_ID` | (from token session) | no | Dhan client id (non-secret). | Wrong ⇒ order calls fail. |
 | `DHAN_HTTP_TIMEOUT_MS` | `8000` | no | Per-HTTP-call timeout (range 500..60000). | Too low ⇒ spurious timeouts. |
 | `DHAN_MIN_INTERVAL_MS` | `120` | no | Broker-side HTTP pacing floor (range 0..5000). | A smaller Box-level value cannot beat this. |
@@ -113,10 +120,25 @@ Legend: **Req?** = required. "yes" means the process cannot function without it;
 
 ## Zerodha charge card (`src/box/localCharges.ts`)
 
+`loadLocalChargeRates()` reads a full statutory rate card, not just the two
+labels. Only brokerage is a genuine broker choice; the statutory heads match the
+Dhan card because they are the same statutory rates. **Note the Zerodha STT
+default (`0.15`) differs from the Dhan card default (`0.1`).**
+
 | Variable | Default | Req? | What it does | If wrong |
 | --- | --- | --- | --- | --- |
 | `BOX_STT_TYPE` | `stt` | no | STT type label on the local charge record. | Cosmetic/audit. |
 | `BOX_CHARGE_RATE_VERSION` | `zerodha-nse-options-2026-04-01` | no | Zerodha charge-card version label. | Cosmetic/audit. |
+| `BOX_BROKERAGE_PER_ORDER` | `20` | no | Zerodha F&O brokerage per order (₹). | Wrong ⇒ mis-priced net edge. |
+| `BOX_BROKERAGE_MAX_PCT` | `0` | no | Cap brokerage as % of value (0 = off). | — |
+| `BOX_STT_SELL_PCT` | `0.15` | no | STT on sell side (%). | Statutory; change only on a rate change. |
+| `BOX_STT_ROUND_NEAREST_RUPEE` | `true` | no | Round STT to nearest rupee. | — |
+| `BOX_EXCHANGE_TXN_PCT` | `0.03503` | no | Exchange transaction charge (%). | Statutory. |
+| `BOX_IPFT_PER_CRORE` | `50` | no | IPFT per crore turnover. | Statutory. |
+| `BOX_IPFT_PCT` | `0` | no | IPFT as a percentage (alternative to per-crore). | Statutory. |
+| `BOX_SEBI_PCT` | `0.0001` | no | SEBI turnover charge (%). | Statutory. |
+| `BOX_STAMP_DUTY_BUY_PCT` | `0.003` | no | Stamp duty on buy side (%). | Statutory. |
+| `BOX_GST_PCT` | `18` | no | GST (%). | Statutory. |
 
 ## Mongo projection (`src/outbox/mongo.ts`)
 
@@ -194,12 +216,29 @@ copied `.env`, they are silently ignored.
 | `NSE_FNO_ARCHIVE_URI`, `NSE_FNO_CURRENT_URI`, `NSE_FNO_SPREAD_URI` | Historical F&O capture / spread computation are calendar-scanner features, not Box. |
 | `EXTRA_SESSION_DAYS` | Only the intraday capture (removed) consumed the special-session list. |
 | `BOX_MONGODB_URI` | Mongo is no longer the operational store; PostgreSQL (`DATABASE_URL`) is. Mongo is reporting-only via `MONGODB_URI`. |
-| `DHAN_API_KEY`, `DHAN_API_SECRET`, `DHAN_REDIRECT_URL` | The Dhan OAuth/login flow is removed — tokens come from CalSpread's Dhan route. |
-| `BOX_PNL_CACHE_ENABLED`, `BOX_PNL_CACHE_INTERVAL_MS`, `BOX_PNL_CACHE_TTL_SEC` | The Redis P&L cache is replaced by PostgreSQL persistence; these Redis-cache knobs no longer apply. |
-| `BOX_PNL_ARCHIVE_DRAIN_DELAY_MS` / `BOX_PNL_VERIFY_HOURS` (Redis-archive knobs) | The Redis-backed P&L archive verification path is removed; P&L history lives in PostgreSQL. |
+| `DHAN_REDIRECT_URL`, `DHAN_POSTBACK_URL` | Read only by the disabled Dhan OAuth consent flow (`src/brokers/dhan/auth.ts`), which StrikeEdge never invokes. Setting them does nothing. |
 
-> Note on the `DHAN_*` OAuth variables: a dormant `src/brokers/dhan/auth.ts`
-> still references `DHAN_API_KEY`/`DHAN_API_SECRET`/`DHAN_REDIRECT_URL`, but that
-> login code path is never invoked in StrikeEdge (StrikeEdge does no broker
-> OAuth). They are intentionally omitted from `.env.example` because setting them
-> does nothing in this deployment.
+> **Correction (2026-09 audit).** `DHAN_API_KEY` and `DHAN_API_SECRET` are NOT
+> inert. `readDhanCredentials()` (`src/brokers/dhan/auth.ts`) reads
+> `DHAN_CLIENT_ID` / `DHAN_API_KEY` / `DHAN_API_SECRET`, and
+> `computeDhanProblems()` (`src/brokers/registry.ts`) uses it: if the key/secret
+> are unset, Dhan reports **"not configured"** and Dhan **live readiness is
+> blocked** (`dhan_configured=false`). Only the browser *consent* flow
+> (`generateDhanConsent` / `consumeDhanConsent`) is disabled — the token itself
+> still comes from CalSpread's Dhan route. So these two are required for Dhan
+> live; they are documented in the Dhan section, not here. `DHAN_REDIRECT_URL` /
+> `DHAN_POSTBACK_URL` are the only genuinely inert ones (consent-flow only).
+
+### P&L cache / archive knobs — re-purposed, NOT removed (`src/box/config.ts`)
+
+An earlier draft listed these as removed Redis knobs. They are read and drive the
+**PostgreSQL-backed** P&L cache/archive (`src/box/pnlArchive.ts`):
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `BOX_PNL_CACHE_ENABLED` | `false` | Enable the PostgreSQL-backed P&L snapshot cache writer. |
+| `BOX_PNL_CACHE_INTERVAL_MS` | `30000` | Snapshot write interval (ms). |
+| `BOX_PNL_CACHE_TTL_SEC` | `259200` | Cached-snapshot TTL (seconds, 3 days). |
+| `BOX_PNL_ARCHIVE_HOUR` | `21` | IST hour the daily P&L archive runs. |
+| `BOX_PNL_ARCHIVE_DRAIN_DELAY_MS` | `50` | Delay (ms) between archive drain steps. |
+| `BOX_PNL_VERIFY_HOURS` | `[22,23]` | IST hours the archive-verification pass runs. |

@@ -41,49 +41,58 @@ reporting only.
 
 ## Token states and what they mean
 
-The token provider client classifies the CalSpread response:
+`GET /api/runtime/status` reports each broker's **`token_state`**, which is
+exactly one of these five values (`src/tokens/brokerTokenService.ts`,
+`src/runtime/statusRoutes.ts`):
 
-- **healthy / authenticated** — a live token with a `login_date`; trading can
-  proceed (subject to gates).
-- **409 (no live session)** — the broker has **no live/unexpired session** at
-  CalSpread right now. CalSpread has not completed (or has lost) that broker's
-  login for the day. The route deliberately answers 409 rather than serving a
-  dead token.
-- **403 (forbidden)** — the passcode was rejected (wrong/rotated
-  `KITE_TOKEN_BROKER_PASSCODE` / `DHAN_TOKEN_BROKER_PASSCODE`) or access is
-  otherwise denied.
-- **security_error** — the token came back but failed a safety check, e.g. its
-  api_key/client_id did not match `KITE_API_KEY_EXPECTED` /
-  `DHAN_CLIENT_ID_EXPECTED`, or the `login_date` is stale (not today's IST day).
-  StrikeEdge refuses a token that fails these checks.
+- **`ready`** — a valid token is installed for today's IST day; trading can
+  proceed (subject to the gates + arming).
+- **`waiting`** — before the poll start (`BROKER_TOKEN_POLL_START`, default
+  `09:00`); no attempt has run yet today.
+- **`polling`** — actively retrying. This covers a CalSpread **409 "no live
+  session yet"**, a network/5xx error, and a **503** backoff. The distinguishing
+  detail is in the **`last_error`** string (e.g. it mentions `(409)`), NOT in
+  `token_state`.
+- **`configuration_error`** — the token route rejected us with **401/403**
+  (wrong/rotated passcode). Polling **stops** — this will not fix itself
+  minute-to-minute. `last_error` names the cause.
+- **`invalid`** — the token came back but failed a safety check: identity
+  mismatch (`api_key` ≠ `KITE_API_KEY_EXPECTED` / `client_id` ≠
+  `DHAN_CLIENT_ID_EXPECTED`), a stale `login_date` (not today's IST day), or a
+  malformed body. Not installed; polling stops. `last_error` names the cause.
 
-### Zerodha token stuck at 409
+> There is no `token_state` value called "healthy", "409", "403" or
+> "security_error". Those describe the token-provider client's internal
+> classification; on the wire you see one of the five states above plus a
+> `last_error` string. Read both together.
 
-CalSpread has no live Zerodha session. **Action:** have the CalSpread operator
+### Zerodha `token_state: polling` with a `last_error` mentioning 409
+
+CalSpread has no live Zerodha session yet. **Action:** have the CalSpread operator
 complete the Zerodha login for the day. StrikeEdge keeps polling
 (`BROKER_TOKEN_POLL_INTERVAL_MS`) and picks the token up automatically once
 CalSpread has it. Do **not** try to force a token in; there is nothing to force.
 
-### Zerodha token stuck at 403
+### Zerodha `token_state: configuration_error` (401/403)
 
-The passcode is wrong or was rotated. **Action:** verify
+The passcode is wrong or was rotated, and polling has stopped. **Action:** verify
 `KITE_TOKEN_BROKER_PASSCODE` matches what CalSpread expects; fix `.env` and
-restart (or wait for the next poll if only the upstream changed). A 403 is a
-credential problem, not a market problem.
+restart. A `configuration_error` is a credential problem, not a market problem.
 
-### login_date is stale
+### `token_state: invalid` — stale login_date
 
-The token belongs to a previous IST day. **Action:** this means CalSpread served
-yesterday's session. It should refresh on CalSpread's side; StrikeEdge will
-reject the stale token (security_error) rather than trade on it. Confirm the
-CalSpread operator has done today's login. Never override the day check.
+The token belongs to a previous IST day (or failed another identity check).
+**Action:** this means CalSpread served yesterday's session. It should refresh on
+CalSpread's side; StrikeEdge rejects the stale token (`invalid`) rather than
+trading on it. Confirm the CalSpread operator has done today's login. Never
+override the day check.
 
 ### Dhan expiry unknown
 
-Dhan tokens carry an `expires_at`; if it is unknown/unparseable, treat the token
-as **not trustworthy for live** — StrikeEdge will not go live on an ambiguous
-expiry. **Action:** re-fetch (next poll), and if it stays unknown, have CalSpread
-re-issue the Dhan session. Stay in paper on the Dhan side until expiry is known.
+If Dhan's `token_expires_at` is unknown/unparseable, treat the token as **not
+trustworthy for live** — StrikeEdge will not go live on an ambiguous expiry.
+**Action:** re-fetch (next poll), and if it stays unknown, have CalSpread re-issue
+the Dhan session. Stay in paper on the Dhan side until expiry is known.
 
 ## Switching brokers safely
 
@@ -113,7 +122,9 @@ erroring.
 - Check Atlas reachability and `MONGODB_URI`. The projector backs off up to
   `MONGO_EXPORT_MAX_BACKOFF_MS` and retries automatically.
 - Once Atlas is healthy, the backlog drains on its own. If it does not, run
-  `npm run outbox:replay` to re-drive from PostgreSQL.
+  `npm run outbox:replay -- --dead-letters` (dry-run first; add `--apply` to
+  write) to re-drive from PostgreSQL. A bare `npm run outbox:replay` with no
+  selector fails fast and does nothing.
 - Dead-lettered rows (poison) are reported separately and need manual inspection;
   they do not block the rest of the drain.
 
