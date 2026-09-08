@@ -33,7 +33,10 @@ import {
   loadDhanChargeRates,
 } from "../../dist/brokers/dhan/charges.js";
 import { isDhanTokenExpired, parseExpiry, redactedSession } from "../../dist/brokers/dhan/auth.js";
-import { chunkDateRange, dhanCandlesToRows } from "../../dist/brokers/history.js";
+// NOTE: The Kite/Dhan historical-charts provider (src/brokers/history.ts) is deliberately
+// EXCLUDED from StrikeEdge — it is not part of the Box-arbitrage backend. The former
+// `/* history */` block (dhanCandlesToRows / chunkDateRange) was removed with that module;
+// every other Dhan assertion below is in scope and retained. See tests/README.md.
 import { normalizeDhanError, isRetryableRead, DhanAuthError, DhanRateLimitError, DhanNetworkError, DhanError } from "../../dist/brokers/dhan/errors.js";
 
 /* -------------------------------- segments -------------------------------- */
@@ -319,64 +322,11 @@ test("5xx and network failures are retryable for reads", () => {
 });
 
 /* --------------------------------- history -------------------------------- */
-
-test("Dhan's COLUMN-wise candles transpose into rows", () => {
-  // Kite returns rows; Dhan returns parallel arrays. Assuming Kite's shape here
-  // yields silently transposed data rather than an error.
-  const rows = dhanCandlesToRows({
-    open: [100, 101],
-    high: [105, 106],
-    low: [99, 100],
-    close: [104, 105],
-    volume: [1000, 2000],
-    open_interest: [50, 60],
-    timestamp: [1_760_000_000, 1_760_000_060],
-  });
-  assert.equal(rows.length, 2);
-  assert.equal(rows[0].open, 100);
-  assert.equal(rows[0].close, 104);
-  assert.equal(rows[0].volume, 1000);
-  assert.equal(rows[0].oi, 50);
-  assert.match(rows[0].date, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/, "Kite's textual shape");
-});
-
-test("candles come back oldest-first, matching Kite's ordering", () => {
-  const rows = dhanCandlesToRows({
-    close: [2, 1],
-    timestamp: [1_760_000_060, 1_760_000_000],
-  });
-  assert.ok(rows[0].date < rows[1].date);
-});
-
-test("a candle with a bad timestamp is dropped rather than dated to 1970", () => {
-  const rows = dhanCandlesToRows({ close: [1, 2], timestamp: [NaN, 1_760_000_000] });
-  assert.equal(rows.length, 1);
-});
-
-test("missing columns become 0 rather than undefined", () => {
-  const rows = dhanCandlesToRows({ timestamp: [1_760_000_000] });
-  assert.equal(rows[0].open, 0);
-  assert.equal(rows[0].oi, 0);
-});
-
-test("long ranges chunk, because Dhan bounds intraday request spans", () => {
-  const from = new Date("2026-01-01T00:00:00Z");
-  const to = new Date("2026-01-31T00:00:00Z");
-  const chunks = chunkDateRange(from, to, 5);
-  assert.ok(chunks.length >= 6, `expected several chunks, got ${chunks.length}`);
-  assert.equal(chunks[0].from.getTime(), from.getTime());
-  assert.equal(chunks[chunks.length - 1].to.getTime(), to.getTime(), "coverage is complete");
-  // Chunks must be contiguous or a gap appears in the chart.
-  for (let i = 1; i < chunks.length; i++) {
-    assert.equal(chunks[i].from.getTime(), chunks[i - 1].to.getTime());
-  }
-});
-
-test("a range within the limit is a single chunk", () => {
-  const from = new Date("2026-01-01T00:00:00Z");
-  const to = new Date("2026-01-03T00:00:00Z");
-  assert.equal(chunkDateRange(from, to, 5).length, 1);
-});
+// REMOVED: the six history tests ("COLUMN-wise candles transpose", "candles come back
+// oldest-first", "a candle with a bad timestamp is dropped", "missing columns become 0",
+// "long ranges chunk", "a range within the limit is a single chunk"). They exercised
+// dhanCandlesToRows / chunkDateRange from src/brokers/history.ts — the Kite historical-charts
+// provider that StrikeEdge deliberately does NOT ship. See tests/README.md for the rationale.
 
 
 /* ------------------- instrument-master quality filtering ------------------- */
