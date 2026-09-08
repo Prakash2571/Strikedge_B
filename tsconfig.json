@@ -1,0 +1,33 @@
+{
+  "compilerOptions": {
+    "rootDir": "./src",
+    "outDir": "./dist",
+
+    "module": "nodenext",
+    "target": "esnext",
+    "lib": ["esnext"],
+    "types": ["node"],
+
+    "sourceMap": true,
+    "declaration": true,
+    "declarationMap": true,
+
+    // NEVER EMIT A BUILD THAT DID NOT TYPECHECK. tsc's default is to emit JavaScript even when it
+    // reported errors, which would let `node --test` run against output from a build that never
+    // passed. Emitting nothing on error makes the failure impossible to ignore.
+    "noEmitOnError": true,
+
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+
+    "strict": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "noUncheckedSideEffectImports": true,
+    "moduleDetection": "force",
+    "skipLibCheck": true
+  },
+  "include": ["src"]
+}

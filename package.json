@@ -1,0 +1,42 @@
+{
+  "name": "strikedge_backend",
+  "version": "1.0.0",
+  "description": "StrikeEdge — standalone Box-arbitrage backend (Zerodha + Dhan, PostgreSQL authoritative, MongoDB async replica)",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "rm -rf dist tsconfig.tsbuildinfo",
+    "start": "node dist/index.js",
+    "dev": "npm run build && npm run start",
+    "typecheck": "tsc -b",
+    "migrate": "node dist/scripts/migrate.js",
+    "migrate:box-from-mongo": "node dist/scripts/migrateBoxFromMongo.js",
+    "rotate:broker-token-key": "node dist/scripts/rotateBrokerTokenKey.js",
+    "outbox:replay": "node dist/scripts/outboxReplay.js",
+    "test:unit": "node --test \"tests/box/*.test.mjs\"",
+    "test:pg": "node --test \"tests/pg/*.test.mjs\"",
+    "test:projector": "node --test \"tests/projector/*.test.mjs\"",
+    "test:tokens": "node --test \"tests/tokens/*.test.mjs\"",
+    "test:access": "node --test \"tests/access/*.test.mjs\"",
+    "test:switch": "node --test \"tests/switch/*.test.mjs\"",
+    "test:shutdown": "node --test \"tests/shutdown/*.test.mjs\"",
+    "test:integration": "npm run test:pg && npm run test:projector",
+    "test": "npm run build && npm run test:unit && npm run test:tokens && npm run test:access && npm run test:switch && npm run test:shutdown && npm run test:integration"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "17.4.2",
+    "express": "5.2.1",
+    "mongodb": "6.13.0",
+    "pg": "8.13.1"
+  },
+  "devDependencies": {
+    "@types/express": "5.0.6",
+    "@types/node": "22.10.0",
+    "@types/pg": "8.11.10",
+    "typescript": "5.7.2"
+  }
+}
