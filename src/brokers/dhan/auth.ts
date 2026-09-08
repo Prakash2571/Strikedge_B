@@ -26,7 +26,6 @@
  */
 
 import { DhanAuthError, DhanError } from "./errors.js";
-import { DHAN_AUTH_ROOT } from "./http.js";
 
 /** What Dhan returns from consume-consent. */
 export interface DhanConsentSession {
@@ -72,11 +71,6 @@ export function readDhanCredentials():
     return { ok: false, reason: `Dhan is not configured: ${missing.join(", ")} missing.` };
   }
   return { ok: true, creds: { clientId, apiKey, apiSecret, redirectUrl, postbackUrl } };
-}
-
-/** The browser login URL for a consent id. */
-export function dhanLoginUrl(consentAppId: string): string {
-  return `${DHAN_AUTH_ROOT}/login/consentApp-login?consentAppId=${encodeURIComponent(consentAppId)}`;
 }
 
 /**

@@ -440,7 +440,9 @@ export class KiteClient {
   private authHeader(): Record<string, string> {
     if (!this.accessToken) {
       throw new KiteError(
-        "Not authenticated. Complete the Zerodha login flow first (/login).",
+        "Zerodha access token is not installed yet. StrikeEdge has no interactive login flow; " +
+          "the token is provisioned by the CalSpread token acquisition service and installed via " +
+          "installProvidedToken(). Wait for token acquisition to complete (see GET /api/runtime/status).",
         401,
       );
     }
