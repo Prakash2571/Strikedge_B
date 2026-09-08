@@ -35,9 +35,10 @@
  */
 
 import "dotenv/config";
+import { pathToFileURL } from "node:url";
 import { MongoClient, type Document } from "mongodb";
 import type { PoolClient } from "pg";
-import { closePg, getPool, initPg, pgConfigFromEnv, withTx } from "../pg/pool.js";
+import { closePg, getPool, initPg, pgConfigFromEnv } from "../pg/pool.js";
 
 /** Order-intent states that are TERMINAL. Everything else is nonterminal. */
 const TERMINAL_INTENT_STATES = new Set(["COMPLETE", "CANCELLED", "REJECTED"]);
@@ -136,10 +137,26 @@ function parseArgs(argv: string[]): ImportOptions {
 
 /**
  * Pre-flight: does the TARGET show a live-trading process could be active?
- * We treat an armed trading session, or any nonterminal order intent, as a live
- * marker. This is a durable check against PostgreSQL, not a guess.
+ *
+ * TWO durable markers, but they are NOT equivalent:
+ *
+ *  - An ARMED trading session is an unconditional live marker. Arming is a
+ *    deliberate operator action that means the engine may place orders; importing
+ *    underneath it could interleave writes with a running engine. This always blocks.
+ *
+ *  - A NONTERMINAL order intent is a live marker ONLY when it is NOT one we are
+ *    about to (re-)import. A first import into an empty target sees none. A RE-RUN
+ *    would otherwise see the intents its own previous run carried across and refuse
+ *    itself — breaking idempotency. So intents whose ids appear in the legacy source
+ *    (`legacyIntentIds`) are excluded: they are historical rows being re-imported,
+ *    not evidence of a live process. A nonterminal intent in the target that is
+ *    ABSENT from the legacy source is unexplained and DOES block, because it can
+ *    only have been produced by a live StrikeEdge process.
  */
-async function detectLiveMarkers(client: PoolClient): Promise<string[]> {
+async function detectLiveMarkers(
+  client: PoolClient,
+  legacyIntentIds: ReadonlySet<string>,
+): Promise<string[]> {
   const markers: string[] = [];
 
   const armed = await client.query<{ n: number }>(
@@ -147,11 +164,14 @@ async function detectLiveMarkers(client: PoolClient): Promise<string[]> {
   );
   if ((armed.rows[0]?.n ?? 0) > 0) markers.push("an armed trading session exists");
 
-  const nonterminal = await client.query<{ n: number }>(
-    `SELECT count(*)::int AS n FROM box_order_intents WHERE state NOT IN ('COMPLETE','CANCELLED','REJECTED')`,
+  const { rows } = await client.query<{ id: string }>(
+    `SELECT id FROM box_order_intents WHERE state NOT IN ('COMPLETE','CANCELLED','REJECTED')`,
   );
-  if ((nonterminal.rows[0]?.n ?? 0) > 0) {
-    markers.push(`${nonterminal.rows[0]?.n} nonterminal order intent(s) exist in the target`);
+  const unexplained = rows.filter((r) => !legacyIntentIds.has(r.id));
+  if (unexplained.length > 0) {
+    markers.push(
+      `${unexplained.length} nonterminal order intent(s) exist in the target that are not in the legacy source`,
+    );
   }
 
   return markers;
@@ -489,6 +509,120 @@ async function collectNonterminalIntents(client: PoolClient): Promise<Nontermina
   return rows;
 }
 
+/** The structured result of an import run, returned for the report and for tests. */
+export interface ImportResult {
+  reports: CollectionReport[];
+  openPositions: OpenPosition[];
+  nonterminalIntents: NonterminalIntent[];
+  liveMarkers: string[];
+}
+
+/**
+ * Run the import against an already-open pool and legacy Mongo database. Exported
+ * so tests can drive it with a per-file schema and a seeded legacy database without
+ * the global pool or a subprocess. `main` is a thin CLI wrapper over this.
+ *
+ * Throws if live markers are present and `forceWithLive` is not set (rule 4).
+ */
+export async function runImport(
+  pool: import("pg").Pool,
+  legacyDb: import("mongodb").Db,
+  opts: ImportOptions,
+): Promise<ImportResult> {
+  // 1) Read the legacy collections first, so the live-marker check can tell an
+  //    intent it is about to re-import apart from one a live process produced.
+  const read = async (name: string): Promise<Document[]> => legacyDb.collection(name).find({}).toArray();
+  const [trades, events, intents, attempts, dailyPnl, settings, session, calibration] = await Promise.all([
+    read("box_trades"),
+    read("box_trade_events"),
+    read("box_order_intents"),
+    read("box_execution_attempts"),
+    read("box_daily_pnl"),
+    read("box_settings"),
+    read("box_trading_session"),
+    read("box_calibration_samples"),
+  ]);
+  const legacyIntentIds = new Set<string>(
+    intents.map((d) => {
+      try {
+        return idToString(d._id);
+      } catch {
+        return "";
+      }
+    }),
+  );
+
+  // 2) Live-marker pre-flight against the TARGET, excluding intents we will re-import.
+  const liveMarkers = await (async () => {
+    const c = await pool.connect();
+    try {
+      return await detectLiveMarkers(c, legacyIntentIds);
+    } finally {
+      c.release();
+    }
+  })();
+  if (liveMarkers.length > 0) {
+    if (!opts.forceWithLive) {
+      throw new LiveMarkersPresentError(liveMarkers);
+    }
+  }
+
+  const reports: CollectionReport[] = [];
+  let openPositions: OpenPosition[] = [];
+  let nonterminalIntents: NonterminalIntent[] = [];
+
+  // Import each collection inside ONE transaction so a mid-import failure rolls
+  // back cleanly. Idempotency means a re-run resumes safely.
+  await withTxOn(pool, async (tx) => {
+    reports.push(await importCollection(tx, trades, "box_trades", writeTrade, opts.apply));
+    reports.push(await importCollection(tx, events, "box_trade_events", writeTradeEvent, opts.apply));
+    reports.push(await importCollection(tx, intents, "box_order_intents", writeOrderIntent, opts.apply));
+    reports.push(await importCollection(tx, attempts, "box_execution_attempts", writeExecutionAttempt, opts.apply));
+    reports.push(await importCollection(tx, dailyPnl, "box_daily_pnl", writeDailyPnl, opts.apply));
+    reports.push(await importCollection(tx, settings, "box_settings", writeSetting, opts.apply));
+    reports.push(await importCollection(tx, session, "box_trading_session", writeTradingSession, opts.apply));
+    reports.push(await importCollection(tx, calibration, "box_calibration_samples", writeCalibrationSample, opts.apply));
+
+    // Report open positions and nonterminal intents SEPARATELY, read from the
+    // target AFTER the import. They reflect exactly what is carried across; we
+    // NEVER change them.
+    openPositions = await collectOpenPositions(tx);
+    nonterminalIntents = await collectNonterminalIntents(tx);
+  });
+
+  return { reports, openPositions, nonterminalIntents, liveMarkers };
+}
+
+/** Raised when the target shows a StrikeEdge process could be trading. */
+export class LiveMarkersPresentError extends Error {
+  readonly markers: readonly string[];
+  constructor(markers: readonly string[]) {
+    super(
+      "Refusing to import while a StrikeEdge process could be trading: " +
+        `${markers.join("; ")}. Stop all StrikeEdge processes and retry. ` +
+        "(--force-with-live exists but MUST NOT be used against a live deployment; see docs/LEGACY_IMPORT.md.)",
+    );
+    this.name = "LiveMarkersPresentError";
+    this.markers = markers;
+  }
+}
+
+/** A transaction over a specific pool (mirrors pool.ts withTx but not pinned to the global pool). */
+async function withTxOn<T>(pool: import("pg").Pool, fn: (client: PoolClient) => Promise<T>): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const out = await fn(client);
+    await client.query("COMMIT");
+    return out;
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 async function main(): Promise<void> {
   const opts = parseArgs(process.argv.slice(2));
   const legacyUri = (process.env.LEGACY_BOX_MONGODB_URI ?? "").trim();
@@ -497,80 +631,22 @@ async function main(): Promise<void> {
   await initPg(pgConfigFromEnv());
   const pool = getPool();
 
-  // 1) Live-marker pre-flight against the TARGET.
-  const liveMarkers = await pool.query("SELECT 1").then(async () => {
-    const c = await pool.connect();
-    try {
-      return await detectLiveMarkers(c);
-    } finally {
-      c.release();
-    }
-  });
-  if (liveMarkers.length > 0) {
-    console.warn(`[migrate:box-from-mongo] LIVE MARKERS DETECTED in target: ${liveMarkers.join("; ")}.`);
-    if (!opts.forceWithLive) {
-      throw new Error(
-        "Refusing to import while a StrikeEdge process could be trading. Stop all StrikeEdge processes " +
-          "and retry. (--force-with-live exists but MUST NOT be used against a live deployment; see docs/LEGACY_IMPORT.md.)",
-      );
-    }
-    console.warn("[migrate:box-from-mongo] --force-with-live set: proceeding DESPITE live markers. This is unsafe.");
-  }
-
-  // 2) Read legacy collections.
   const client = new MongoClient(legacyUri, { serverSelectionTimeoutMS: 8_000 });
-  const reports: CollectionReport[] = [];
-  let openPositions: OpenPosition[] = [];
-  let nonterminalIntents: NonterminalIntent[] = [];
-
+  let result: ImportResult;
   try {
     await client.connect();
-    const db = client.db();
-
-    const read = async (name: string): Promise<Document[]> =>
-      db.collection(name).find({}).toArray();
-
-    const [
-      trades, events, intents, attempts, dailyPnl, settings, session, calibration,
-    ] = await Promise.all([
-      read("box_trades"),
-      read("box_trade_events"),
-      read("box_order_intents"),
-      read("box_execution_attempts"),
-      read("box_daily_pnl"),
-      read("box_settings"),
-      read("box_trading_session"),
-      read("box_calibration_samples"),
-    ]);
-
-    console.log(
-      `[migrate:box-from-mongo] mode: ${opts.apply ? "APPLY (writing)" : "DRY RUN (no writes)"}`,
-    );
-
-    // 3) Import each collection inside ONE transaction so a mid-import failure
-    //    rolls back cleanly. Idempotency means a re-run resumes safely.
-    await withTx(async (tx) => {
-      reports.push(await importCollection(tx, trades, "box_trades", writeTrade, opts.apply));
-      reports.push(await importCollection(tx, events, "box_trade_events", writeTradeEvent, opts.apply));
-      reports.push(await importCollection(tx, intents, "box_order_intents", writeOrderIntent, opts.apply));
-      reports.push(await importCollection(tx, attempts, "box_execution_attempts", writeExecutionAttempt, opts.apply));
-      reports.push(await importCollection(tx, dailyPnl, "box_daily_pnl", writeDailyPnl, opts.apply));
-      reports.push(await importCollection(tx, settings, "box_settings", writeSetting, opts.apply));
-      reports.push(await importCollection(tx, session, "box_trading_session", writeTradingSession, opts.apply));
-      reports.push(await importCollection(tx, calibration, "box_calibration_samples", writeCalibrationSample, opts.apply));
-
-      // 4) Report open positions and nonterminal intents SEPARATELY. These are read
-      //    from the target AFTER the (dry-run: nothing / apply: written) import, so
-      //    they reflect what will actually be carried across. We NEVER change them.
-      openPositions = await collectOpenPositions(tx);
-      nonterminalIntents = await collectNonterminalIntents(tx);
-    });
+    console.log(`[migrate:box-from-mongo] mode: ${opts.apply ? "APPLY (writing)" : "DRY RUN (no writes)"}`);
+    result = await runImport(pool, client.db(), opts);
+    if (result.liveMarkers.length > 0 && opts.forceWithLive) {
+      console.warn(
+        `[migrate:box-from-mongo] --force-with-live set: proceeded DESPITE live markers (${result.liveMarkers.join("; ")}). This is unsafe.`,
+      );
+    }
   } finally {
     await client.close().catch(() => undefined);
   }
 
-  // 5) Print the migration report.
-  printReport(reports, openPositions, nonterminalIntents, opts);
+  printReport(result.reports, result.openPositions, result.nonterminalIntents, opts);
 }
 
 function printReport(
@@ -630,13 +706,18 @@ function printReport(
   console.log("========================\n");
 }
 
-main()
-  .then(async () => {
-    await closePg();
-    process.exit(0);
-  })
-  .catch(async (err) => {
-    console.error(`[migrate:box-from-mongo] FAILED: ${bounded(err, 500)}`);
-    await closePg().catch(() => undefined);
-    process.exit(1);
-  });
+/** Only run the CLI when invoked directly, not when imported by a test. */
+const isEntrypoint = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (isEntrypoint) {
+  main()
+    .then(async () => {
+      await closePg();
+      process.exit(0);
+    })
+    .catch(async (err) => {
+      console.error(`[migrate:box-from-mongo] FAILED: ${bounded(err, 500)}`);
+      await closePg().catch(() => undefined);
+      process.exit(1);
+    });
+}
