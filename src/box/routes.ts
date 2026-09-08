@@ -1,10 +1,11 @@
 /**
  * Box HTTP + SSE surface, mounted under /api/box.
  *
- * Uses the application's existing access pattern: the injected `requireAdmin`
- * middleware (full admin OR trade access, via the x-admin-token header), and the
- * same query-parameter token trick for the SSE endpoint, since EventSource
- * cannot send headers.
+ * Uses the application's access pattern: the injected `requireOperator`
+ * middleware (a valid site-passcode session, delivered as an HttpOnly cookie), and
+ * `getOperatorRole(req)` to read the validated role. The SSE endpoint authenticates
+ * from the same secure same-origin cookie — a session token in the query string is
+ * never accepted, since EventSource sends cookies on same-origin requests.
  *
  * Every route lives here rather than in index.ts, so the box module adds nothing
  * to that file beyond a single registration call.
@@ -24,9 +25,14 @@ import {
 
 export interface BoxRouteDeps {
   engine: BoxEngine;
-  requireAdmin: RequestHandler;
-  /** Resolves an admin role from a token — used for the SSE query-param auth. */
-  getAdminRole: (token: string | undefined) => "full" | "trade" | null;
+  requireOperator: RequestHandler;
+  /**
+   * Resolves the operator role from the request's validated session (attached by
+   * requireOperator). StrikeEdge authenticates via an HttpOnly session cookie, not
+   * a header/query token, so this reads the request — never a query-string token —
+   * which is why an SSE stream cannot be authenticated by a token in the URL.
+   */
+  getOperatorRole: (req: Request) => "full" | "trade" | null;
 }
 
 function fail(res: Response, err: unknown): void {
@@ -53,10 +59,9 @@ const deleteRateLimit = rateLimit({
 });
 
 export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
-  const { engine, requireAdmin } = deps;
+  const { engine, requireOperator } = deps;
   const requireFull = (req: Request, res: Response): boolean => {
-    const token = req.header("x-admin-token") ?? undefined;
-    if (deps.getAdminRole(token) !== "full") {
+    if (deps.getOperatorRole(req) !== "full") {
       res.status(403).json({ error: "Full administrator access required." });
       return false;
     }
@@ -65,11 +70,11 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
 
   /* ------------------------------- control ------------------------------- */
 
-  app.get("/api/box/status", requireAdmin, (_req: Request, res: Response) => {
+  app.get("/api/box/status", requireOperator, (_req: Request, res: Response) => {
     res.json(engine.getStatus());
   });
 
-  app.get("/api/box/config", requireAdmin, (_req: Request, res: Response) => {
+  app.get("/api/box/config", requireOperator, (_req: Request, res: Response) => {
     res.json(engine.getConfig());
   });
 
@@ -82,7 +87,7 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
    * only latency numbers, counts, statuses and explicitly-configured labels — never a token, key
    * or session identifier.
    */
-  app.get("/api/box/execution-diagnostics", requireAdmin, (_req: Request, res: Response) => {
+  app.get("/api/box/execution-diagnostics", requireOperator, (_req: Request, res: Response) => {
     try {
       res.json(engine.getExecutionDiagnostics());
     } catch (err) {
@@ -98,7 +103,7 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
    * entered. Positions ALREADY OPEN are never affected — they keep being
    * monitored and exit on their own rules regardless of the new width.
    */
-  app.post("/api/box/strike-level", requireAdmin, async (req: Request, res: Response) => {
+  app.post("/api/box/strike-level", requireOperator, async (req: Request, res: Response) => {
     try {
       const raw = (req.body ?? {}) as { level?: unknown };
       const level = Number(raw.level);
@@ -122,14 +127,13 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
    *
    * Body: { min_expected_net_profit?: number, safety_buffer?: number }
    */
-  app.post("/api/box/settings", requireAdmin, async (req: Request, res: Response) => {
+  app.post("/api/box/settings", requireOperator, async (req: Request, res: Response) => {
     try {
       const body = (req.body ?? {}) as Record<string, unknown>;
       // Attribute the change in the append-only ledger. This threshold governs
       // automatic entries, so "it moved" is not enough — the role that moved it
       // belongs in the audit trail alongside the values.
-      const token = req.header("x-admin-token") ?? undefined;
-      const actor = deps.getAdminRole(token) ?? "admin";
+      const actor = deps.getOperatorRole(req) ?? "admin";
       const result = await engine.setTuning(
         {
           minExpectedNetProfit: body.min_expected_net_profit ?? body.minExpectedNetProfit,
@@ -148,7 +152,7 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
   });
 
   /** RUN — begin discovering and auto-opening paper boxes. */
-  app.post("/api/box/start", requireAdmin, async (_req: Request, res: Response) => {
+  app.post("/api/box/start", requireOperator, async (_req: Request, res: Response) => {
     try {
       const result = await engine.start();
       if (!result.ok) {
@@ -167,7 +171,7 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
    * Open positions keep being monitored and can still auto-exit; that is the
    * documented meaning of STOP and it is enforced by the engine, not here.
    */
-  app.post("/api/box/stop", requireAdmin, (_req: Request, res: Response) => {
+  app.post("/api/box/stop", requireOperator, (_req: Request, res: Response) => {
     engine.stop();
     res.json({ ok: true, status: engine.getStatus() });
   });
@@ -177,7 +181,7 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
     "box_live_order_enabled",
     "box_emergency_flatten",
   ] as const) {
-    app.post(`/api/box/controls/${control}`, requireAdmin, (req: Request, res: Response) => {
+    app.post(`/api/box/controls/${control}`, requireOperator, (req: Request, res: Response) => {
       if (!requireFull(req, res)) return;
       const enabled = (req.body as { enabled?: unknown } | undefined)?.enabled;
       if (typeof enabled !== "boolean") {
@@ -202,7 +206,7 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
    * The UI's Execution panel reads this rather than mining `getStatus()`. Contains no secrets:
    * modes, labels, counts, booleans and configured numbers only.
    */
-  app.get("/api/box/execution-control", requireAdmin, (_req: Request, res: Response) => {
+  app.get("/api/box/execution-control", requireOperator, (_req: Request, res: Response) => {
     try {
       res.json(engine.getExecutionControl());
     } catch (err) { fail(res, err); }
@@ -214,7 +218,7 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
    * Lets the UI report "restart required" and the exact environment variables involved, instead of
    * offering a selector that silently fails. Read-only, so plain admin auth.
    */
-  app.post("/api/box/execution-mode/preview", requireAdmin, (req: Request, res: Response) => {
+  app.post("/api/box/execution-mode/preview", requireOperator, (req: Request, res: Response) => {
     const to = (req.body as { selection?: unknown } | undefined)?.selection;
     const allowed = ["paper_latency", "paper_legging", "paper_legging_live_parity", "live"] as const;
     if (typeof to !== "string" || !(allowed as readonly string[]).includes(to)) {
@@ -234,7 +238,7 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
    * is a startup-only construction boundary, so a paper deployment contains no object able to place
    * a real order. Backend validation is independent of the frontend's.
    */
-  app.post("/api/box/execution-mode/paper-profile", requireAdmin, (req: Request, res: Response) => {
+  app.post("/api/box/execution-mode/paper-profile", requireOperator, (req: Request, res: Response) => {
     if (!requireFull(req, res)) return;
     const profile = (req.body as { profile?: unknown } | undefined)?.profile;
     const allowed = ["standard", "live_parity", "stress"] as const;
@@ -245,7 +249,7 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
     try {
       const result = engine.setPaperExecutionProfile(
         profile as (typeof allowed)[number],
-        deps.getAdminRole(req.header("x-admin-token") ?? undefined),
+        deps.getOperatorRole(req),
       );
       if (!result.ok) {
         res.status(result.code).json({ error: result.error, ...(result.blockers ? { blockers: result.blockers } : {}) });
@@ -266,7 +270,7 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
    * `BOX_SESSION_MAX_COMPLETED_TRADES` is used. The value is SNAPSHOTTED, so a later config change
    * cannot widen a session already armed.
    */
-  app.post("/api/box/session/arm", requireAdmin, async (req: Request, res: Response) => {
+  app.post("/api/box/session/arm", requireOperator, async (req: Request, res: Response) => {
     if (!requireFull(req, res)) return;
     const raw = (req.body as { max_completed_trades?: unknown } | undefined)?.max_completed_trades;
     let max: number | undefined;
@@ -280,7 +284,7 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
     try {
       const result = await engine.armTradingSession({
         ...(max === undefined ? {} : { maxCompletedTrades: max }),
-        actor: deps.getAdminRole(req.header("x-admin-token") ?? undefined),
+        actor: deps.getOperatorRole(req),
       });
       if (!result.ok) {
         res.status(result.code).json({ error: result.error, execution: engine.getExecutionControl() });
@@ -296,31 +300,31 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
    * Stops new entry; does NOT clear the counters, so disarm-then-arm cannot be used to skip the
    * exposure guard on arming. Every reduction path is unaffected.
    */
-  app.post("/api/box/session/disarm", requireAdmin, async (req: Request, res: Response) => {
+  app.post("/api/box/session/disarm", requireOperator, async (req: Request, res: Response) => {
     if (!requireFull(req, res)) return;
     try {
       const result = await engine.disarmTradingSession(
-        deps.getAdminRole(req.header("x-admin-token") ?? undefined),
+        deps.getOperatorRole(req),
       );
       res.json({ ok: result.ok, session: result.session, execution: engine.getExecutionControl() });
     } catch (err) { fail(res, err); }
   });
 
-  app.post("/api/box/live/reconcile", requireAdmin, async (req: Request, res: Response) => {
+  app.post("/api/box/live/reconcile", requireOperator, async (req: Request, res: Response) => {
     if (!requireFull(req, res)) return;
     try {
       res.json({ ok: true, reconciliation: await engine.reconcileLive(), status: engine.getStatus() });
     } catch (err) { fail(res, err); }
   });
 
-  app.post("/api/box/live/cancel-working", requireAdmin, async (req: Request, res: Response) => {
+  app.post("/api/box/live/cancel-working", requireOperator, async (req: Request, res: Response) => {
     if (!requireFull(req, res)) return;
     try {
       res.json({ ok: true, orders: await engine.cancelWorkingBoxOrders(), status: engine.getStatus() });
     } catch (err) { fail(res, err); }
   });
 
-  app.post("/api/box/live/flatten", requireAdmin, async (req: Request, res: Response) => {
+  app.post("/api/box/live/flatten", requireOperator, async (req: Request, res: Response) => {
     if (!requireFull(req, res)) return;
     try {
       res.json({ ok: true, ...(await engine.flattenAttributedBoxExposure()), status: engine.getStatus() });
@@ -329,7 +333,7 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
 
   /* ----------------------------- opportunities ---------------------------- */
 
-  app.get("/api/box/opportunities", requireAdmin, (req: Request, res: Response) => {
+  app.get("/api/box/opportunities", requireOperator, (req: Request, res: Response) => {
     const raw = Number(req.query.limit ?? 0);
     const limit = Number.isFinite(raw) && raw > 0 ? Math.min(300, Math.round(raw)) : undefined;
     res.json({
@@ -339,7 +343,7 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
   });
 
   /** The ATM±3 chains being monitored (list form). */
-  app.get("/api/box/chains", requireAdmin, (req: Request, res: Response) => {
+  app.get("/api/box/chains", requireOperator, (req: Request, res: Response) => {
     const underlying = String(req.query.underlying ?? "").trim();
     if (!underlying) {
       res.json({ chains: engine.listChainSymbols() });
@@ -357,7 +361,7 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
 
   /* -------------------------------- trades ------------------------------- */
 
-  app.get("/api/box/trades", requireAdmin, async (_req: Request, res: Response) => {
+  app.get("/api/box/trades", requireOperator, async (_req: Request, res: Response) => {
     try {
       const trades = await loadBoxTrades();
       res.json({
@@ -371,7 +375,7 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
   });
 
   /** Live open positions with their current exit arithmetic (in-memory, fast). */
-  app.get("/api/box/trades/open", requireAdmin, (_req: Request, res: Response) => {
+  app.get("/api/box/trades/open", requireOperator, (_req: Request, res: Response) => {
     res.json({ dbEnabled: isBoxDbEnabled(), open: engine.getOpenPositions() });
   });
 
@@ -384,7 +388,7 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
    * default `scope=all` is the whole closed book from Mongo and is the slower call
    * the UI makes second, in the background.
    */
-  app.get("/api/box/trades/history", requireAdmin, async (req: Request, res: Response) => {
+  app.get("/api/box/trades/history", requireOperator, async (req: Request, res: Response) => {
     try {
       const scope = String(req.query.scope ?? "all").trim().toLowerCase();
       if (scope === "today") {
@@ -429,7 +433,7 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
   });
 
   /** paper_legging execution attempts that aborted (partial fill + unwind). */
-  app.get("/api/box/execution-attempts", requireAdmin, async (req: Request, res: Response) => {
+  app.get("/api/box/execution-attempts", requireOperator, async (req: Request, res: Response) => {
     try {
       const raw = Number(req.query.limit ?? 0);
       const limit = Number.isFinite(raw) && raw > 0 ? Math.min(500, Math.round(raw)) : 100;
@@ -440,7 +444,7 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
   });
 
   /** The append-only decision ledger. */
-  app.get("/api/box/events", requireAdmin, async (req: Request, res: Response) => {
+  app.get("/api/box/events", requireOperator, async (req: Request, res: Response) => {
     try {
       const raw = Number(req.query.limit ?? 0);
       const limit = Number.isFinite(raw) && raw > 0 ? Math.min(1000, Math.round(raw)) : 200;
@@ -457,7 +461,7 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
    * with 409 when the four-leg one-lot market is unavailable — it will not invent
    * a price to satisfy the request.
    */
-  app.post("/api/box/trades/:id/close", requireAdmin, async (req: Request, res: Response) => {
+  app.post("/api/box/trades/:id/close", requireOperator, async (req: Request, res: Response) => {
     try {
       const id = String(req.params.id ?? "");
       const result = await engine.closeManually(id);
@@ -489,7 +493,7 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
   app.delete(
     "/api/box/trades/:id",
     deleteRateLimit,
-    requireAdmin,
+    requireOperator,
     async (req: Request, res: Response) => {
       if (!requireFull(req, res)) return;
       try {
@@ -498,8 +502,7 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
         const reason = typeof body.reason === "string" && body.reason.trim() !== ""
           ? body.reason.trim().slice(0, 500)
           : null;
-        const token = req.header("x-admin-token") ?? undefined;
-        const actor = deps.getAdminRole(token) ?? "admin";
+        const actor = deps.getOperatorRole(req) ?? "admin";
 
         const result = await engine.deleteTrade(id, { actor, reason });
         if (!result.ok) {
@@ -529,17 +532,14 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
    * Live box state: scanner state, opportunity changes, entries, open-position
    * updates and exits.
    *
-   * EventSource cannot set headers, so the admin token arrives as a query
-   * parameter here — exactly as GET /api/stream and /api/login already do.
+   * SSE authenticates from the secure, same-origin session cookie via
+   * requireOperator — EventSource sends cookies on same-origin requests. A session
+   * token in the query string is NEVER accepted; the guard reads only the validated
+   * session the middleware attached to the request.
    */
-  app.get("/api/box/stream", (req: Request, res: Response) => {
-    const token =
-      (req.headers["x-admin-token"] as string | undefined) ??
-      (typeof req.query["x-admin-token"] === "string"
-        ? (req.query["x-admin-token"] as string)
-        : undefined);
-    if (deps.getAdminRole(token) === null) {
-      res.status(403).json({ error: "Admin authentication required" });
+  app.get("/api/box/stream", requireOperator, (req: Request, res: Response) => {
+    if (deps.getOperatorRole(req) === null) {
+      res.status(401).json({ error: "Authentication required" });
       return;
     }
 
