@@ -11,10 +11,14 @@ against the target code, not from memory.
 | --- | --- | --- |
 | `Cal_Spread` | CalSpread frontend (source, READ ONLY) | `3ac5abe07a9e580a0ecc0c8c173aff7dff346184` |
 | `Cal_Spread_Backend` | CalSpread backend (source, READ ONLY) | `803ffe58a25d5ad5d42023d8c063d419b058da56` |
-| `Strikedge_B` | StrikeEdge backend (target) | HEAD at time of writing: `ec944b6b613b0fa2addbcc1c04e18d91e1d4f52d` |
+| `Strikedge_B` | StrikeEdge backend (target) | `9a305888479ddd775b9c46e21624e1fc5e90850e` — the first `main` push |
+| `Strikedge_F` | StrikeEdge frontend (target) | `0230bcecb947e6f9328b9a5403c6f08a644c7e93` — the first `main` push |
 
-The **final** target SHA is the last commit on `main`; this document is committed
-before that final commit, so treat the tip of `main` as the definitive target.
+Those two target SHAs are the commits at which the whole extraction was verified green:
+backend `npm run build` clean, 1,594 tests passing across seven suites with zero failures
+and zero skips, both repositories building from clean checkouts. Only this manifest
+paragraph changed afterwards, which is why its own commit is one ahead of the SHA it
+names.
 
 ## 2. Copied source files
 
