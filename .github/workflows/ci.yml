@@ -76,8 +76,8 @@ jobs:
     name: 1. Clean install (strict npm ci)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
@@ -96,7 +96,7 @@ jobs:
         run: git diff --exit-code -- package-lock.json
       - name: Upload npm logs on failure
         if: failure()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: npm-logs-install
           path: ~/.npm/_logs/
@@ -111,8 +111,8 @@ jobs:
     name: 2. Build / typecheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
@@ -127,7 +127,7 @@ jobs:
         run: test -f dist/index.js
       - name: Upload npm logs on failure
         if: failure()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: npm-logs-build
           path: ~/.npm/_logs/
@@ -181,8 +181,8 @@ jobs:
           --health-timeout 5s
           --health-retries 20
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
@@ -344,7 +344,7 @@ jobs:
 
       - name: Upload test logs on failure
         if: failure()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: test-logs
           path: tests-out/
@@ -367,7 +367,7 @@ jobs:
     name: 4. Safety defaults (example config never live)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: .env.example must exist and must not enable live trading
         run: |
           set -euo pipefail
@@ -408,7 +408,7 @@ jobs:
     name: 5. No committed secrets
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Grep the tree for committed env/credential files
         run: |
           set -euo pipefail
@@ -437,6 +437,6 @@ jobs:
     name: 6. No live broker hostnames (static scan)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Static-scan the test tree for live broker hostnames
         run: bash .github/ci/no-live-hostnames.sh
