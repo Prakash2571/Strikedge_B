@@ -1819,9 +1819,15 @@ export async function applyBoxExecutionAttemptProjection(
     const versionMatches = currentVersion === command.expected_version ||
       (command.expected_version === 0 && (before.projection_version === null || before.projection_version === undefined));
     const residual = Array.isArray(before.residual_exposure) ? before.residual_exposure : [];
+    // The version-zero legacy fallback compares residual CONTENT, not raw serialisation. PostgreSQL
+    // stores residual_exposure as jsonb, which does not preserve object key order, so a byte-for-byte
+    // JSON.stringify() comparison against the command's expected residual would never match a stored
+    // multi-field leg and a legacy row could never be adopted. residualProjectionIdentity() canonicalises
+    // field set and array order, so it is the order-independent identity the guard needs.
+    const legacyResidualMatches =
+      residualProjectionIdentity(residual as typeof command.expected_residual_exposure) === command.expected_projection_identity;
     const identityMatches = currentIdentity === command.expected_projection_identity ||
-      (command.expected_version === 0 && currentIdentity === null &&
-        JSON.stringify(residual) === JSON.stringify(command.expected_residual_exposure));
+      (command.expected_version === 0 && currentIdentity === null && legacyResidualMatches);
 
     if (!versionMatches || !identityMatches) {
       return projectionResult("stale", before);
