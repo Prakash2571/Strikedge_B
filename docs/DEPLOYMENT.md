@@ -1,0 +1,237 @@
+# StrikeEdge deployment
+
+Production deployment: PostgreSQL, migrations, build/start, PM2, nginx (with the
+SSE settings), health check, backup/restore, rollback, the safe migration
+procedure, and — most importantly — the **CalSpread → StrikeEdge cutover**.
+
+PostgreSQL is StrikeEdge's operational authority; treat it accordingly.
+
+## 1. PostgreSQL installation, database and role
+
+Install PostgreSQL (14+; 15/16 fine) from your distro or the PGDG repo. Then
+create a database and a role. Either a **local Unix socket** or a **localhost TCP**
+connection is supported.
+
+Local Unix socket (peer auth — simplest for a single-host deploy):
+
+```bash
+sudo -u postgres createuser --pwprompt strikedge      # or peer-auth role matching the OS user
+sudo -u postgres createdb --owner=strikedge strikedge
+# .env:
+#   DATABASE_URL=postgres:///strikedge
+```
+
+localhost TCP with a password:
+
+```sql
+CREATE ROLE strikedge LOGIN PASSWORD 'CHANGE_ME';
+CREATE DATABASE strikedge OWNER strikedge;
+```
+
+```
+# .env:
+DATABASE_URL=postgresql://strikedge:CHANGE_ME@127.0.0.1:5432/strikedge
+```
+
+The role needs ordinary DDL/DML on its own database (it creates tables via
+migrations). It does not need superuser.
+
+## 2. Migrations
+
+Migrations live in `migrations/*.sql` and run under a PostgreSQL advisory lock, so
+two processes starting together cannot both apply the same migration. Each file's
+checksum is recorded; editing an already-applied migration is refused.
+
+```bash
+npm run migrate                 # apply pending migrations
+npm run migrate -- --check      # assert-only: exits non-zero if the schema is behind
+```
+
+`PG_MIGRATE_ON_BOOT=true` (default) applies migrations during boot. Set it
+`false` and use `npm run migrate` as an explicit release step; boot then refuses
+to start if the schema is behind (surfaced clearly in logs).
+
+## 3. Production build and start
+
+```bash
+npm ci
+npm run build          # tsc -b → dist/
+npm run migrate        # (or rely on PG_MIGRATE_ON_BOOT)
+npm start              # node dist/index.js
+```
+
+## 4. PM2
+
+Use the checked-in `ecosystem.config.cjs` (fork mode, one instance, generous
+`kill_timeout` above `SHUTDOWN_TIMEOUT_MS`).
+
+```bash
+pm2 start ecosystem.config.cjs
+pm2 status
+pm2 logs strikedge
+pm2 reload strikedge          # graceful: SIGTERM → wait kill_timeout → SIGKILL
+pm2 stop strikedge
+pm2 save                      # persist across reboots
+pm2 startup                   # install the boot hook (run the command it prints)
+```
+
+Graceful shutdown runs: stop scanner → drain the outbox → close Mongo → **close
+PostgreSQL last**, bounded by `SHUTDOWN_TIMEOUT_MS`. `kill_timeout` (30s) sits
+above that so the sequence finishes before SIGKILL.
+
+## 5. nginx and SSE
+
+Use `deploy/nginx.conf`. The `/api/box/stream` location disables buffering and
+caching, uses a long read timeout, and sets `X-Accel-Buffering: no`:
+
+- `proxy_buffering off;` — otherwise nginx holds SSE frames and the live board
+  looks frozen; off flushes each `data:` frame immediately.
+- `proxy_cache off;` — a never-ending 200 must never be cached/coalesced.
+- `proxy_read_timeout 3600s;` — SSE streams are long-lived and quiet between
+  events; the default 60s would drop a healthy stream during a lull.
+- `proxy_set_header X-Accel-Buffering no;` — per-response guarantee that this
+  stream is unbuffered even if buffering is enabled elsewhere.
+
+## 6. Health check
+
+```bash
+curl -s https://<host>/api/health
+# {"ok":true,"service":"strikedge","shutting_down":false}
+```
+
+`shutting_down:true` means the process received SIGTERM and is draining — a load
+balancer should stop routing to it. Also watch `GET /api/runtime/status` and
+`GET /api/export/status` (see `docs/RUNBOOK.md`).
+
+## 7. Backup and restore
+
+**PostgreSQL is the backup of record.** Back it up; do not treat MongoDB Atlas as
+your backup.
+
+```bash
+# Backup (custom format — compressed, restorable selectively)
+pg_dump --format=custom --file=strikedge_$(date +%F).dump "$DATABASE_URL"
+
+# Restore into a fresh database
+createdb strikedge_restore
+pg_restore --clean --if-exists --dbname=strikedge_restore strikedge_$(date +%F).dump
+```
+
+Schedule `pg_dump` (e.g. nightly + before every migration) and test a restore
+periodically.
+
+**Why MongoDB Atlas is NOT the backup of record.** Atlas is an *async reporting
+replica* fed by a transactional outbox. It lags PostgreSQL, it can be disabled
+(`MONGO_EXPORT_ENABLED=false` or no `MONGODB_URI`), and its documents are shaped
+for reporting, not for reconstructing operational state (order-intent CAS
+history, reservation ownership, day-state proofs). Restoring from Atlas would
+give you a stale, lossy view and could not re-establish the durable guarantees.
+Always restore from a PostgreSQL dump; use the outbox replay only to *re-populate
+Atlas from PostgreSQL*, never the reverse.
+
+## 8. Outbox replay
+
+If the Mongo projection falls behind or Atlas was down, re-drive it from
+PostgreSQL:
+
+```bash
+npm run outbox:replay
+```
+
+This re-enqueues/replays outbox rows to Atlas. It reads from PostgreSQL (the
+source of truth) and writes to Mongo — never the other way.
+
+## 9. Rollback
+
+1. `pm2 stop strikedge`.
+2. Deploy the previous build artifact (previous `dist/` or previous tag +
+   `npm ci && npm run build`).
+3. **Do not roll a migration backwards automatically.** Migrations are additive
+   and checksum-locked. If the previous code is compatible with the current
+   schema (usually true for additive migrations), just start the old code. If a
+   migration must be undone, do it as a new, reviewed forward migration after
+   following §10.
+4. `pm2 start ecosystem.config.cjs` and verify `/api/health` and
+   `/api/runtime/status`.
+
+## 10. Safe database migration procedure
+
+Never migrate under a live, armed process.
+
+1. **Stop the scanner** — `POST /api/box/stop` (or via the UI).
+2. **Disarm** live trading — `POST /api/box/session/disarm`.
+3. **Verify flat** — `GET /api/runtime/status`: no open positions, no working
+   orders, no execution in flight, no residual legs, no unresolved order intents,
+   reconciliation complete.
+4. **Back up** — `pg_dump` (see §7).
+5. **Migrate** — `npm run migrate` (or `-- --check` first to see the delta).
+6. **Verify** — `npm run migrate -- --check` returns OK; app boots; `/api/health`
+   green.
+7. **Restart / re-arm** — start the process; only re-arm live trading
+   deliberately, through the gates.
+
+---
+
+## 11. THE CRITICAL CUTOVER — CalSpread → StrikeEdge
+
+> **CalSpread Box live execution for both Zerodha and Dhan must remain disabled
+> before and while StrikeEdge owns Box live execution. StrikeEdge PostgreSQL
+> cannot fence orders submitted independently by the old CalSpread process.**
+
+CalSpread and StrikeEdge **must not both run active Box live scanners against the
+same Zerodha or Dhan account.** Their reservation/order-intent stores are separate
+(CalSpread's Mongo, StrikeEdge's PostgreSQL); neither can see or fence the other's
+orders. Two live scanners on one account can double-enter, race the same
+underlying and leave residuals nobody planned. The passcode/token routes are
+shared and safe; **live execution is the thing that must be exclusive.**
+
+Perform the cutover in this order:
+
+1. **Stop the CalSpread Box scanner** (its Box scanning loop).
+2. **Disable CalSpread Box entry control** (no new Box entries).
+3. **Disable CalSpread Box live-order control** (no new live Box orders).
+4. **Set CalSpread `BOX_LIVE_TRADING_ENABLED=false`.**
+5. **Set CalSpread `DHAN_LIVE_TRADING_ENABLED=false`.**
+6. **Confirm CalSpread is clean at BOTH brokers:** no in-flight Box entry, no
+   working Box order, no ambiguous Box order, no unresolved Box order intent, and
+   no residual Box exposure at Zerodha AND at Dhan.
+7. **Make an explicit ownership decision for any existing Box position.** Either
+   close it under CalSpread first, or import it into StrikeEdge with
+   `npm run migrate:box-from-mongo` (dry-run first; it copies state verbatim,
+   never marks anything flat) and reconcile each open position/nonterminal intent
+   by hand. Decide per position — do not leave it ambiguous.
+8. **Stop CalSpread's dedicated Box market feed.**
+9. **Keep CalSpread running** only for its remaining, non-Box functions **and its
+   two token routes** (`/api/kite/token`, `/api/dhan/token`) — StrikeEdge depends
+   on those for the morning token.
+10. **Start StrikeEdge in paper mode** (the shipped defaults: `paper_latency`,
+    all live gates false).
+11. **Verify token acquisition** — StrikeEdge's morning poll fetches the day's
+    token from CalSpread; `/api/runtime/status` shows a healthy token.
+12. **Verify the dedicated StrikeEdge Box feed** — one socket on the active
+    broker, ticks flowing.
+13. **Verify PostgreSQL restart recovery** — restart StrikeEdge and confirm it
+    reloads open state from PostgreSQL and reconciles cleanly.
+14. **Verify Mongo outbox replication** — `/api/export/status` shows the backlog
+    draining to Atlas.
+15. **Run observation** — shadow / paper_legging / live_parity — long enough to
+    trust behaviour against live prices without risking capital.
+16. **Only then enable live**, through **all** gates: shared deployment gate
+    (`BOX_EXECUTION_MODE=live` + `BOX_LIVE_TRADING_ENABLED=true`), the **per-broker
+    gate** for the active broker (`ZERODHA_LIVE_TRADING_ENABLED=true` **or**
+    `DHAN_LIVE_TRADING_ENABLED=true`), plus explicit **runtime arming**
+    (`POST /api/box/session/arm`).
+
+### Expected socket topology after cutover
+
+- **CalSpread:** its own non-Box feeds as before, **no dedicated Box feed**, and
+  it continues to serve the two token routes. **No CalSpread Box live execution.**
+- **StrikeEdge:** exactly **one** dedicated Box market-data socket on the
+  **active** broker (never two brokers at once), plus the broker order/HTTP
+  connections for the active broker only. One PM2 fork process, one PostgreSQL
+  pool, one (optional) Mongo client for the reporting drain.
+
+At no point do both systems hold a live Box order path to the same account. If you
+must roll back to CalSpread, reverse the exclusivity the same way: disarm and
+disable StrikeEdge live execution and stop its Box feed **before** re-enabling
+CalSpread's.
