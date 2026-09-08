@@ -275,6 +275,45 @@ route. StrikeEdge hosts **no token routes** — it is a client of CalSpread's.
   admin/access secrets. The passcode grants UI access only and arms nothing.
 - **Multi-worker safety** now rests on the PostgreSQL durable reservation tier
   and globally-unique owner ids rather than a Mongo unique index.
+- **Two scanner-start refusal messages were corrected.** `BoxEngine.start()`
+  refuses for two reasons and both messages were inherited from CalSpread, where
+  they were true, and were wrong here:
+  - *"Box persistence is not configured (set MONGODB_URI)"* → now names
+    PostgreSQL, `DATABASE_URL` and `GET /api/runtime/status`. `isBoxDbEnabled()`
+    resolves to `isPgReady()`, so PostgreSQL is the only thing that can trip that
+    branch; MongoDB Atlas is an asynchronous reporting replica whose absence must
+    never block the scanner. The old text would have sent an operator to debug the
+    wrong database while the authoritative store was down.
+  - *"Connect to Zerodha before starting the box scanner"* → now names the ACTIVE
+    broker, so a Dhan-active deployment no longer displays an instruction about a
+    broker it is not using.
+
+  This is a behaviour change in operator-facing copy only — no gate, threshold or
+  code path moved, and the refusal conditions are unchanged. Pinned by
+  `tests/box/scannerStartRefusals.test.mjs` so neither can silently regress.
+
+## 8a. Box math parity, verified by regeneration
+
+The 22 golden fixtures under `tests/migration-fixtures/` (113 cases: 42 in
+`box/`, 71 in `box-parity/`) are **byte-for-byte identical** to the CalSpread
+baseline, generators included.
+
+That alone only proves the files were copied. The stronger check was also run:
+`tests/migration-fixtures/generate.mjs` and `generate-parity.mjs` were executed
+against **StrikeEdge's own compiled build**, which rewrites every fixture from the
+live implementation. The regenerated output is byte-identical to the CalSpread
+baseline.
+
+So the persistence layer moved from Mongoose to `pg`, the reservation store was
+reimplemented, Redis was removed and the entrypoint was rewritten — and the
+candidate economics, charges, direction selection, exit economics, order pricing,
+position-state derivation, quote evaluation, slippage, bounded-limit walking,
+cumulative-fill ledger, implementation shortfall, latency sourcing, liquidity
+ledger, order-lifecycle staging, paper scheduling, queue calibration, structured
+latency and time-of-day bucketing all still produce the same numbers.
+
+Regenerating a fixture remains a deliberate act: a changed fixture means trading
+behaviour changed, and that is a finding rather than a chore.
 
 ## 9. The unavoidable four-leg broker risk
 
