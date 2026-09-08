@@ -30,6 +30,7 @@ import {
   withTx,
 } from "../pg/pool.js";
 import { enqueueOutbox, enqueueOutboxSnapshot } from "../outbox/writer.js";
+import type { BoxMarginSource } from "./brokerContext.js";
 import { LEGACY_BROKER, type BrokerId } from "../brokers/types.js";
 import {
   MAX_FLATTEN_APPLICATION_IDS,
@@ -435,6 +436,7 @@ function rowToTrade(row: Record<string, unknown>): BoxTradeRecord {
     status: row.status,
     box_width: num(row.box_width),
     margin: numOrNull(row.margin),
+    margin_source: (row.margin_source as BoxTradeRecord["margin_source"]) ?? null,
     entry_box_cost: num(row.entry_box_cost),
     entry_gross_edge: num(row.entry_gross_edge),
     safety_buffer: num(row.safety_buffer),
@@ -545,7 +547,17 @@ function tradeProjectionPayload(trade: BoxTradeRecord): Record<string, unknown> 
     broker: brokerValue(trade.broker),
     charge_origin: trade.charge_origin ?? "local",
     charge_rate_version: trade.charge_rate_version ?? null,
-    margin_source: trade.margin === null || trade.margin === undefined ? "unknown" : "broker",
+    /**
+     * The REAL provenance, from the persisted column.
+     *
+     * This used to be derived as `margin === null ? "unknown" : "broker"`, which told a
+     * reader only whether a number existed — not whether it was a netted basket figure or
+     * a summed per-leg upper bound. Those differ by roughly an order of magnitude on a
+     * hedged Box, so the derived value made the projected history unanalysable. `null` is
+     * preserved as `null` (predates provenance capture) rather than being flattened into
+     * `"unavailable"`, which means something different.
+     */
+    margin_source: trade.margin_source ?? null,
     execution_mode: trade.execution_mode,
     projection_schema_version: BOX_PROJECTION_SCHEMA_VERSION,
   };
@@ -657,13 +669,27 @@ export async function insertBoxTrade(
 }
 
 /** Patch the basket margin onto a trade once fetched off the hot path. */
-export async function setBoxTradeMargin(id: string, margin: number): Promise<void> {
+/**
+ * Store a trade's margin AND the model that produced it.
+ *
+ * `source` is optional so the frozen CalSpread call signature still compiles, but callers
+ * should always pass it: without provenance an inflated `dhan_per_leg_fallback` sum is
+ * indistinguishable from a real netted basket figure once written, which is precisely the
+ * confusion this column exists to prevent.
+ */
+export async function setBoxTradeMargin(
+  id: string,
+  margin: number,
+  source?: BoxMarginSource,
+): Promise<void> {
   if (!isBoxDbEnabled() || !isValidBoxId(id)) return;
   try {
     await withTx(async (client) => {
       const { rows } = await client.query(
-        `UPDATE box_trades SET margin = $2 WHERE id = $1 RETURNING ${TRADE_STAR}`,
-        [id, margin],
+        // COALESCE so an omitted source never ERASES provenance a previous write recorded.
+        `UPDATE box_trades SET margin = $2, margin_source = COALESCE($3, margin_source)
+           WHERE id = $1 RETURNING ${TRADE_STAR}`,
+        [id, margin, source ?? null],
       );
       if (rows[0]) await enqueueTradeProjection(client, rowToTrade(rows[0]), "trade_margin");
     });

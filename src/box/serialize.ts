@@ -63,6 +63,10 @@ export function serializeBoxTrade(doc: BoxTradeDocLike) {
     })),
     box_width: doc.box_width,
     margin: doc.margin ?? null,
+    // WHICH model produced `margin`. Exposed because the dashboard is required to show
+    // broker-specific margin provenance, and because a dhan_per_leg_fallback figure
+    // OVER-STATES a hedged Box and must never be read as a netted basket margin.
+    margin_source: doc.margin_source ?? null,
     entry_box_cost: doc.entry_box_cost,
     entry_gross_edge: doc.entry_gross_edge,
     entry_charges: doc.entry_charges ?? null,

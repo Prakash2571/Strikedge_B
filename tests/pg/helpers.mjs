@@ -22,7 +22,7 @@ const BASE_URL = (process.env.DATABASE_URL ?? "postgres://strikedge:strikedge@12
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS_DIR = resolve(HERE, "..", "..", "migrations");
-const MIGRATIONS = ["001_outbox.sql", "002_box_core.sql", "003_box_pnl_settings_session.sql", "004_reservations.sql"];
+const MIGRATIONS = ["001_outbox.sql", "002_box_core.sql", "003_box_pnl_settings_session.sql", "004_reservations.sql", "008_trade_margin_source.sql"];
 
 /** A connection string that defaults every connection to `schema`. */
 function urlForSchema(schema) {

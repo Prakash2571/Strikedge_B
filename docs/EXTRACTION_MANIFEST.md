@@ -325,18 +325,44 @@ Two states the old shape could not express are now shown: a token-provider
 not the same as "waiting") and **dead-lettered projections**. And
 `live_entry.reasons` is now displayed, so "live entry is blocked" says why.
 
-### Known gap: margin provenance is not exposed over HTTP
+### Margin provenance is now persisted and served
 
-The margin source (`kite_basket` vs a conservative Dhan per-leg fallback) is
-persisted in PostgreSQL and projected to MongoDB, as required — but it is **not
-present in any HTTP response**, so the dashboard cannot display it. Charge
-provenance (`charge_origin`, `charge_rate_version`) *is* on the serialised trade
-and is displayed.
+The margin source (`kite_basket` / `dhan_multi` / `dhan_per_leg_fallback` /
+`unavailable`) is persisted on `box_trades.margin_source` (migration
+`008_trade_margin_source.sql`), projected to MongoDB, exposed on the serialised
+trade, and displayed on the dashboard.
 
-This is recorded rather than papered over: the frontend previously "showed" margin
-provenance by reading a field that did not exist. Exposing it means adding
-`margin_source` to `src/box/serialize.ts` and the trade response — a deliberate API
-addition, not a silent one, and out of scope for the extraction.
+This closes a real gap rather than a cosmetic one. `margin` stored a single number
+and nothing recorded which model produced it, even though the models are not
+interchangeable: `kite_basket` and `dhan_multi` are position-aware netted figures,
+while `dhan_per_leg_fallback` is a summed per-leg **upper bound** that materially
+over-states a hedged four-leg Box. `src/box/engine.ts` warned on the console when it
+fell back, and its own comment stated the problem: *"Only `res.total` is persisted,
+so once stored an inflated per-leg sum is indistinguishable from a real basket
+margin — and it is plausible enough to go unnoticed."* The specification requires
+the opposite: *"Never silently use Dhan per-leg margin as if it were hedge-adjusted
+basket margin. Persist the margin source."*
+
+The outbox payload had additionally **derived** `margin_source` as
+`margin === null ? "unknown" : "broker"`, which recorded only whether a number
+existed — so the projected history could not distinguish two figures that differ by
+roughly an order of magnitude. It now carries the real model name.
+
+`NULL` is meaningful and is the default for pre-existing rows: it means "recorded
+before provenance was captured", which is deliberately distinct from `unavailable`
+("asked, and got nothing"). Back-filling a guess would manufacture provenance that
+was never observed. Covered by `tests/pg/marginProvenance.test.mjs` (7 tests),
+including that an omitted source never erases provenance a previous write recorded.
+
+### `DHAN_DATA_ENABLED` defaults true, deliberately
+
+Every other Dhan gate defaults false, so this looks asymmetric. It is intentional
+and is preserved byte-for-byte from CalSpread: `dhanDataEnabled()` treats an unset
+value as **true** because it gates only quote/instrument access, which cannot place
+an order, whereas `dhanLiveTradingEnabled()` treats an unset value as **false**
+because it gates real orders. Verified by diffing both predicates against
+`Cal_Spread_Backend/src/brokers/registry.ts` — identical. Changing it would be an
+unrequested behavioural divergence from the source, so it stands.
 
 ## 8b. Box math parity, verified by regeneration
 

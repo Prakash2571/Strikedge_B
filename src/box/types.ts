@@ -1580,6 +1580,17 @@ export interface IBoxTrade {
    * like the calendar trade's margin, and never gates a trade.
    */
   margin: number | null;
+  /**
+   * WHICH margin model produced `margin`. The four are not interchangeable:
+   * `kite_basket` and `dhan_multi` are position-aware netted figures, whereas
+   * `dhan_per_leg_fallback` is a summed per-leg UPPER bound that materially over-states a
+   * hedged four-leg Box. Persisted so a stored number can never be mistaken for a netted
+   * one after the fact.
+   *
+   * `null` means the trade predates provenance capture — deliberately distinct from
+   * `"unavailable"`, which means a figure was requested and none was obtained.
+   */
+  margin_source?: "kite_basket" | "dhan_multi" | "dhan_per_leg_fallback" | "unavailable" | null;
 
   /** Signed net debit of the four entry fills (negative = credit received). */
   entry_box_cost: number;

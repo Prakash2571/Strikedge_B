@@ -94,20 +94,34 @@ test("box_trade projection carries the full provenance set", async () => {
   assert.equal(p.charge_rate_version, "v3", "charge_rate_version is projected");
   assert.ok(
     Object.prototype.hasOwnProperty.call(p, "margin_source"),
-    "margin_source provenance is projected (unknown|broker)",
+    "margin_source provenance is projected",
   );
-  assert.ok(["unknown", "broker"].includes(p.margin_source), `margin_source must be unknown|broker, got ${p.margin_source}`);
+  // The REAL model name, or null when the trade has no margin figure yet. This assertion
+  // used to accept only "unknown"|"broker" — a derived value that recorded whether a number
+  // existed rather than which model produced it, so it could not distinguish a netted
+  // basket margin from a per-leg upper bound that differs by roughly an order of magnitude.
+  assert.ok(
+    p.margin_source === null ||
+      ["kite_basket", "dhan_multi", "dhan_per_leg_fallback", "unavailable"].includes(
+        p.margin_source,
+      ),
+    `margin_source must be a real model name or null, got ${p.margin_source}`,
+  );
 });
 
 test("box_trade margin update enqueues a second provenance-bearing projection", async () => {
   const trade = await repo.insertBoxTrade(baseTrade({ broker: "zerodha" }));
-  await repo.setBoxTradeMargin(trade._id, 12345);
+  await repo.setBoxTradeMargin(trade._id, 12345, "kite_basket");
   const rows = await outboxFor("box_trade", trade._id);
   assert.equal(rows.length, 2, "trade_opened + trade_margin");
   const margin = rows.find((r) => r.event_type === "trade_margin");
   assert.ok(margin, "a trade_margin projection exists");
   assertUniversalProvenance(margin);
-  assert.equal(margin.payload.margin_source, "broker", "a fetched margin marks margin_source=broker");
+  assert.equal(
+    margin.payload.margin_source,
+    "kite_basket",
+    "the projection must name the model that produced the figure, not a derived boolean",
+  );
 });
 
 test("box_order_intent projection carries broker, broker_mode, execution_mode and source_id", async () => {

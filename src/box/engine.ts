@@ -3090,7 +3090,10 @@ export class BoxEngine {
           }
           const pos = this.positions.get(id);
           if (pos) pos.margin = margin;
-          await setBoxTradeMargin(id, margin);
+          if (pos) pos.margin_source = res.source;
+          // Persist the PROVENANCE with the figure. Without it a dhan_per_leg_fallback
+          // upper bound is indistinguishable from a netted basket margin once stored.
+          await setBoxTradeMargin(id, margin, res.source);
           if (attempt > 1) {
             console.log(`[Box] margin for ${key} captured on attempt ${attempt}: ₹${margin}`);
           }

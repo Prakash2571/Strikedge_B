@@ -31,6 +31,12 @@ import {
 
 /** One live box position, as the monitor sees it. */
 export interface BoxOpenPosition {
+  /**
+   * Provenance of `margin` — see `IBoxTrade.margin_source`. Carried on the in-memory
+   * position so a status read can report whether the figure is a netted basket margin or
+   * a conservative per-leg upper bound, without a database round trip.
+   */
+  margin_source?: import("./types.js").IBoxTrade["margin_source"];
   id: string;
   /** underlying|expiry|K1|K2|DIRECTION */
   key: string;
