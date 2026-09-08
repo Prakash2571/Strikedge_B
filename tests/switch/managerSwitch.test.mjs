@@ -15,13 +15,19 @@
 import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { createPgHarness, TEST_KEY_HEX } from "../tokens/helpers.mjs";
+import { installHermeticNetwork } from "../helpers/hermeticNetwork.mjs";
 
 let h;
 let registry;
 let KiteClient;
 let TickerHub;
+let hermetic;
 
 before(async () => {
+  // A permitted `switchBroker("dhan", …)` runs the REAL DhanInstrumentStore load, which
+  // would download the ~201k-row live scrip master from images.dhan.co. Serve the trimmed
+  // fixture and fail closed on any other broker egress.
+  hermetic = installHermeticNetwork();
   process.env.BROKER_TOKEN_ENCRYPTION_KEY = TEST_KEY_HEX;
   // Dhan must look "configured" so a Zerodha->Dhan switch is not blocked by
   // broker_not_configured; these are never used to log in (no OAuth).
@@ -35,6 +41,7 @@ before(async () => {
 });
 after(async () => {
   if (h) await h.cleanup();
+  hermetic?.restore();
 });
 beforeEach(async () => {
   const c = await h.raw();

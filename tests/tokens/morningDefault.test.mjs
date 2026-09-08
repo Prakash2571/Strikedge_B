@@ -14,13 +14,19 @@ import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { createPgHarness, TEST_KEY_HEX } from "./helpers.mjs";
 import { boolOr } from "../../dist/config.js";
+import { installHermeticNetwork } from "../helpers/hermeticNetwork.mjs";
 
 let h;
 let registry;
 let KiteClient;
 let TickerHub;
+let hermetic;
 
 before(async () => {
+  // Switching to Dhan runs the REAL scrip-master load (images.dhan.co) and switching back
+  // to Zerodha runs KiteClient.getInstruments() (api.kite.trade). Both are served from
+  // checked-in fixtures; any other broker egress fails closed.
+  hermetic = installHermeticNetwork();
   process.env.BROKER_TOKEN_ENCRYPTION_KEY = TEST_KEY_HEX;
   process.env.DHAN_CLIENT_ID = "DCL";
   process.env.DHAN_API_KEY = "dk";
@@ -32,6 +38,7 @@ before(async () => {
 });
 after(async () => {
   if (h) await h.cleanup();
+  hermetic?.restore();
 });
 beforeEach(async () => {
   const c = await h.raw();

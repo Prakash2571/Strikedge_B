@@ -15,10 +15,23 @@
  * The manager is driven with stub probes/hooks so the ordering is observable.
  */
 
-import test from "node:test";
+import test, { before, after } from "node:test";
 import assert from "node:assert/strict";
 
 import { ActiveBrokerManager } from "../../dist/brokers/registry.js";
+import { installHermeticNetwork } from "../helpers/hermeticNetwork.mjs";
+
+// The three successful `switchBroker("dhan", …)` cases below drive the REAL
+// DhanInstrumentStore.fetchMaster(), which would otherwise download the ~201k-row live
+// scrip master from images.dhan.co. Serve the trimmed fixture instead and fail closed on
+// any other broker egress. See tests/README.md > "Hermetic network".
+let hermetic;
+before(() => {
+  hermetic = installHermeticNetwork();
+});
+after(() => {
+  hermetic?.restore();
+});
 
 /** A manager with no exposure and both brokers configured. */
 function manager(overrides = {}) {
