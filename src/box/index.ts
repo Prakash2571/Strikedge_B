@@ -66,8 +66,19 @@ export interface BoxModuleDeps {
       price: number;
     }[],
   ) => Promise<{ initial: number; final: number; total: number }>;
-  requireAdmin: RequestHandler;
-  getAdminRole: (token: string | undefined) => "full" | "trade" | null;
+  /**
+   * The site-passcode gate. In CalSpread this was `requireAdmin`, a header/query
+   * admin-token middleware; in StrikeEdge it is `requireOperator`, which validates
+   * an HttpOnly session cookie against PostgreSQL. The `RequestHandler` shape is
+   * identical, which is why the Box routes needed only an import change.
+   */
+  requireOperator: RequestHandler;
+  /**
+   * Resolves the operator role from the request that `requireOperator` already
+   * validated. Reads the REQUEST, not a query-string token — which is precisely
+   * what stops the SSE stream being authenticated by a token in the URL.
+   */
+  getOperatorRole: (req: Parameters<RequestHandler>[0]) => "full" | "trade" | null;
 
   /* ------------------------- broker-neutral overrides ------------------------ */
 
@@ -165,8 +176,8 @@ export function registerBoxModule(app: Express, deps: BoxModuleDeps): BoxModule 
 
   registerBoxRoutes(app, {
     engine,
-    requireAdmin: deps.requireAdmin,
-    getAdminRole: deps.getAdminRole,
+    requireOperator: deps.requireOperator,
+    getOperatorRole: deps.getOperatorRole,
   });
 
   return {

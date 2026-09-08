@@ -69,6 +69,20 @@ export function makeIdResolver(all: Instrument[]): (token: number) => string | n
 }
 
 /**
+ * One board row. Exactly CalSpread's `BoardItem`.
+ *
+ * `BoxBoardItem` (in `src/box/instruments.ts`) declares only the four fields the
+ * Box universe actually reads, and it is deliberately left that way — the Box code
+ * must not grow a dependency on the calendar board's shape. The extra `futures`
+ * array is still produced because it is what CalSpread's board carried, and a
+ * structural subtype is assignable to `BoxBoardItem` wherever the Box module wants
+ * one. Declaring it here rather than widening `BoxBoardItem` keeps that seam intact.
+ */
+export interface FnoBoardItem extends BoxBoardItem {
+  futures: { token: number; expiry: string; lot_size: number }[];
+}
+
+/**
  * Build the F&O board: each underlying with its spot token and three nearest
  * futures. The Box universe is derived from this — the futures rows supply the
  * lot size and the expiry ladder, and `spot_token` is what places the ATM window.
@@ -78,7 +92,7 @@ export function makeIdResolver(all: Instrument[]): (token: number) => string | n
  * so `resolveIndexSpotSymbol` tries the curated Zerodha name first and then the
  * underlying symbol itself. Getting this wrong drops every index Box silently.
  */
-export function deriveFnoBoard(all: Instrument[]): BoxBoardItem[] {
+export function deriveFnoBoard(all: Instrument[]): FnoBoardItem[] {
   const futuresByUnderlying = new Map<string, Instrument[]>();
   const eqBySymbol = new Map<string, Instrument>();
   const indexBySymbol = new Map<string, Instrument>();
@@ -97,8 +111,8 @@ export function deriveFnoBoard(all: Instrument[]): BoxBoardItem[] {
     }
   }
 
-  const stocks: BoxBoardItem[] = [];
-  const indices: BoxBoardItem[] = [];
+  const stocks: FnoBoardItem[] = [];
+  const indices: FnoBoardItem[] = [];
 
   for (const [symbol, futs] of futuresByUnderlying) {
     const futures = futs
