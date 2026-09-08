@@ -268,6 +268,37 @@ export class BrokerTokenAcquisitionService {
 
   /** One acquisition attempt for one broker. At most one in flight per broker. */
   private async attempt(broker: BrokerKind): Promise<void> {
+    /**
+     * TOP-LEVEL GUARD — a broker must never be stranded without a reschedule.
+     *
+     * Every call site is `void this.attempt(broker)`, so a rejection escaping this method
+     * becomes an unhandled rejection: the process survives (there is a process-level guard)
+     * but this broker's timer is never re-armed. It would then sit at `polling` for the rest
+     * of the trading day, with no token, no error visible in the status object, and no
+     * further attempt — the worst possible failure mode for a once-a-day acquisition.
+     *
+     * The reachable paths are already individually guarded (`fetchBrokerToken` has its own
+     * try/finally, `installAndPersist` is wrapped by the `ready` case, the callbacks are
+     * `.catch`-ed, and the result switch is exhaustive). This is defence against a
+     * programming error or a throwing clock rather than a known bug — but the cost of being
+     * wrong is a silent lost trading day, so it is guarded the same way the projector loop
+     * and the engine's fatal guard are.
+     */
+    try {
+      await this.attemptInner(broker);
+    } catch (err) {
+      const rt = this.runtimes[broker];
+      rt.inFlight = false;
+      rt.state = "polling";
+      rt.lastError = `unexpected acquisition error: ${
+        err instanceof Error ? err.message.slice(0, 120) : "unknown"
+      }`;
+      console.warn(`[Token] ${broker} acquisition threw unexpectedly — rescheduling.`);
+      this.armRetry(broker, this.opts.pollIntervalMs);
+    }
+  }
+
+  private async attemptInner(broker: BrokerKind): Promise<void> {
     if (this.stopped) return;
     const rt = this.runtimes[broker];
 

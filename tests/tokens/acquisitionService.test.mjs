@@ -272,3 +272,58 @@ test("restart restores a valid token for today and does NOT re-poll", async () =
   assert.equal(mock.state.zerodha.count, 0, "a token already valid for today must not trigger a poll");
   svc.stop();
 });
+
+/**
+ * A broker must never be STRANDED by an unexpected throw.
+ *
+ * Every attempt is dispatched as `void this.attempt(broker)`, so a rejection escaping it
+ * becomes an unhandled rejection: the process survives (there is a process-level guard) but
+ * this broker's timer is never re-armed. It would then sit at `polling` for the rest of the
+ * trading day — no token, no visible error, no further attempt. For a once-a-day acquisition
+ * that is the worst possible failure mode, so `attempt()` has a top-level guard that records
+ * a redacted error and RESCHEDULES.
+ *
+ * The reachable paths were already individually guarded, so this exercises the guard by
+ * making the injected clock throw — the one dependency `attempt` touches outside them. The
+ * reschedule is proven observably, by a SECOND provider request arriving, rather than by
+ * reaching into a private timer.
+ */
+test("an unexpected throw inside an attempt reschedules instead of stranding the broker", async () => {
+  const clock = makeFakeClock(istInstant("2026-09-08", "09:00"));
+  let throwOnNextRead = false;
+  const throwingClock = {
+    now: () => {
+      if (throwOnNextRead) {
+        throwOnNextRead = false;
+        throw new Error("clock exploded");
+      }
+      return clock.now();
+    },
+  };
+
+  mock.setResponder("zerodha", zSuccess);
+  // A short interval so the armed retry is observable without a long wait.
+  const { svc } = makeService(throwingClock, "zerodha", { pollIntervalMs: 30 });
+  try {
+    throwOnNextRead = true;
+    await svc.attempt("zerodha"); // private at compile time, callable against dist
+
+    const status = svc.status().zerodha;
+    assert.equal(status.state, "polling", "the broker must stay in a polling state, not stall");
+    assert.match(
+      status.lastError ?? "",
+      /unexpected acquisition error/,
+      "the failure must be recorded, redacted, in the status object",
+    );
+
+    // The reschedule: a retry was armed, so another provider request must follow.
+    const before = mock.state.zerodha.count;
+    await settle(150);
+    assert.ok(
+      mock.state.zerodha.count > before,
+      "a retry must actually fire — a stranded broker would never request again",
+    );
+  } finally {
+    svc.stop();
+  }
+});

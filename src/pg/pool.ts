@@ -144,7 +144,29 @@ export async function initPg(cfg: PgConfig = pgConfigFromEnv()): Promise<void> {
     idleTimeoutMillis: 30_000,
   });
 
-  // Applied per physical connection, so a pool that grows later inherits them.
+  /**
+   * Applied per PHYSICAL connection, so a pool that grows later inherits them.
+   *
+   * WHY THE UN-AWAITED `void` IS CORRECT — DO NOT "FIX" IT
+   * `pg` does not await this handler, so it looks like the first caller query could run
+   * before the timeouts land. It cannot: the handler runs synchronously during the
+   * `connect` event and `client.query` ENQUEUES on the client's FIFO query queue, which
+   * `pg` drains in order. The SET is therefore always ahead of the caller's first
+   * statement. Verified empirically against five simultaneously-created connections, all
+   * of which reported `statement_timeout = 5s` on their very first query.
+   *
+   * A libpq `options=-c statement_timeout=…` startup parameter would be stronger still
+   * (server-side, before any query), but it is deliberately NOT used here: a config-level
+   * `options` takes precedence over one in the connection string, and
+   * `tests/pg/helpers.mjs` puts `options=-csearch_path=<schema>` in the URL to isolate each
+   * test file. Setting it here would silently drop that search_path and collapse every pg
+   * test into the `public` schema. Merging the two is possible but buys nothing over the
+   * ordering guarantee above.
+   *
+   * The `.catch` is a swallow of last resort: on a healthy connection a `SET` does not
+   * fail, and if it somehow did, throwing inside an event handler would take the process
+   * down rather than degrade one connection.
+   */
   p.on("connect", (client) => {
     void client
       .query(
