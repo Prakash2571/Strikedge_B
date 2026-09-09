@@ -78,7 +78,14 @@ function scriptedTransport({ states = [], cancelError = null } = {}) {
   const queue = [...states];
   const transport = {
     calls,
-    placeOrder: async (payload) => { calls.push(["place", payload]); return { order_id: "K1" }; },
+    placeOrder: async (payload, opts) => {
+      // Model the REAL send boundary: KiteHttpTransport invokes beforeSend synchronously
+      // immediately before the wire, so a faithful fake must too, else it silently omits the
+      // final entry guard (exactly the "recording adapter that omits the boundary" hazard).
+      opts?.beforeSend?.();
+      calls.push(["place", payload]);
+      return { order_id: "K1" };
+    },
     cancelOrder: async (id) => {
       calls.push(["cancel", id]);
       if (cancelError) throw cancelError;
