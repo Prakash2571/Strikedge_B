@@ -333,14 +333,17 @@ export class DhanBrokerAdapter implements BrokerAdapter {
     // TRANSPORT START: before `call()`, so the pacing wait is attributed to transport_wait_ms
     // rather than being hidden inside the POST duration.
     this.mark(req.client_order_id, "transport_started");
+    // Fires exactly once, at the FINAL SYNCHRONOUS instant before the wire (Defect 3): the guard
+    // is threaded THROUGH the adapter pacer AND the lower Dhan HTTP pacing queue to
+    // http.request()'s send boundary, closing the window where a queued POST could fire after
+    // entry was disarmed. `http_request_started` is marked here because this is the true moment
+    // the POST leaves for the network; a thrown BrokerPreSubmitRefusedError proves it never did.
+    const beforeSend = (): void => {
+      beforePost?.();
+      this.mark(req.client_order_id, "http_request_started");
+    };
     try {
       placed = await this.call(() => {
-        // Run after pacing, at the final local boundary before the placement
-        // mutation. A thrown refusal proves placeOrder was never called.
-        beforePost?.();
-        // HTTP REQUEST START: inside the paced callback, so post_to_http_response_ms measures the
-        // network and Dhan, NOT our own rate limiter.
-        this.mark(req.client_order_id, "http_request_started");
         return this.client.placeOrder({
           dhanClientId: this.cfg.dhanClientId(),
           correlationId,
@@ -353,7 +356,7 @@ export class DhanBrokerAdapter implements BrokerAdapter {
           securityId: String(identity.securityId),
           quantity: req.quantity,
           price: req.pricing.limit_price,
-        });
+        }, { beforeSend });
       }, "order_mutation");
       this.mark(req.client_order_id, "http_response");
     } catch (err) {
@@ -414,21 +417,106 @@ export class DhanBrokerAdapter implements BrokerAdapter {
     }
 
     order.broker_order_id = placed.orderId;
-    order.state = dhanOrderState(placed.orderStatus, 0, req.quantity);
     order.updated_at = Date.now();
     // Two distinct facts: an order id proves the order EXISTS; the ACK proves Dhan ACCEPTED it.
     // Neither proves any quantity executed.
     this.mark(req.client_order_id, "broker_order_id");
     this.mark(req.client_order_id, "acknowledged");
     this.clientByBroker.set(placed.orderId, req.client_order_id);
-    this.orders.set(req.client_order_id, order);
 
-    if (order.state === "REJECTED") {
-      order.reject_family = "generic";
-      order.reject_reason = `Dhan rejected the order at submission (status ${placed.orderStatus}).`;
-      throw new BrokerOrderRejectedError(cloneOrder(order), placed);
+    // DEFECT 2 — a placement STATUS STRING is NOT an execution record.
+    //
+    // Dhan's POST /orders answers with only `{orderId, orderStatus}` — it carries NO cumulative
+    // filled quantity and NO average price. The previous code did
+    // `dhanOrderState(status, 0, quantity)`, which turned an immediate "TRADED" into COMPLETE
+    // with filled_quantity 0: a fully-accounted terminal execution invented from a label and a
+    // hardcoded zero, with no order-status or trade-book read behind it. P&L and recovery then
+    // trusted a fill that was never observed.
+    //
+    // So the placement label only ever seeds a PROVISIONAL, non-terminal state here; the
+    // authoritative quantity and price come from an order/trade read. A label that CLAIMS a
+    // terminal outcome (TRADED / PART_TRADED / CANCELLED / CLOSED / EXPIRED / REJECTED) is
+    // VERIFIED, never accepted:
+    //   - verified evidence  → the real state, with real cumulative qty and avg price;
+    //   - no evidence yet     → keep waiting/polling (non-terminal), never COMPLETE-with-0;
+    //   - evidence impossible → RECONCILIATION_REQUIRED, blocking dependent entries, rather
+    //                           than collapsing to a guessed COMPLETE or a guessed REJECTED.
+    const claimsTerminal = isBrokerOrderTerminal(dhanOrderState(placed.orderStatus, 0, req.quantity))
+      || dhanOrderState(placed.orderStatus, 0, req.quantity) === "PARTIALLY_FILLED";
+
+    if (claimsTerminal) {
+      // Ask for authoritative evidence. A TRADED label with no verified quantity must never
+      // become a fully accounted execution on the label alone.
+      const verified = await this.refresh(req.client_order_id).catch(() => undefined);
+      const current = this.orders.get(req.client_order_id) ?? order;
+      if (verified && this.hasAuthoritativeQuantity(verified, placed.orderStatus)) {
+        // Reconcile contradictions here too: `project()` already re-derives the state from the
+        // OBSERVED filled quantity, so a "CANCELLED with a nonzero fill" surfaces as a real
+        // partial and a "TRADED with a short fill" as PARTIALLY_FILLED rather than COMPLETE.
+        if (verified.state === "REJECTED") {
+          this.orders.set(req.client_order_id, verified);
+          throw new BrokerOrderRejectedError(cloneOrder(verified), placed);
+        }
+        this.orders.set(req.client_order_id, verified);
+        return this.waitForResolution(req.client_order_id, verified);
+      }
+      // A REJECTED label with a verified ZERO fill is genuinely terminal and carries no
+      // exposure, so it is safe to accept as a rejection — but only once the read has CONFIRMED
+      // the zero, not merely inferred it from the label.
+      if (verified && verified.state === "REJECTED" && verified.filled_quantity === 0) {
+        this.orders.set(req.client_order_id, verified);
+        throw new BrokerOrderRejectedError(cloneOrder(verified), placed);
+      }
+      // Could not obtain authoritative quantity/price for a terminal-looking placement. RETAIN
+      // UNCERTAINTY: quarantine so dependent entries are blocked, rather than fabricating a fill
+      // or a rejection. The durable reconciler resolves it against confirmed evidence.
+      current.state = "RECONCILIATION_REQUIRED";
+      current.reject_reason =
+        `Dhan reported '${placed.orderStatus}' at placement but no authoritative cumulative quantity/price could be read; ` +
+        "the execution is unproven and must be reconciled before any dependent leg.";
+      current.updated_at = Date.now();
+      this.orders.set(req.client_order_id, current);
+      throw new BrokerAmbiguousSubmitError(req.client_order_id, current.reject_reason, placed, cloneOrder(current));
     }
+
+    // A non-terminal placement (TRANSIT / PENDING): the order is working. Seed the provisional
+    // acknowledged/open state and let waitForResolution poll to a VERIFIED terminal outcome,
+    // where every quantity comes from an order/trade read via project().
+    order.state = dhanOrderState(placed.orderStatus, 0, req.quantity);
+    this.orders.set(req.client_order_id, order);
     return this.waitForResolution(req.client_order_id, order);
+  }
+
+  /**
+   * Whether a refreshed order carries the authoritative evidence needed to ACCOUNT for a
+   * terminal execution (Defect 2).
+   *
+   * The distinction the old code missed is between a MISSING quantity and an EXPLICITLY
+   * VERIFIED ZERO. A read that returns a COMPLETE-family state must also carry a positive
+   * cumulative fill AND an average price before we treat it as executed; a CANCELLED/REJECTED
+   * read with a confirmed zero fill is authoritative in the other direction (nothing executed).
+   * Anything else — a "TRADED" read that still shows 0 filled, or one with no average price —
+   * is NOT yet proof and keeps the order uncertain.
+   */
+  private hasAuthoritativeQuantity(verified: BrokerOrder, placedStatus: DhanOrderStatus | string): boolean {
+    // A working (non-terminal) read is not the evidence we need for a terminal claim; keep
+    // polling instead.
+    if (!isBrokerOrderTerminal(verified.state) && verified.state !== "PARTIALLY_FILLED") return false;
+    // Executed states demand a positive, priced fill.
+    if (verified.state === "COMPLETE" || verified.state === "PARTIALLY_FILLED") {
+      return verified.filled_quantity > 0 && verified.average_price !== null && verified.average_price > 0;
+    }
+    // CANCELLED after a claimed terminal: authoritative only when the fill is a CONFIRMED zero,
+    // or a positive priced partial (a "CANCELLED with a nonzero fill" that project() surfaced).
+    if (verified.state === "CANCELLED") {
+      if (verified.filled_quantity === 0) return true;
+      return verified.average_price !== null && verified.average_price > 0;
+    }
+    // REJECTED is handled by the caller (a confirmed zero-fill rejection is terminal); a
+    // rejection with a claimed fill is contradictory and stays uncertain.
+    if (verified.state === "REJECTED") return verified.filled_quantity === 0;
+    void placedStatus;
+    return false;
   }
 
   /**
@@ -568,6 +656,21 @@ export class DhanBrokerAdapter implements BrokerAdapter {
       if (!remote) return known;
       const fills = await this.fetchFills(remote.orderId);
       const projected = this.project(known, remote, known.tag ?? this.correlationFor(clientOrderId), fills);
+      // MONOTONIC CUMULATIVE FILLS (Defect 2). A later read must NEVER regress the observed
+      // cumulative quantity: overlapping REST reads and (in production) stream events can arrive
+      // out of order, and a fleeting lower `filledQty` from the order book would otherwise
+      // rewrite exposure downward and could turn a real fill back into "nothing executed". Once
+      // a quantity is confirmed it can only stay the same or grow.
+      if (projected.filled_quantity < known.filled_quantity) {
+        projected.filled_quantity = known.filled_quantity;
+        projected.pending_quantity = Math.max(0, known.quantity - known.filled_quantity);
+        // Keep the richer of the two fill records so a dropped trade-book row cannot erase a
+        // fill we already saw (deduplicated by fill_id at consumption).
+        if (projected.fills.length < known.fills.length) projected.fills = known.fills.map((f) => ({ ...f }));
+        if (projected.average_price === null && known.average_price !== null) {
+          projected.average_price = known.average_price;
+        }
+      }
       // TIMING: the broker's CUMULATIVE quantity. The recorder ignores anything that is not an
       // increase, so re-polling an unchanged order manufactures no extra "fill" events.
       this.markFill(clientOrderId, projected.filled_quantity);
