@@ -455,8 +455,16 @@ export class DhanClient {
    * must NEVER call this again with the same correlation id in the hope of a
    * cleaner answer.
    */
-  placeOrder(req: DhanPlaceOrderRequest): Promise<DhanPlaceOrderResponse> {
-    return this.http.write<DhanPlaceOrderResponse>({ method: "POST", path: "/orders", body: req });
+  placeOrder(req: DhanPlaceOrderRequest, opts: { beforeSend?: () => void } = {}): Promise<DhanPlaceOrderResponse> {
+    return this.http.write<DhanPlaceOrderResponse>({
+      method: "POST",
+      path: "/orders",
+      body: req,
+      // FINAL SYNCHRONOUS SEND GUARD (Defect 3): forwarded to the true send boundary in
+      // http.request(), NOT run in the adapter's pacer where two async waits still remained
+      // between the guard and the wire. A throw here proves no POST was transmitted.
+      ...(opts.beforeSend ? { beforeSend: opts.beforeSend } : {}),
+    });
   }
 
   modifyOrder(req: DhanModifyOrderRequest): Promise<DhanPlaceOrderResponse> {
