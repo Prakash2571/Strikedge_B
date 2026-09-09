@@ -66,6 +66,16 @@ interface ConnectOptions {
   onOpen?: () => void;
   onError?: (message: string) => void;
   onClose?: () => void;
+  /**
+   * Kite streams ORDER UPDATES as TEXT frames on THIS SAME quote socket — shaped
+   * `{ "type": "order"|"error"|"message", "data": … }` per the current v3 docs
+   * (verified 2026-09-09, https://kite.trade/docs/connect/v3/websocket/). They used to be
+   * silently discarded here (the fast fill path was on the wire and thrown away). When a
+   * consumer supplies this callback, every text frame is forwarded verbatim for the order-
+   * update layer to parse. Absent ⇒ the historical behaviour (ignore text) is preserved, so
+   * this is inert unless a caller opts in.
+   */
+  onTextFrame?: (raw: string) => void;
 }
 
 export function connectTicker(opts: ConnectOptions): TickerHandle {
@@ -97,8 +107,21 @@ export function connectTicker(opts: ConnectOptions): TickerHandle {
 
   ws.onmessage = (ev: MessageEvent) => {
     const data = ev.data;
-    // Text frames are postbacks (order updates / error messages) — ignore.
-    if (typeof data === "string") return;
+    // Text frames are Kite POSTBACKS — order updates, errors and broker messages
+    // (https://kite.trade/docs/connect/v3/websocket/#postbacks-and-non-binary-updates,
+    // verified 2026-09-09). Historically discarded here, which threw away the fast fill
+    // path. Now forwarded to any registered order-update consumer; binary frames remain
+    // market-data ticks. Forwarding is guarded so a throwing consumer cannot kill the feed.
+    if (typeof data === "string") {
+      if (opts.onTextFrame) {
+        try {
+          opts.onTextFrame(data);
+        } catch {
+          // An order-update parse/handler fault must NEVER break the market-data socket.
+        }
+      }
+      return;
+    }
     if (!(data instanceof ArrayBuffer)) return;
     const ticks = parseBinary(data);
     if (ticks.length) opts.onTick(ticks);
