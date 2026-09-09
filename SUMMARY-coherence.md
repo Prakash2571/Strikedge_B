@@ -159,10 +159,15 @@ still admitted.
 
 ## 11. Remaining limitations
 
-- The exchange-time constraint cannot engage in live until the Kite feed parser
-  populates `exchange_ts` (Handoff #1). Until then the receive-time gate — the primary
-  live constraint — is what fires. This is safe (fails toward the always-available
-  bound), not a hole.
+- ~~The exchange-time constraint cannot engage in live until the Kite feed parser populates
+  `exchange_ts`.~~ **RESOLVED on the merged integration branch:** `src/ticker.ts:205-214`
+  populates `exchange_ts` from Kite full-mode packet offset 60 (epoch seconds x1000, 0 = absent),
+  so the exchange-dispersion constraint is now ACTIVE for Zerodha. Dhan still supplies no book
+  timestamp (LTT is not a book time and is never substituted), so Dhan legs are governed by the
+  receive-time constraint — by design, not as a gap.
+  NOTE the precision consequence: the shipped 250 ms default is BELOW Kite's 1-second stamp
+  granularity, so a Zerodha run should raise `BOX_MAX_CROSS_LEG_EXCHANGE_DISPERSION_MS` to
+  >= 1000 (see docs/MUMBAI_EC2_PROFILE.md) or the receive-time gate remains the effective one.
 - Receive-time coherence remains a proxy for exchange simultaneity (§4); it is
   correctly labelled as such and never over-claimed.
 - `maxExchangeAheadOfReceiveMs` and the generation proxy are conservative

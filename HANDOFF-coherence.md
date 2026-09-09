@@ -8,7 +8,18 @@ correctness hole in my module (it fails closed / falls back to receive-time when
 the evidence is absent); they are what would let the exchange-time constraint
 actually fire in production.
 
-## 1. Feed parser must populate `BoxTickInput.exchange_ts` — `src/ticker.ts`, `src/brokers/**`
+## 1. ~~Feed parser must populate `BoxTickInput.exchange_ts`~~ — **CLOSED 2026-09-09**
+
+> **RESOLVED by the order-update-stream work, verified on the merged tree.**
+> `src/ticker.ts:205-214` now reads the Kite exchange timestamp at packet offset 60 as a Unix
+> **second**, multiplies by 1000 to ms, applies it only to full packets (`len >= 184`), and
+> treats 0 as absent. That is exactly what this item asked for, so the exchange-dispersion
+> half of the coherence gate is now **ACTIVE for Zerodha** rather than inert. Dhan correctly
+> still sets no `exchange_ts` (it publishes only LTT, which is not a book time), so Dhan legs
+> remain governed by the receive-time constraint. No action remains.
+
+### Original item (kept for the record)
+
 
 The quote store already carries `exchange_at` and only sets it when a tick supplies
 a finite positive `exchange_ts` (`quotes.ts` `applyTicks`). The coherence policy
