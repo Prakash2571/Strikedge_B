@@ -28,8 +28,8 @@
 import type { NextFunction, Request, RequestHandler, Response } from "express";
 import type { AppConfig } from "../config.js";
 import { boundedError } from "../pg/pool.js";
-import { csrfCookieName, readCookie } from "./cookies.js";
-import { CSRF_HEADER, csrfMatches, isMutatingMethod, originAllowed } from "./csrf.js";
+import { readCookie } from "./cookies.js";
+import { CSRF_HEADER, csrfMatches, isMutatingMethod, normalizeCsrfHeader, originAllowed } from "./csrf.js";
 import type { OperatorRole, ValidatedSession } from "./sessionStore.js";
 import { sweepExpiredSessions, validateSession } from "./sessionStore.js";
 
@@ -151,12 +151,14 @@ export interface RequireOperatorDeps {
  *
  * On MUTATING methods (POST/PUT/PATCH/DELETE) it additionally requires:
  *   1. an Origin header matching CSRF_ALLOWED_ORIGIN, and
- *   2. a CSRF header whose sha256 matches the session-bound digest (constant time).
+ *   2. a NON-EMPTY x-csrf-token HEADER whose sha256 matches the session-bound
+ *      digest (constant time). The readable CSRF cookie is NEVER accepted as a
+ *      substitute for the header — see src/access/csrf.ts for why a cookie fallback
+ *      would silently defeat CSRF protection.
  * Either failure is a 403 before the handler runs.
  */
 export function createRequireOperator(deps: RequireOperatorDeps): RequestHandler {
   const { config } = deps;
-  const csrfName = csrfCookieName(config);
   return (req: Request, res: Response, next: NextFunction): void => {
     const token = readCookie(req, config.sessionCookieName);
     void validateSession(token)
@@ -176,7 +178,14 @@ export function createRequireOperator(deps: RequireOperatorDeps): RequestHandler
             return;
           }
           // 2) CSRF header must match the session-bound token, in constant time.
-          const presented = req.header(CSRF_HEADER) ?? readCookie(req, csrfName);
+          // The token MUST arrive in the x-csrf-token HEADER — the JS-readable CSRF
+          // cookie is NEVER accepted as a substitute. A cross-site form POST makes the
+          // browser attach our cookies automatically, so honouring the cookie would
+          // silently defeat the header requirement; the attacker's page cannot READ
+          // our cookie (same-origin policy), so only a header it cannot forge proves
+          // the request originated from our own SPA. A present-but-empty/whitespace
+          // header is rejected exactly like a missing one.
+          const presented = normalizeCsrfHeader(req.header(CSRF_HEADER));
           if (!csrfMatches(presented, session.csrfTokenHash)) {
             sendApiError(res, 403, "csrf_failed", "Invalid or missing CSRF token.");
             return;

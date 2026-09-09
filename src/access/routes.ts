@@ -18,7 +18,7 @@
 import type { Express, Request, Response } from "express";
 import type { AppConfig } from "../config.js";
 import { clearSessionCookies, csrfCookieName, readCookie, setSessionCookies } from "./cookies.js";
-import { CSRF_HEADER, csrfMatches, originAllowed } from "./csrf.js";
+import { CSRF_HEADER, csrfMatches, normalizeCsrfHeader, originAllowed } from "./csrf.js";
 import { sendApiError } from "./middleware.js";
 import type { AccessSessionConfig } from "./sessionStore.js";
 import {
@@ -132,10 +132,23 @@ export function registerAccessRoutes(app: Express, deps: AccessRouteDeps): void 
   /**
    * POST /api/access/logout — revoke the session and clear the cookies.
    *
-   * A logout is a mutating request, so it is protected by the same Origin + CSRF
-   * discipline as any other mutation (checked inline here because the route is not
-   * behind requireOperator — an already-expired session must still be able to clear
-   * its cookies). We validate the session, enforce Origin + CSRF, then revoke.
+   * ASYMMETRIC BY DESIGN — and it does NOT weaken CSRF protection.
+   * This route is not behind `requireOperator`, so it enforces CSRF + Origin inline.
+   *
+   *  - WITH a live session: this is a real state-changing mutation (it revokes the
+   *    session row), so it is protected by the SAME strict discipline as any other
+   *    mutation — an exact allowed Origin AND a non-empty `x-csrf-token` HEADER whose
+   *    sha256 matches the session-bound digest. The readable CSRF cookie is NEVER
+   *    accepted as a substitute for the header (see src/access/csrf.ts).
+   *
+   *  - WITHOUT a live session (expired/revoked/unknown): there is NO session to
+   *    protect. A forged cross-site "logout" of a session that no longer exists
+   *    changes nothing on the server, so requiring a CSRF header here would protect
+   *    nothing while stranding a browser that still holds a dead cookie — it could
+   *    never clear it (the header source is gone with the session). We therefore
+   *    still clear the cookies and return 200 `{authenticated:false}` without a
+   *    header. This is safe precisely because the CSRF header only ever guards a
+   *    LIVE session's state; with no live session there is no state to guard.
    */
   app.post("/api/access/logout", async (req: Request, res: Response) => {
     try {
@@ -147,7 +160,10 @@ export function registerAccessRoutes(app: Express, deps: AccessRouteDeps): void 
           sendApiError(res, 403, "bad_origin", "Request origin is not allowed.");
           return;
         }
-        const presented = req.header(CSRF_HEADER) ?? readCookie(req, csrfName);
+        // The token MUST come from the HEADER — the readable CSRF cookie is never a
+        // substitute (a cross-site POST would carry the cookie automatically). An
+        // empty/whitespace header is rejected exactly like a missing one.
+        const presented = normalizeCsrfHeader(req.header(CSRF_HEADER));
         if (!csrfMatches(presented, live.csrfTokenHash)) {
           sendApiError(res, 403, "csrf_failed", "Invalid or missing CSRF token.");
           return;

@@ -11,10 +11,15 @@
  * THE COOKIES
  *  - the SESSION cookie is HttpOnly, so JS cannot read it and it cannot be
  *    exfiltrated by an XSS payload; it is the bearer credential the server trusts.
- *  - the CSRF cookie is intentionally NOT HttpOnly, so the SPA can read it and
- *    echo its value in a request header. That header value is compared against the
- *    session-bound CSRF digest server-side, which is what defeats a cross-site
- *    POST (the attacker's page cannot read our cookie to forge the header).
+ *  - the CSRF cookie is intentionally NOT HttpOnly, so the SPA can READ it and
+ *    echo its value in the `x-csrf-token` request header. Its ONLY purpose is to
+ *    let JS recover the token after a page reload — it is a convenience, NOT a
+ *    credential. The server verifies the token from the HEADER and never accepts
+ *    the cookie as a substitute: a cross-site POST would carry the cookie
+ *    automatically, so honouring the cookie would defeat the check, whereas the
+ *    attacker's page cannot READ our cookie to forge the header. That header value
+ *    is compared against the session-bound CSRF digest server-side, which is what
+ *    defeats a cross-site POST.
  */
 
 import type { Request, Response } from "express";

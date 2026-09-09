@@ -4,10 +4,21 @@
  * MODEL
  * A CSRF token is minted alongside the session (see sessionStore.mintSession) and
  * only its sha256 is stored, bound to the session row. The raw token is delivered
- * to the browser in a NON-HttpOnly cookie and echoed by /api/access/status, so the
- * SPA can send it back in a request header on every mutating request. The server
- * recomputes sha256 over the header value and compares it — in constant time —
- * against the digest bound to the authenticated session.
+ * to the browser in a NON-HttpOnly cookie whose ONLY purpose is to let the SPA
+ * recover the token after a page reload; the SPA echoes that value back in the
+ * `x-csrf-token` request HEADER on every mutating request. The server recomputes
+ * sha256 over the HEADER value and compares it — in constant time — against the
+ * digest bound to the authenticated session.
+ *
+ * THE HEADER IS THE ONLY PROOF — THE COOKIE IS NEVER ACCEPTED AS A SUBSTITUTE
+ * The readable CSRF cookie is a convenience for the SPA, not a credential. The
+ * server verifies the token from the HEADER and NOTHING ELSE. Accepting the cookie
+ * as a fallback would silently defeat the whole scheme: a cross-site form POST
+ * causes the browser to attach our cookies automatically, so a cookie-as-header
+ * fallback would let an attacker's page satisfy the CSRF check without ever reading
+ * our cookie. Requiring the value in a header the attacker cannot set (they cannot
+ * READ the cookie under the same-origin policy, so they cannot populate the header)
+ * is exactly what stops the cross-site POST.
  *
  * WHY THIS DEFEATS CSRF
  * A cross-site attacker can cause the browser to send our cookies, but the
@@ -20,6 +31,18 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 
 /** The request header the SPA must send the CSRF token in. */
 export const CSRF_HEADER = "x-csrf-token";
+
+/**
+ * Normalise a presented CSRF header value into either a non-empty token or
+ * `undefined`. A missing header, or a present-but-empty/whitespace-only header,
+ * both resolve to `undefined` so they are rejected identically by `csrfMatches`.
+ * The header value must never be read from the cookie — see the module header.
+ */
+export function normalizeCsrfHeader(raw: string | undefined): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
 
 /** HTTP methods that mutate state and therefore require CSRF + Origin checks. */
 const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);

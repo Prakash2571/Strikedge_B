@@ -25,7 +25,12 @@ exceptions:
 
 Only these, and nothing else:
 
-- `GET /api/health` — a liveness probe carrying no sensitive data
+- `GET /api/health` — an unauthenticated liveness/readiness probe carrying no
+  sensitive data (200 `ready:true` only when boot is complete; 503 `ready:false`
+  while starting, failed or shutting down). Note: while the process is not `ready`,
+  the single readiness gate refuses `POST /api/access/verify` and
+  `POST /api/access/logout` with 503 — entering the site passcode is a mutation and
+  cannot succeed until startup completes.
 - `POST /api/access/verify` — the passcode check itself (rate-limited)
 - `GET /api/access/status` — "am I already signed in?", so the passcode page
   does not 401-loop; it reveals only whether a live session exists
@@ -71,7 +76,7 @@ Only these, and nothing else:
 | Cookie | HttpOnly | Secure | SameSite | Path | Purpose |
 | --- | --- | --- | --- | --- | --- |
 | `SESSION_COOKIE_NAME` | **yes** | prod: yes | Strict | `/` | the bearer credential; JS can never read it |
-| `<SESSION_COOKIE_NAME>_csrf` | **no** | prod: yes | Strict | `/` | JS-readable, echoed in the CSRF header |
+| `<SESSION_COOKIE_NAME>_csrf` | **no** | prod: yes | Strict | `/` | JS-readable so the SPA can recover the token after a reload and echo it in the `x-csrf-token` header; never accepted as proof itself |
 
 `Secure` is always set in production. It is omitted **only** in non-production
 over http (`config.isProduction === false`) so local development works; this is
@@ -80,17 +85,31 @@ is the only value that tightens, never relaxes.
 
 ## CSRF + Origin (mutating requests)
 
-Every `POST/PUT/PATCH/DELETE` behind `requireOperator` must satisfy BOTH:
+Every `POST/PUT/PATCH/DELETE` behind `requireOperator` must satisfy ALL of:
 
-1. **Origin** header exactly matches `CSRF_ALLOWED_ORIGIN` (scheme+host+port). A
-   missing Origin is refused.
-2. **CSRF** header (`x-csrf-token`) whose sha256 matches the session-bound digest,
-   compared in constant time.
+1. a valid **HttpOnly session cookie** (a live session), and
+2. an **Origin** header that exactly matches `CSRF_ALLOWED_ORIGIN`
+   (scheme+host+port). A missing Origin is refused, and
+3. a **non-empty `x-csrf-token` HEADER** whose sha256 matches the session-bound
+   digest, compared in constant time. A present-but-empty/whitespace header is
+   rejected exactly like a missing one.
 
-The CSRF token defeats a cross-site POST because the attacker's page cannot read
-our non-HttpOnly CSRF cookie to forge the header; the Origin check is a second,
-independent guard. `logout` enforces the same discipline inline (it is not behind
-`requireOperator` so an already-expired session can still clear its cookies).
+**The header is the only accepted proof.** The JS-readable `<name>_csrf` cookie is
+NEVER accepted as a substitute for the header. Its sole purpose is to let the SPA
+recover the token after a page reload; it is a convenience, not a credential. A
+cross-site form POST makes the browser attach our cookies automatically, so a
+cookie-as-header fallback would silently defeat the whole scheme — which is why the
+server reads the token from the header and nothing else. The CSRF header defeats a
+cross-site POST because the attacker's page cannot READ our non-HttpOnly CSRF
+cookie to forge the header; the Origin check is a second, independent guard.
+
+`logout` enforces the same header + Origin discipline inline **when there is a live
+session** (it is not behind `requireOperator`). When there is NO live session
+(expired/revoked/unknown) it clears the cookies and returns 200
+`{authenticated:false}` **without** requiring a header: there is no session state
+to protect, and forcing a header would strand a browser holding a dead cookie. This
+asymmetry does not weaken CSRF protection, because the header only ever guards a
+live session's state — with no live session there is nothing to guard.
 
 ## SSE
 
