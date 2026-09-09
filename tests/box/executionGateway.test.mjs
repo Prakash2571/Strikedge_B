@@ -103,6 +103,30 @@ function assertCheckedStamp(h, index) {
   assert.equal("checkedFeed" in req, false, "feed evidence is not embedded in the broker request");
 }
 
+/**
+ * The expected exit transmission sequence, re-derived from the ENTRY sides.
+ *
+ * Deliberately does NOT import exitDependencies.ts: restating the property independently means a
+ * bug in the planner cannot also certify itself. Rule: a role whose ENTRY side was SELL is short, so
+ * closing it is risk-reducing and goes in the first group, together with any long whose paired
+ * vertical leg has no outstanding short. Hedge releases follow.
+ */
+function expectedExitOrder(direction, remaining, quantities) {
+  const partner = { k1_ce: "k2_ce", k2_ce: "k1_ce", k1_pe: "k2_pe", k2_pe: "k1_pe" };
+  const first = [];
+  const second = [];
+  ROLES.forEach((role, index) => {
+    if (!(remaining[role] > 0)) return;
+    const pair = [role, quantities[index]];
+    if (entrySideFor(role, direction) === "SELL") { first.push(pair); return; }
+    const other = partner[role];
+    const otherIsShort = entrySideFor(other, direction) === "SELL";
+    if (otherIsShort && remaining[other] > 0) second.push(pair);
+    else first.push(pair);
+  });
+  return [...first, ...second];
+}
+
 function detectionLegs(candidate, quotes, sideFor = exitSideFor) {
   return ROLES.map((role) => {
     const inst = candidate.legs[role];
@@ -151,15 +175,18 @@ test("live gateway submits exactly the 1-4 nonzero outstanding roles and trusts 
 
       assert.equal(result.ok, true);
       assert.equal(h.submitted.length, count);
-      assert.deepEqual(
-        h.submitted.map(({ role, quantity }) => [role, quantity]),
-        ROLES.slice(0, count).map((role, index) => [role, quantities[index]]),
-      );
+      // EXPOSURE-AWARE EXIT ORDER (exitDependencies.ts). The SET of roles and their quantities is
+      // unchanged — what changed is the SEQUENCE. Short-closing BUYs and longs with no short beside
+      // them go first; a hedge release only follows proven closure of the short it covers. The
+      // expected order is derived here from the entry sides rather than copied, so this asserts the
+      // property and not a snapshot.
+      const expected = expectedExitOrder(h.candidate.direction ?? "LONG_BOX", remaining, quantities);
+      assert.deepEqual(h.submitted.map(({ role, quantity }) => [role, quantity]), expected);
       assert.equal(h.submitted.every((req) => req.quantity > 0 && req.pricing.order_type === "LIMIT"), true);
       h.submitted.forEach((_, index) => assertCheckedStamp(h, index));
       assert.deepEqual(
-        Object.entries(result.record.fills_by_role),
-        ROLES.slice(0, count).map((role, index) => [role, quantities[index]]),
+        Object.entries(result.record.fills_by_role).sort(),
+        ROLES.slice(0, count).map((role, index) => [role, quantities[index]]).sort(),
         "the gateway projects only broker-confirmed cumulative fills",
       );
       assert.deepEqual(h.violations, []);

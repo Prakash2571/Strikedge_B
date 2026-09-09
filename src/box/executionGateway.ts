@@ -4,6 +4,7 @@ import {
   BrokerOrderRejectedError,
   BrokerPreSubmitRefusedError,
   boxClientOrderId,
+  isBrokerOrderTerminal,
 } from "./brokerAdapter.js";
 import {
   planPartialEntryRecovery,
@@ -18,6 +19,11 @@ import {
   type BoxCapitalReport,
 } from "./boxCapital.js";
 import { entrySubmissionOrder } from "./entrySubmissionOrder.js";
+import {
+  planExitDependencies,
+  releasableHedgeQuantity,
+  verticalPartner,
+} from "./exitDependencies.js";
 import { evaluateLiveEntryGuard, stillWantedSafely } from "./liveEntryGuard.js";
 import {
   evaluateBookCoherence,
@@ -75,8 +81,25 @@ import {
   type ResidualLegExposure,
 } from "./types.js";
 
-/** Narrow strategy-facing execution seam shared by scanner, monitor and recovery. */
-export interface BoxExecutionGateway {
+/**
+ * One exit leg's authoritative outcome within a wave.
+ *
+ * `certain` is the safety question: may the paired hedge be released on the strength of this?
+ * Only a TERMINAL broker snapshot ({@link isBrokerOrderTerminal}), or a proven local refusal that
+ * never reached the broker, answers yes. A PARTIALLY_FILLED snapshot is deliberately NOT certain —
+ * it can still fill more, and sizing a hedge release from it is exactly the "guess a quantity while
+ * an order can still fill" that the contract forbids. See exitDependencies.ts.
+ *
+ * This is a STRICTER notion than the `uncertain` flag that drives the invariant/recovery path,
+ * which keeps its original meaning (an unprovable broker outcome). Holding a hedge on a live
+ * partial is the safe side and must not, by itself, trip the breaker.
+ */
+interface ExitWaveOutcome {
+  readonly filled: number;
+  readonly certain: boolean;
+}
+
+/** Narrow strategy-facing execution seam shared by scanner, monitor and recovery. */export interface BoxExecutionGateway {
   readonly mode: BoxConfig["executionMode"];
   hasCapacity(): boolean;
   simulateEntry(args: Parameters<BoxExecutionSimulator["simulateEntry"]>[0]): Promise<BoxEntryExecutionResult>;
@@ -593,49 +616,158 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     const manager = this.requireManager();
     const attemptId = stableAttemptId(args.position.id, args.detectedAt, "EXIT");
     const detByRole = new Map(args.detectionLegs.map((leg) => [leg.role, leg]));
-    const requests = outstandingRoles(args.position).map(({ role, quantity }) => this.request({
+    const direction = args.position.direction ?? "LONG_BOX";
+    const outstanding = outstandingRoles(args.position);
+    if (outstanding.length === 0) {
+      const record = liveRecord(args.detectedAt, this.now(), [], false, this.deps.cfg, undefined, args.position.id);
+      return { ok: false, record, reason: "legging_incomplete", detail: "position already flat" };
+    }
+
+    // ── EXPOSURE-AWARE EXIT DEPENDENCIES (see exitDependencies.ts) ──────────────────────────
+    //
+    // WAVE 0 transmits everything that can only reduce risk: every BUY that closes a short leg,
+    // plus every long leg with no short standing beside it (a long-only residual has nothing to
+    // wait for, and must never be made to wait for a nonexistent short).
+    //
+    // WAVE 1 transmits hedge releases, each bounded by PROVEN cover release. A hedge whose paired
+    // short is still outstanding — because the close cancelled, partially filled, or is simply not
+    // decided yet — keeps exactly the quantity that short still needs.
+    const outstandingByRole: Partial<Record<BoxLegRole, number>> = {};
+    for (const { role, quantity } of outstanding) outstandingByRole[role] = quantity;
+    const plan = planExitDependencies(direction, outstandingByRole);
+
+    const build = (role: BoxLegRole, quantity: number): BrokerOrderRequest => this.request({
       role,
       inst: args.position.legs[role],
-      side: exitSideFor(role, args.position.direction ?? "LONG_BOX"),
+      side: exitSideFor(role, direction),
       quantity,
       referencePrice: detByRole.get(role)?.price ?? 0,
       tradeId: args.position.id,
       attemptId,
       purpose: "EXIT",
       phase: "exit",
-    }));
-    if (requests.length === 0) {
-      const record = liveRecord(args.detectedAt, this.now(), [], false, this.deps.cfg, undefined, args.position.id);
-      return { ok: false, record, reason: "legging_incomplete", detail: "position already flat" };
-    }
-    let checkedFeed: Map<string, CheckedFeedStamp>;
+    });
+
+    const orders: BrokerOrder[] = [];
+    let uncertain = false;
+    let attempted = 0;
+    const withheld: string[] = [];
+
+    /** Submit one wave, recording orders and whether any outcome is unprovable. */
+    const runWave = async (
+      legs: readonly { role: BoxLegRole; quantity: number }[],
+    ): Promise<Map<BoxLegRole, ExitWaveOutcome>> => {
+      const byRole = new Map<BoxLegRole, ExitWaveOutcome>();
+      if (legs.length === 0) return byRole;
+      const requests = legs.map((leg) => build(leg.role, leg.quantity));
+      attempted += requests.length;
+      // Freshness is re-established per wave: wave 1 is transmitted after wave 0's broker round
+      // trip, so reusing wave 0's stamps would authorise a SELL against a book that has since aged.
+      const checkedFeed = this.precheck(requests);
+      const settled = await Promise.allSettled(
+        requests.map((request) => manager.submit(request, checkedFeed.get(request.client_order_id))),
+      );
+      settled.forEach((item, index) => {
+        const role = requests[index]!.role;
+        if (item.status === "fulfilled") {
+          orders.push(item.value);
+          // `uncertain` keeps its ORIGINAL meaning — an unprovable broker terminal quantity — so a
+          // confirmed partial still does not trip the invariant. Hedge-release certainty is the
+          // stricter test beside it.
+          if (item.value.state === "UNKNOWN" || item.value.state === "RECONCILIATION_REQUIRED") {
+            uncertain = true;
+          }
+          byRole.set(role, {
+            filled: item.value.filled_quantity,
+            certain: isBrokerOrderTerminal(item.value.state),
+          });
+          return;
+        }
+        if (item.reason instanceof BrokerPreSubmitRefusedError) {
+          // A LOCAL pre-submit refusal never reached the broker, so nothing filled. That is
+          // CERTAIN knowledge of zero — not an unknown — and it is exactly why the original code
+          // excluded it from `uncertain`. It still releases no hedge, because the short is intact.
+          byRole.set(role, { filled: 0, certain: true });
+          return;
+        }
+        if (item.reason instanceof OrderPersistenceAfterFillError) {
+          orders.push(item.reason.order);
+          uncertain = true;
+          byRole.set(role, { filled: item.reason.order.filled_quantity, certain: false });
+          return;
+        }
+        uncertain = true;
+        byRole.set(role, { filled: 0, certain: false });
+      });
+      return byRole;
+    };
+
+    let wave0: Map<BoxLegRole, ExitWaveOutcome>;
     try {
-      checkedFeed = this.precheck(requests);
+      wave0 = await runWave(plan.wave0.map((slot) => ({ role: slot.role, quantity: slot.outstanding })));
     } catch (error) {
-      const record = liveRecord(args.detectedAt, this.now(), [], false, this.deps.cfg, requests.length, args.position.id);
+      const record = liveRecord(args.detectedAt, this.now(), [], false, this.deps.cfg, plan.wave0.length, args.position.id);
       return { ok: false, record, reason: "insufficient_quantity", detail: errorMessage(error) };
     }
-    const settled = await Promise.allSettled(
-      requests.map((request) => manager.submit(request, checkedFeed.get(request.client_order_id))),
-    );
-    const orders = ordersFromSettled(settled);
-    const uncertain = settled.some((item) => item.status === "rejected" &&
-      !(item.reason instanceof BrokerPreSubmitRefusedError)) ||
-      orders.some((order) => order.state === "UNKNOWN" || order.state === "RECONCILIATION_REQUIRED");
+
+    // Hedge releases, sized from AUTHORITATIVE fill quantity only.
+    const releases: { role: BoxLegRole; quantity: number }[] = [];
+    for (const slot of plan.wave1) {
+      const short = slot.covers!;
+      const evidence = wave0.get(short);
+      const releasable = releasableHedgeQuantity({
+        hedgeOutstanding: slot.outstanding,
+        short: {
+          shortOutstanding: outstandingByRole[short] ?? 0,
+          confirmedClosed: evidence?.filled ?? 0,
+          // No evidence at all (the short was never planned, or the wave threw) is UNCERTAIN.
+          certain: evidence?.certain ?? false,
+        },
+      });
+      if (releasable <= 0) {
+        withheld.push(`${slot.role} held back ${slot.outstanding} covering ${short}`);
+        continue;
+      }
+      if (releasable < slot.outstanding) {
+        withheld.push(`${slot.role} held back ${slot.outstanding - releasable} covering ${short}`);
+      }
+      releases.push({ role: slot.role, quantity: releasable });
+    }
+
+    if (releases.length > 0) {
+      try {
+        await runWave(releases);
+      } catch (error) {
+        // A hedge release refused for want of an executable book is NOT an exposure failure: the
+        // hedge simply stays on, which is the safe side. Recorded, never escalated to a naked sell.
+        withheld.push(`hedge release blocked: ${errorMessage(error)}`);
+      }
+    }
+
     if (uncertain) manager.invariantViolation(`live exit ${attemptId} has uncertain broker terminal quantity`);
-    const record = liveRecord(args.detectedAt, this.now(), orders, false, this.deps.cfg, requests.length, args.position.id);
+    const record = liveRecord(args.detectedAt, this.now(), orders, false, this.deps.cfg, attempted, args.position.id);
     const legs = legsFromOrders(orders, args.position.legs, this.deps.quotes, this.now());
-    // `>=` for the same reason as the entry path: the requested exit quantity is covered, so the
-    // close is complete. Reading an overfilled exit as incomplete would leave the monitor believing
-    // roles are still outstanding and re-submitting closes against already-flat legs.
-    const clean =
-      !uncertain && orders.length === requests.length && orders.every((order) => order.filled_quantity >= order.quantity);
+
+    // CLEAN means every outstanding unit of every outstanding role is confirmed closed. Measured
+    // per ROLE against the position's outstanding quantity — not per REQUEST — because a hedge
+    // release is deliberately sized below its outstanding quantity when cover is still required,
+    // and "the requests I chose to send all filled" would then read a half-exited box as flat.
+    const closedByRole = new Map<BoxLegRole, number>();
+    for (const order of orders) {
+      closedByRole.set(order.role, (closedByRole.get(order.role) ?? 0) + order.filled_quantity);
+    }
+    const clean = !uncertain && withheld.length === 0 &&
+      outstanding.every(({ role, quantity }) => (closedByRole.get(role) ?? 0) >= quantity);
     if (clean) return { ok: true, legs, record, booksAtFill: new Map() };
     return {
       ok: false,
       record,
       reason: "legging_incomplete",
-      detail: uncertain ? "exit terminal quantity uncertain; position moved to recovery" : "live exit partially filled",
+      detail: uncertain
+        ? "exit terminal quantity uncertain; position moved to recovery"
+        : withheld.length > 0
+          ? `live exit preserved required hedge cover: ${withheld.join("; ")}`
+          : "live exit partially filled",
       legs,
       booksAtFill: new Map(),
     };
@@ -1121,24 +1253,56 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     return checked;
   }
 
+  /**
+   * PROTECTIVE UNWIND of CONFIRMED entry exposure — exposure-aware, hedge-preserving.
+   *
+   * THE DEFECT THIS CLOSES. This used to walk `orders` in arbitrary array order and reverse each
+   * confirmed fill, so on a partial entry it could SELL a filled long hedge before (or instead of)
+   * buying back the short leg beside it. An accepted-but-unfilled buy-back then left a naked short
+   * with its cover gone — the same failure as the exit path, reached from recovery instead.
+   *
+   * THE ORDER IS NOW DERIVED FROM EXPOSURE, not from array position (see exitDependencies.ts):
+   *
+   *   wave 0  reverse every SHORT the entry created (an unwind BUY; only ever reduces risk)
+   *   wave 1  reverse the LONG hedges, each capped at the quantity PROVEN no longer needed as
+   *           cover for the short beside it
+   *
+   * Anything held back is not lost: it stays as durable residual exposure for the flatten loop,
+   * which is strictly safer than selling cover away and strictly better than doing nothing.
+   */
   private async unwindConfirmed(orders: BrokerOrder[], instruments: Record<BoxLegRole, BoxOptionInstrument>, tradeId: string, attemptId: string): Promise<BrokerOrder[]> {
     const manager = this.requireManager();
     const unwinds: BrokerOrder[] = [];
+
+    /** Confirmed exposure this entry actually created, by role. */
+    const exposure = new Map<BoxLegRole, { order: BrokerOrder; quantity: number }>();
     for (const order of orders) {
       if (order.filled_quantity <= 0) continue;
+      const prior = exposure.get(order.role);
+      exposure.set(order.role, {
+        order,
+        quantity: (prior?.quantity ?? 0) + order.filled_quantity,
+      });
+    }
+
+    /** Reverse `quantity` of one confirmed leg. Returns what the reversal proved. */
+    const reverse = async (
+      order: BrokerOrder,
+      quantity: number,
+    ): Promise<ExitWaveOutcome> => {
       const quote = this.deps.quotes.get(order.token);
       const side: OrderSide = order.side === "BUY" ? "SELL" : "BUY";
       const reference = quote ? touchPrice(side, quote.bids, quote.asks) : null;
       if (!reference) {
         manager.invariantViolation(`cannot price protective unwind for ${order.client_order_id}`);
-        continue;
+        return { filled: 0, certain: false };
       }
       try {
         const request = this.request({
           role: order.role,
           inst: instruments[order.role],
           side,
-          quantity: order.filled_quantity,
+          quantity,
           referencePrice: reference,
           tradeId,
           attemptId,
@@ -1146,13 +1310,57 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
           phase: "unwind",
         });
         const checkedFeed = this.precheck([request]);
-        unwinds.push(await manager.submit(request, checkedFeed.get(request.client_order_id)));
+        const result = await manager.submit(request, checkedFeed.get(request.client_order_id));
+        unwinds.push(result);
+        return { filled: result.filled_quantity, certain: isBrokerOrderTerminal(result.state) };
       } catch (error) {
         if (error instanceof OrderPersistenceAfterFillError) {
           unwinds.push(error.order);
+          manager.invariantViolation(`protective unwind failed for ${order.client_order_id}: ${errorMessage(error)}`);
+          return { filled: error.order.filled_quantity, certain: false };
         }
         manager.invariantViolation(`protective unwind failed for ${order.client_order_id}: ${errorMessage(error)}`);
+        // A LOCAL pre-submit refusal proves no POST, so the exposure is intact and known; anything
+        // else may leave a fill with the broker and must be treated as unprovable.
+        return { filled: 0, certain: error instanceof BrokerPreSubmitRefusedError };
       }
+    };
+
+    // ── wave 0: buy back every short the entry created ──────────────────────────────────────
+    const reduced = new Map<BoxLegRole, ExitWaveOutcome>();
+    for (const role of BOX_LEG_ROLES) {
+      const item = exposure.get(role);
+      if (!item || item.order.side !== "SELL") continue;
+      reduced.set(role, await reverse(item.order, item.quantity));
+    }
+
+    // ── wave 1: release long hedges only up to proven-free quantity ─────────────────────────
+    for (const role of BOX_LEG_ROLES) {
+      const item = exposure.get(role);
+      if (!item || item.order.side !== "BUY") continue;
+      const partner = verticalPartner(role);
+      const partnerExposure = exposure.get(partner);
+      const shortOutstanding = partnerExposure && partnerExposure.order.side === "SELL"
+        ? partnerExposure.quantity
+        : 0;
+      const evidence = reduced.get(partner);
+      const releasable = releasableHedgeQuantity({
+        hedgeOutstanding: item.quantity,
+        short: {
+          shortOutstanding,
+          confirmedClosed: evidence?.filled ?? 0,
+          certain: evidence?.certain ?? false,
+        },
+      });
+      if (releasable <= 0) {
+        manager.invariantViolation(
+          `protective unwind ${attemptId} preserved hedge ${role} (${item.quantity}) because short ${partner} ` +
+            `still has ${shortOutstanding - Math.min(evidence?.certain ? evidence.filled : 0, shortOutstanding)} ` +
+            `outstanding; the exposure is carried as residual instead of sold`,
+        );
+        continue;
+      }
+      await reverse(item.order, releasable);
     }
     return unwinds;
   }
