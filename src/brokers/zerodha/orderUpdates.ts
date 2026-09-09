@@ -137,3 +137,15 @@ export function parseKiteOrderFrame(raw: string): KiteParsedTextFrame {
   };
   return { type: "order", observation, text: null };
 }
+
+/**
+ * Whether the Zerodha order-update fast path is enabled, parsed module-locally per the
+ * codebase precedent (`dhanHttpConfigFromEnv` in brokers/dhan/http.ts).
+ *
+ * OFF BY DEFAULT. Only `ZERODHA_ORDER_STREAM_ENABLED=true` turns it on. When off, `ticker.ts`
+ * keeps discarding text frames exactly as before, so this is inert until explicitly enabled.
+ * The stream only OBSERVES — it never places an order.
+ */
+export function zerodhaOrderStreamEnabledFromEnv(): boolean {
+  return (process.env.ZERODHA_ORDER_STREAM_ENABLED ?? "").trim().toLowerCase() === "true";
+}

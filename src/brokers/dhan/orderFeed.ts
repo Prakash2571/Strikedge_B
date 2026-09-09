@@ -312,3 +312,16 @@ function defaultFactory(url: string): MinimalWebSocket {
   if (!Ctor) throw new Error("No global WebSocket available for the Dhan order-update stream.");
   return new Ctor(url);
 }
+
+/**
+ * Whether the Dhan order-update stream is enabled, parsed module-locally per the codebase
+ * precedent (`dhanHttpConfigFromEnv` in brokers/dhan/http.ts) rather than via box/config.ts.
+ *
+ * OFF BY DEFAULT. Only `DHAN_ORDER_STREAM_ENABLED=true` turns it on, consistent with how live
+ * behaviour is gated everywhere else — and a live-trading environment additionally has to be
+ * the thing that constructs and starts the feed. The stream only ever OBSERVES; it can never
+ * place an order, so enabling it changes what we see, never what we send.
+ */
+export function dhanOrderStreamEnabledFromEnv(): boolean {
+  return (process.env.DHAN_ORDER_STREAM_ENABLED ?? "").trim().toLowerCase() === "true";
+}
