@@ -126,10 +126,13 @@ export function parseKiteOrderFrame(raw: string): KiteParsedTextFrame {
     ownerTag: tag ?? "",
     brokerOrderId: orderId,
     account,
-    // A postback without filled_quantity is a status-only update (e.g. a bare ACK). Zero is the
-    // honest cumulative in that case; the monotonic ledger treats it as carrying no new
-    // quantity, so it can never rewind a prior fill.
+    // MISSING-VS-CONFIRMED-ZERO (item 1B). A postback WITHOUT `filled_quantity` is a status-only
+    // update (a bare ACK / a modification). It is NOT a confirmed zero fill: mapping it to 0 here
+    // would fabricate an execution record. So the placeholder is 0 but `quantityPresent` is false,
+    // and the projection/adapter then treat the quantity as INSUFFICIENT EVIDENCE — never applied,
+    // never terminalising — and a targeted REST reconciliation obtains the real quantity.
     cumulativeQty: filled ?? 0,
+    quantityPresent: filled !== null,
     averagePrice: avg,
     rawStatus: status,
     eventId,

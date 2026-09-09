@@ -87,8 +87,27 @@ export interface RegisteredOrder extends OrderOwnershipKey {
  * ownership keys — everything needed to attribute AND to apply, with no follow-up fetch.
  */
 export interface NormalizedOrderObservation extends OrderOwnershipKey {
-  /** Broker cumulative filled quantity AFTER this observation. Authoritative. */
+  /**
+   * Broker cumulative filled quantity AFTER this observation. Authoritative WHEN
+   * {@link quantityPresent} is true. When `quantityPresent` is false this field carries a
+   * placeholder (0) that MUST NOT be read as a confirmed zero fill — see the next field.
+   */
   readonly cumulativeQty: number;
+  /**
+   * Whether the broker payload actually CARRIED a cumulative filled quantity.
+   *
+   * THE MISSING-VS-CONFIRMED-ZERO DISTINCTION (item 1B). A Kite postback without
+   * `filled_quantity`, or a Dhan `order_alert` whose `TradedQty` is absent, tells us NOTHING
+   * about how much filled — it is insufficient evidence, not a proof of zero. Collapsing that
+   * absence to `cumulativeQty: 0` (as the transports used to) fabricates a confirmed zero,
+   * which is exactly the defect this flag closes. Absent ⇒ the projection applies NO quantity
+   * event (so a terminal-looking label can never terminalise on nothing) and the adapter is
+   * handed an absent quantity so `readNonNegativeInteger` sees the gap rather than a fake zero.
+   *
+   * Optional and defaulting to `true` ONLY for callers that genuinely observed a number (e.g. a
+   * REST snapshot that read a concrete field); every stream transport sets it explicitly.
+   */
+  readonly quantityPresent?: boolean;
   /** Broker cumulative average fill price, when reported. */
   readonly averagePrice?: number | null;
   /** Broker status string, verbatim, for diagnostics. Never the basis for quantity. */
@@ -116,13 +135,27 @@ export type IngestRejection =
   | "malformed";
 
 export interface IngestResult {
-  /** True when the observation was attributed to a registered order and applied. */
+  /** True when the observation was attributed to a registered order. */
   readonly attributed: boolean;
   readonly clientOrderId: string | null;
-  /** Present only when attributed: the ledger outcome (applied / duplicate / stale / …). */
+  /**
+   * Present only when attributed AND the observation carried a cumulative quantity: the ledger
+   * outcome (applied / duplicate / stale / …). Null when the observation was attributed but its
+   * quantity was ABSENT (insufficient evidence) — see {@link quantityEvidence}.
+   */
   readonly apply: FillApplyResult | null;
   /** Present only when NOT attributed: why. */
   readonly rejection: IngestRejection | null;
+  /**
+   * Whether this observation carried a usable cumulative quantity.
+   *
+   * `confirmed` — the payload carried a quantity (including an explicit, confirmed zero); it was
+   *               applied to the ledger.
+   * `absent`    — the payload had no quantity field. It is INSUFFICIENT EVIDENCE, never a zero
+   *               fill: the ledger is untouched, but the event is still attributed so ownership
+   *               and stream liveness are tracked and a REST reconciliation can be scheduled.
+   */
+  readonly quantityEvidence: "confirmed" | "absent";
   readonly source: FillEventSource;
 }
 
@@ -196,6 +229,12 @@ export class OrderUpdateProjection {
    */
   private unownedCount = 0;
   private foreignAccountCount = 0;
+  /**
+   * Owned events that carried NO cumulative quantity (insufficient evidence). Not a fault — a
+   * status-only frame (ACK/TRANSIT) is normal — but a spike is the signal to lean on REST
+   * reconciliation, so it is counted and surfaced.
+   */
+  private absentQuantityCount = 0;
 
   /**
    * Register (or re-register) a box order so its events can be attributed and its fills
@@ -254,21 +293,28 @@ export class OrderUpdateProjection {
    * source does, so a REST poll can never make a dead stream look alive.
    */
   ingest(obs: NormalizedOrderObservation): IngestResult {
+    // A quantity is "absent" ONLY when the transport explicitly said so (quantityPresent ===
+    // false). Everything that did not opt in is treated as confirmed, preserving the behaviour of
+    // every existing REST/reconciliation caller that reads a concrete field.
+    const quantityAbsent = obs.quantityPresent === false;
+    const quantityEvidence: "confirmed" | "absent" = quantityAbsent ? "absent" : "confirmed";
+
     if (obs.source === "order_update" || obs.source === "postback") {
-      // Any genuine stream delivery is evidence the stream is alive right now.
+      // Any genuine stream delivery is evidence the stream is alive right now — REGARDLESS of
+      // whether it carried a quantity. A status-only frame still proves the socket is delivering.
       if (obs.observedAtWall != null && Number.isFinite(obs.observedAtWall)) {
         this.lastEventAtWall = obs.observedAtWall;
       }
     }
 
     if (!Number.isFinite(obs.cumulativeQty) || obs.cumulativeQty < 0) {
-      return { attributed: false, clientOrderId: null, apply: null, rejection: "malformed", source: obs.source };
+      return { attributed: false, clientOrderId: null, apply: null, rejection: "malformed", quantityEvidence, source: obs.source };
     }
 
     const clientOrderId = this.resolveOwner(obs);
     if (clientOrderId === null) {
       this.unownedCount++;
-      return { attributed: false, clientOrderId: null, apply: null, rejection: "unowned", source: obs.source };
+      return { attributed: false, clientOrderId: null, apply: null, rejection: "unowned", quantityEvidence, source: obs.source };
     }
 
     const expectedAccount = this.accountOf.get(clientOrderId) ?? null;
@@ -279,7 +325,7 @@ export class OrderUpdateProjection {
       String(obs.account).trim() !== expectedAccount
     ) {
       this.foreignAccountCount++;
-      return { attributed: false, clientOrderId, apply: null, rejection: "foreign_account", source: obs.source };
+      return { attributed: false, clientOrderId, apply: null, rejection: "foreign_account", quantityEvidence, source: obs.source };
     }
 
     // Once the broker id is present on an owned event, remember it so a later broker-id-only
@@ -291,7 +337,18 @@ export class OrderUpdateProjection {
       // Registered by tag but the ledger is gone (should not happen): treat as unowned rather
       // than silently create a zero-requested ledger that could accept an overfill for nothing.
       this.unownedCount++;
-      return { attributed: false, clientOrderId, apply: null, rejection: "unowned", source: obs.source };
+      return { attributed: false, clientOrderId, apply: null, rejection: "unowned", quantityEvidence, source: obs.source };
+    }
+
+    // INSUFFICIENT EVIDENCE. The event is owned by this box leg, but the broker did not report a
+    // cumulative quantity, so there is NOTHING to apply — applying `cumulativeQty` here would
+    // record a fabricated zero (or, worse for a status-only redelivery, consume the eventId as if
+    // it were a real fill). The ownership binding above still happened, the stream liveness above
+    // still refreshed, and the caller schedules a targeted REST reconciliation to obtain the true
+    // quantity. This is the missing-vs-confirmed-zero rule from item 1B, enforced at the projection.
+    if (quantityAbsent) {
+      this.absentQuantityCount++;
+      return { attributed: true, clientOrderId, apply: null, rejection: null, quantityEvidence, source: obs.source };
     }
 
     const event: CumulativeFillEvent = {
@@ -304,7 +361,7 @@ export class OrderUpdateProjection {
       source: obs.source,
     };
     const apply = ledger.apply(event);
-    return { attributed: true, clientOrderId, apply, rejection: null, source: obs.source };
+    return { attributed: true, clientOrderId, apply, rejection: null, quantityEvidence, source: obs.source };
   }
 
   private resolveOwner(key: OrderOwnershipKey): string | null {
@@ -439,6 +496,7 @@ export class OrderUpdateProjection {
     orders: number;
     unowned: number;
     foreignAccount: number;
+    absentQuantity: number;
     disconnects: number;
     reconcilePending: boolean;
   } {
@@ -446,6 +504,7 @@ export class OrderUpdateProjection {
       orders: this.ledgers.size,
       unowned: this.unownedCount,
       foreignAccount: this.foreignAccountCount,
+      absentQuantity: this.absentQuantityCount,
       disconnects: this.disconnectCount,
       reconcilePending: this.reconcileOwed,
     };

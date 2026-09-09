@@ -246,3 +246,111 @@ export function permissionInvariantViolations(): string[] {
   }
   return problems;
 }
+
+/**
+ * THE ORDER-STREAM LIFECYCLE STATE MACHINE.
+ *
+ * The tables above are pure. This is the small stateful driver that turns transport lifecycle
+ * events (connecting / socket open / authenticated / synchronized / disconnected / session lost)
+ * into the {@link OrderStreamLifecycleState} the tables score. It exists so that the state is
+ * derived from EVENTS THAT ACTUALLY HAPPENED, not set ad hoc at call sites — which is the whole
+ * reason "socket open" stopped being able to read READY.
+ *
+ * THE LOAD-BEARING TRANSITIONS:
+ *   - `onSocketOpen` moves CONNECTING → AUTHENTICATING. It is NOT READY: a route to the broker is
+ *     not authorisation, and (Dhan) authorisation is not even acknowledged, so a socket that has
+ *     merely opened proves nothing about delivery.
+ *   - `onAuthenticated` moves AUTHENTICATING → RECONCILING, ALWAYS. Even a first connect owes an
+ *     initial synchronization; a reconnect owes one because the broker does not promise to replay
+ *     events missed in the gap. RECONCILING forbids new entry but permits exit and cancel.
+ *   - `markSynchronized` is the ONLY path to READY. It means the REST reconciliation sweep merged
+ *     every durable nonterminal order and attributed position without loss or double-count.
+ *   - `onDisconnected` moves to DISCONNECTED and OWES a reconciliation. Exposure management and
+ *     protective cancel continue; new entry stops. A missing event is NEVER read as a zero fill.
+ *   - `onIdle` moves a connected stream to DEGRADED (connected but not delivering usable events).
+ *   - `onSessionLost` moves to AUTH_EXPIRED: reconnecting with the same rejected token is pointless
+ *     and the broker will refuse everything but a cancel anyway.
+ *
+ * PURE of I/O: it holds only the current state and a "have we ever connected" bit; a caller feeds
+ * it events and reads `state()`.
+ */
+export class OrderStreamStateMachine {
+  private current: OrderStreamLifecycleState;
+  private everConnected = false;
+  private reconcileOwed = false;
+
+  constructor(enabled: boolean) {
+    this.current = enabled ? "DISCONNECTED" : "DISABLED";
+  }
+
+  state(): OrderStreamLifecycleState {
+    return this.current;
+  }
+
+  /** True while a post-connect/reconnect REST reconciliation has not yet completed. */
+  reconcilePending(): boolean {
+    return this.reconcileOwed;
+  }
+
+  /** Whether the NEXT successful connect is a reconnect (a gap may have occurred). */
+  isReconnect(): boolean {
+    return this.everConnected;
+  }
+
+  setEnabled(enabled: boolean): void {
+    if (!enabled) {
+      this.current = "DISABLED";
+      this.reconcileOwed = false;
+      return;
+    }
+    if (this.current === "DISABLED") this.current = "DISCONNECTED";
+  }
+
+  onConnecting(): void {
+    if (this.current === "DISABLED") return;
+    this.current = "CONNECTING";
+  }
+
+  /** Socket open — a route exists, nothing more. Never READY. */
+  onSocketOpen(): void {
+    if (this.current === "DISABLED") return;
+    this.current = "AUTHENTICATING";
+  }
+
+  /** Authorised — but a reconciliation is always owed before entry resumes. */
+  onAuthenticated(): void {
+    if (this.current === "DISABLED") return;
+    this.everConnected = true;
+    this.reconcileOwed = true;
+    this.current = "RECONCILING";
+  }
+
+  /** The reconciliation sweep completed and is consistent. The ONLY path to READY. */
+  markSynchronized(): void {
+    if (this.current === "DISABLED") return;
+    this.reconcileOwed = false;
+    // Only promote to READY from a connected-and-authorised state; never from a dropped one.
+    if (this.current === "RECONCILING" || this.current === "DEGRADED") this.current = "READY";
+  }
+
+  /** Connected but not delivering usable events within the expected idle bound. */
+  onIdle(): void {
+    if (this.current === "READY" || this.current === "RECONCILING") this.current = "DEGRADED";
+  }
+
+  onDisconnected(): void {
+    if (this.current === "DISABLED" || this.current === "AUTH_EXPIRED") return;
+    this.reconcileOwed = true;
+    this.current = "DISCONNECTED";
+  }
+
+  onSessionLost(): void {
+    if (this.current === "DISABLED") return;
+    this.reconcileOwed = true;
+    this.current = "AUTH_EXPIRED";
+  }
+
+  permissions(): OperationPermissions {
+    return orderStreamPermissions(this.current);
+  }
+}
