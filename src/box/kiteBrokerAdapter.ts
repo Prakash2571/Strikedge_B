@@ -125,6 +125,9 @@ export class KiteHttpTransport implements KiteBrokerTransport {
       }
       return data;
     } catch (error) {
+      // A LOCAL REFUSAL (send guard threw) is a proven no-POST, never a broker outcome: it must
+      // propagate untouched and never be wrapped as an ambiguous submission.
+      if (error instanceof BrokerPreSubmitRefusedError) throw error;
       if (error instanceof BrokerAmbiguousSubmitError || isDefinitivePlacementRejection(error)) throw error;
       throw new BrokerAmbiguousSubmitError(
         "transport-pending",
