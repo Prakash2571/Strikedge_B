@@ -50,12 +50,14 @@ import {
   type BrokerOrderState,
   type BrokerPosition,
   type BrokerRejectFamily,
+  type ExternalOrderUpdate,
 } from "./brokerAdapter.js";
 import type { BoxConfig } from "./config.js";
 import { Deadline, monotonicNow, type MonotonicClock } from "../brokers/deadline.js";
 import {
   evaluateExecutionEvidence,
   readCumulativeQuantity,
+  readNonNegativeInteger,
   readPositivePrice,
   readTradedPrice,
 } from "./brokerExecutionEvidence.js";
@@ -322,6 +324,137 @@ export class DhanBrokerAdapter implements BrokerAdapter {
    * paces every HTTP call at `DHAN_MIN_INTERVAL_MS` inside src/brokers/dhan/http.ts, which is
    * why the Dhan order floor in brokerPacing.ts matches that value rather than going lower.
    */
+  /**
+   * Resolvers waiting for the NEXT observation of one order, keyed by client order id.
+   *
+   * This is what makes an order-update stream more than a status label. `waitForResolution` used to
+   * sleep a fixed `brokerMinIntervalMs` between REST polls, so a fill was seen at best one poll
+   * interval after it happened, no matter how promptly the broker told us. A stream event now
+   * resolves the pending sleep immediately, so the waiter wakes on the EVENT.
+   *
+   * Bounded by construction: one entry per in-flight order, deleted the moment it is woken.
+   */
+  private readonly orderWaiters = new Map<string, Set<() => void>>();
+  /** Stream observations applied to this session, for status/diagnostics. */
+  private streamObservationsApplied = 0;
+  private streamObservationsIgnored = 0;
+
+  /**
+   * Sleep up to `ms`, but wake EARLY if an external observation of this order arrives.
+   *
+   * Never longer than the poll interval, so REST remains a controlled fallback: if the stream is
+   * dead, silent, or lying by omission, the loop still polls on its own cadence. The stream can
+   * only ever make the answer arrive sooner.
+   */
+  private async sleepOrObservation(ms: number, clientOrderId: string): Promise<void> {
+    let waiters = this.orderWaiters.get(clientOrderId);
+    if (!waiters) {
+      waiters = new Set();
+      this.orderWaiters.set(clientOrderId, waiters);
+    }
+    let wake: () => void = () => {};
+    const woken = new Promise<void>((resolve) => { wake = resolve; });
+    waiters.add(wake);
+    try {
+      await Promise.race([sleep(ms), woken]);
+    } finally {
+      waiters.delete(wake);
+      if (waiters.size === 0) this.orderWaiters.delete(clientOrderId);
+    }
+  }
+
+  /** Wake every waiter on one order. Called after an external observation is merged. */
+  private wakeOrderWaiters(clientOrderId: string): void {
+    const waiters = this.orderWaiters.get(clientOrderId);
+    if (!waiters) return;
+    for (const wake of [...waiters]) {
+      try { wake(); } catch { /* a waiter must never break the ingestion path */ }
+    }
+  }
+
+  /**
+   * APPLY ONE EXTERNAL ORDER OBSERVATION (a websocket order update).
+   *
+   * Routed through the SAME evidence validation as a REST snapshot
+   * (brokerExecutionEvidence.ts): a stream is a FASTER source, never a more trusted one. So a
+   * stream event with a terminal-looking status but no cumulative quantity cannot terminalise an
+   * order, and an unpriced fill is recorded as unpriced rather than as free.
+   *
+   * MONOTONIC. A cumulative quantity below what is already proven is discarded outright — out-of-
+   * order stream delivery and overlapping REST reads are normal, and neither may rewind exposure.
+   *
+   * PROMPT. The merged snapshot is stored and every waiter on this order is woken, so
+   * `waitForResolution` returns on the event instead of on the next poll interval.
+   */
+  applyOrderUpdate(update: ExternalOrderUpdate): BrokerOrder | undefined {
+    const known = this.orders.get(update.clientOrderId);
+    if (!known) {
+      this.streamObservationsIgnored++;
+      return undefined;
+    }
+    const observedQuantity = readNonNegativeInteger(update.cumulativeQty);
+    const observedPrice = readPositivePrice(update.averagePrice ?? null);
+    const label = String(update.rawStatus ?? "");
+    const claimedState = dhanOrderState(label, observedQuantity.value ?? known.filled_quantity, known.quantity);
+    const verdict = evaluateExecutionEvidence({
+      statusLabel: label,
+      claimedState,
+      requestedQuantity: known.quantity,
+      priorFilled: known.filled_quantity,
+      quantity: observedQuantity,
+      price: observedPrice,
+    });
+
+    // A regression carries no new information. Ignoring it (rather than merging it) is what keeps
+    // a delayed lower cumulative quantity from touching either the snapshot or the waiters.
+    const regressed = observedQuantity.present && (observedQuantity.value ?? 0) < known.filled_quantity;
+
+    const merged: BrokerOrder = cloneOrder(known);
+    merged.filled_quantity = verdict.filledQuantity;
+    merged.pending_quantity = Math.max(0, known.quantity - verdict.filledQuantity);
+    if (verdict.averagePrice !== null) merged.average_price = verdict.averagePrice;
+    merged.execution_evidence = verdict.quality;
+    if (update.brokerOrderId) {
+      merged.broker_order_id = update.brokerOrderId;
+      this.clientByBroker.set(update.brokerOrderId, update.clientOrderId);
+    }
+    // The state is re-derived from the ACCEPTED quantity, exactly as `project()` does, so a
+    // contradictory label (TRADED with a short fill, CANCELLED with a fill) resolves the same way
+    // whichever source reported it.
+    merged.state = verdict.sufficient
+      ? dhanOrderState(label, verdict.filledQuantity, known.quantity)
+      : known.state;
+    if (!verdict.sufficient) merged.reject_reason = verdict.detail;
+    // NEVER regress a terminal state to a working one on a late event.
+    if (isBrokerOrderTerminal(known.state) && !isBrokerOrderTerminal(merged.state)) {
+      merged.state = known.state;
+    }
+    if (verdict.filledQuantity > 0 && merged.fills.length === 0) {
+      merged.fills = [{
+        fill_id: `dhan:stream:${merged.broker_order_id ?? update.clientOrderId}:${verdict.filledQuantity}:${verdict.averagePrice ?? "unpriced"}`,
+        quantity: verdict.filledQuantity,
+        price: verdict.averagePrice,
+        at: update.observedAtWall ?? Date.now(),
+      }];
+    }
+    merged.updated_at = update.observedAtWall ?? Date.now();
+
+    if (regressed) {
+      this.streamObservationsIgnored++;
+      return cloneOrder(known);
+    }
+    this.orders.set(update.clientOrderId, merged);
+    this.streamObservationsApplied++;
+    this.markFill(update.clientOrderId, merged.filled_quantity);
+    this.wakeOrderWaiters(update.clientOrderId);
+    return cloneOrder(merged);
+  }
+
+  /** How many external (stream) observations this session applied vs ignored. */
+  streamObservationStats(): { applied: number; ignored: number } {
+    return { applied: this.streamObservationsApplied, ignored: this.streamObservationsIgnored };
+  }
+
   /** The MONOTONIC clock in force for elapsed/deadline measurement (Defect D). */
   private mono(): number {
     return (this.cfg.monotonic ?? monotonicNow)();
@@ -645,7 +778,10 @@ export class DhanBrokerAdapter implements BrokerAdapter {
       if (ackDeadlineHit || workingDeadlineHit || partialDeadlineHit) {
         return this.protectiveCancelAndConfirm(clientOrderId, current);
       }
-      await sleep(this.cfg.brokerMinIntervalMs);
+      // WAKE ON THE EVENT, fall back on the interval. A stream observation resolves this sleep
+      // immediately; with no stream (or a silent one) the poll cadence is exactly as before, so
+      // REST stays a controlled fallback rather than being replaced.
+      await this.sleepOrObservation(this.cfg.brokerMinIntervalMs, clientOrderId);
       const refreshed = await this.refresh(clientOrderId);
       if (!refreshed) break;
       current = refreshed;
@@ -700,7 +836,8 @@ export class DhanBrokerAdapter implements BrokerAdapter {
     let confirmPolls = 0;
     while (this.mono() < cancelDeadlineAt && confirmPolls < maxConfirmPolls) {
       confirmPolls++;
-      await sleep(this.cfg.brokerMinIntervalMs);
+      // A cancel races a fill; a stream event telling us which won must not wait out a poll.
+      await this.sleepOrObservation(this.cfg.brokerMinIntervalMs, clientOrderId);
       const refreshed = await this.refresh(clientOrderId);
       if (refreshed && isBrokerOrderTerminal(refreshed.state)) return cloneOrder(refreshed);
     }

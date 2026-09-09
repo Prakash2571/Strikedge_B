@@ -29,6 +29,7 @@ import {
   readNonNegativeInteger,
   readPositivePrice,
 } from "./brokerExecutionEvidence.js";
+import type { ExternalOrderUpdate } from "./brokerAdapter.js";
 import type { ExecutionTimingRecorder } from "./executionTiming.js";
 import type { ExecutionMode, IBoxOrderIntent, OrderSide } from "./types.js";
 
@@ -733,6 +734,105 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     }
   }
 
+  /**
+   * Resolvers waiting for the NEXT observation of one order (see the Dhan adapter for the full
+   * argument). Zerodha delivers order updates as TEXT frames on the market-data socket; without
+   * this seam such an event could only change a status label, because an order waiter is blocked on
+   * `waitForResolution`'s poll interval, not on the socket.
+   */
+  private readonly orderWaiters = new Map<string, Set<() => void>>();
+  private streamObservationsApplied = 0;
+  private streamObservationsIgnored = 0;
+
+  /** Sleep up to `ms`, waking EARLY on an external observation of this order. */
+  private async waitOrObservation(ms: number, clientOrderId: string): Promise<void> {
+    let waiters = this.orderWaiters.get(clientOrderId);
+    if (!waiters) {
+      waiters = new Set();
+      this.orderWaiters.set(clientOrderId, waiters);
+    }
+    let wake: () => void = () => {};
+    const woken = new Promise<void>((resolve) => { wake = resolve; });
+    waiters.add(wake);
+    try {
+      await Promise.race([this.clock.wait(ms), woken]);
+    } finally {
+      waiters.delete(wake);
+      if (waiters.size === 0) this.orderWaiters.delete(clientOrderId);
+    }
+  }
+
+  private wakeOrderWaiters(clientOrderId: string): void {
+    const waiters = this.orderWaiters.get(clientOrderId);
+    if (!waiters) return;
+    for (const wake of [...waiters]) {
+      try { wake(); } catch { /* a waiter must never break the ingestion path */ }
+    }
+  }
+
+  /**
+   * APPLY ONE EXTERNAL ORDER OBSERVATION (a Kite order postback text frame).
+   *
+   * Same contract as the Dhan adapter's: already attributed by the projection, re-validated through
+   * the shared evidence reader, cumulative-monotonic, and it wakes the order's waiters so the fill
+   * is seen on the event rather than on the next poll.
+   */
+  applyOrderUpdate(update: ExternalOrderUpdate): BrokerOrder | undefined {
+    const known = this.orders.get(update.clientOrderId);
+    if (!known) {
+      this.streamObservationsIgnored++;
+      return undefined;
+    }
+    const observedQuantity = readNonNegativeInteger(update.cumulativeQty);
+    const observedPrice = readPositivePrice(update.averagePrice ?? null);
+    const label = String(update.rawStatus ?? "");
+    const claimedState = kiteState(label, observedQuantity.value ?? known.filled_quantity, known.quantity);
+    const verdict = evaluateExecutionEvidence({
+      statusLabel: label,
+      claimedState,
+      requestedQuantity: known.quantity,
+      priorFilled: known.filled_quantity,
+      quantity: observedQuantity,
+      price: observedPrice,
+    });
+    const regressed = observedQuantity.present && (observedQuantity.value ?? 0) < known.filled_quantity;
+    if (regressed) {
+      this.streamObservationsIgnored++;
+      return clone(known);
+    }
+
+    const merged = clone(known);
+    merged.filled_quantity = verdict.filledQuantity;
+    merged.pending_quantity = Math.max(0, known.quantity - verdict.filledQuantity);
+    if (verdict.averagePrice !== null) merged.average_price = verdict.averagePrice;
+    merged.execution_evidence = verdict.quality;
+    if (update.brokerOrderId) merged.broker_order_id = update.brokerOrderId;
+    merged.state = verdict.sufficient
+      ? kiteState(label, verdict.filledQuantity, known.quantity)
+      : known.state;
+    if (!verdict.sufficient) merged.reject_reason = verdict.detail;
+    if (isBrokerOrderTerminal(known.state) && !isBrokerOrderTerminal(merged.state)) {
+      merged.state = known.state;
+    }
+    if (verdict.filledQuantity > 0 && merged.fills.length === 0) {
+      merged.fills = [{
+        fill_id: `kite:stream:${merged.broker_order_id ?? update.clientOrderId}:${verdict.filledQuantity}:${verdict.averagePrice ?? "unpriced"}`,
+        quantity: verdict.filledQuantity,
+        price: verdict.averagePrice,
+        at: update.observedAtWall ?? this.clock.now(),
+      }];
+    }
+    merged.updated_at = update.observedAtWall ?? this.clock.now();
+    this.orders.set(update.clientOrderId, merged);
+    this.streamObservationsApplied++;
+    this.wakeOrderWaiters(update.clientOrderId);
+    return clone(merged);
+  }
+
+  streamObservationStats(): { applied: number; ignored: number } {
+    return { applied: this.streamObservationsApplied, ignored: this.streamObservationsIgnored };
+  }
+
   private async waitForResolution(order: BrokerOrder): Promise<BrokerOrder> {
     const started = this.clock.now();
     let partialAt: number | null = null;
@@ -744,7 +844,8 @@ export class KiteBrokerAdapter implements BrokerAdapter {
       if (elapsed >= deadline || (partialAt !== null && this.clock.now() - partialAt >= this.config.partialTimeoutMs)) {
         return clone(await this.protectiveCancelAndConfirm(order));
       }
-      await this.clock.wait(Math.max(1, this.config.brokerMinIntervalMs));
+      // Wake on the EVENT, fall back on the interval: REST stays a controlled fallback.
+      await this.waitOrObservation(Math.max(1, this.config.brokerMinIntervalMs), order.client_order_id);
       order = await this.refresh(order);
       if (order.state === "PARTIALLY_FILLED" && partialAt === null) partialAt = this.clock.now();
     }
