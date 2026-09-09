@@ -6,6 +6,14 @@ procedure, and — most importantly — the **CalSpread → StrikeEdge cutover**
 
 PostgreSQL is StrikeEdge's operational authority; treat it accordingly.
 
+> **Going live in Mumbai (`ap-south-1`)?** Read
+> [`docs/MUMBAI_EC2_PROFILE.md`](MUMBAI_EC2_PROFILE.md) first. It holds the conservative
+> starting profile (real trading disabled, one lot, one box), the ready-to-edit
+> [`deploy/mumbai-ec2-conservative.env.example`](../deploy/mumbai-ec2-conservative.env.example),
+> and the EC2-specific requirements: stable outbound IP, clock sync, PostgreSQL
+> durability, monitoring, restart/recovery, config precedence, and the requirement that
+> CalSpread Box execution be disabled first.
+
 ## 1. PostgreSQL installation, database and role
 
 Install PostgreSQL (14+; 15/16 fine) from your distro or the PGDG repo. Then
