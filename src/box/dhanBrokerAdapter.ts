@@ -467,9 +467,27 @@ export class DhanBrokerAdapter implements BrokerAdapter {
         this.orders.set(req.client_order_id, verified);
         throw new BrokerOrderRejectedError(cloneOrder(verified), placed);
       }
-      // Could not obtain authoritative quantity/price for a terminal-looking placement. RETAIN
-      // UNCERTAINTY: quarantine so dependent entries are blocked, rather than fabricating a fill
-      // or a rejection. The durable reconciler resolves it against confirmed evidence.
+      // EVIDENCE NOT YET VISIBLE: the read SUCCEEDED and PROJECTED a genuine working state (the
+      // trade has not propagated to the order book yet). This is the "keep waiting" case, NOT the
+      // "give up" case — poll to a VERIFIED terminal outcome, where every quantity comes from an
+      // order/trade read. A read that FAILED leaves the order in its pre-broker SUBMITTING state
+      // (refresh returns the unchanged projection), which is NOT evidence and falls through to
+      // the quarantine below.
+      const projectedAWorkingState =
+        verified
+        && !isBrokerOrderTerminal(verified.state)
+        && (verified.state === "OPEN"
+          || verified.state === "ACKNOWLEDGED"
+          || verified.state === "PARTIALLY_FILLED");
+      if (projectedAWorkingState) {
+        this.orders.set(req.client_order_id, verified);
+        return this.waitForResolution(req.client_order_id, verified);
+      }
+      // Could not obtain authoritative quantity/price for a terminal-looking placement — either
+      // the read failed outright, or it returned a terminal label we could not substantiate with
+      // a quantity/price. RETAIN UNCERTAINTY: quarantine so dependent entries are blocked, rather
+      // than fabricating a fill or a rejection. The durable reconciler resolves it against
+      // confirmed evidence.
       current.state = "RECONCILIATION_REQUIRED";
       current.reject_reason =
         `Dhan reported '${placed.orderStatus}' at placement but no authoritative cumulative quantity/price could be read; ` +
