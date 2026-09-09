@@ -11,21 +11,44 @@ Run everything with a local PostgreSQL and (for the outbox projector) MongoDB re
 export DATABASE_URL=postgres://strikedge:strikedge@127.0.0.1:55432/strikedge
 export MONGODB_URI=mongodb://127.0.0.1:57017/strikedge_test
 npm run build
-npm run test:unit        # tests/box/**   — pure/offline Box engine unit suite
+npm run test:unit        # tests/box/**   — pure/offline Box engine unit suite (NO database, NO network)
 npm run test:pg          # tests/pg/**     — real-PostgreSQL integration (fails loud if PG is down)
 npm run test:projector   # tests/projector/** — Mongo outbox projector
 npm run test:tokens      # tests/tokens/** — broker-token acquisition/rotation/redaction
 npm run test:access      # tests/access/** — site passcode gate (replaces the admin-token layer)
 npm run test:switch      # tests/switch/** — broker switch / durable generation
 npm run test:shutdown    # tests/shutdown/** — graceful shutdown coordinator + declared order
+npm run test:readiness   # tests/readiness/** — startup-readiness state machine (NO database, NO network)
 ```
+
+## Suite boundaries — what each suite needs
+
+The unit suite is DATABASE-FREE and NETWORK-FREE by design, and this is now ENFORCED (see
+"The unit-suite hermetic guard" below). The table records exactly which external service each
+suite requires, so an accidental future dependency is obvious:
+
+| Suite | PostgreSQL? | MongoDB? | Network? | Notes |
+|-------|-------------|----------|----------|-------|
+| unit (`tests/box/`) | **no** | **no** | **no** | Pure/offline. Any test needing a real database belongs in another suite; a static guard fails the suite otherwise. |
+| invariants (`tests/invariants/`) | no | no | no | Pure safety invariants. |
+| tokens (`tests/tokens/`) | no | no | loopback only | Drives a LOCAL mock HTTP server (127.0.0.1); no real broker. |
+| access (`tests/access/`) | no | no | loopback only | Site passcode gate; loopback express app only. |
+| switch (`tests/switch/`) | no | no | loopback only | Broker switch; broker egress served from fixtures (hermetic). |
+| shutdown (`tests/shutdown/`) | no | no | no | Coordinator driven with fakes. |
+| readiness (`tests/readiness/`) | no | no | loopback only | Readiness state machine + loopback express app. |
+| pg (`tests/pg/`) | **YES** | no | loopback only | Real-PostgreSQL authority. Fails LOUDLY if PG is down. |
+| projector (`tests/projector/`) | no | **YES** | loopback only | Real-MongoDB bounded outbox projector. |
+
+Only `pg` requires PostgreSQL; only `projector` requires MongoDB; every other suite needs
+neither. `npm test` runs each suite EXACTLY once (unit → invariants → tokens → access → switch →
+shutdown → readiness → `test:integration`, where `test:integration` = pg → projector).
 
 ## What each suite covers
 
 | Suite | Directory | Covers |
 |-------|-----------|--------|
-| unit | `tests/box/` | The Box engine: math, execution, order manager, calibration, reservations (algorithm), Dhan support, projection bookkeeping, config invariants. Pure/offline except the daily-risk index probe (see below), which reads a throwaway PostgreSQL schema. |
-| pg | `tests/pg/` | Real-PostgreSQL authority: reservation port (fences, all-or-none, TTL/expiry, release, GC), order-intent CAS, residual-projection CAS, trades/crash-recovery, one-shot session. Fails LOUDLY if PostgreSQL is unreachable — it never skips silently. |
+| unit | `tests/box/` | The Box engine: math, execution, order manager, calibration, reservations (algorithm), Dhan support, projection bookkeeping, config invariants. **Fully pure/offline — needs NO database and NO network.** The one real-PostgreSQL test that used to live here (the daily-risk index probe) was moved to `tests/pg/` so the unit suite is truly database-free, and a static guard (`tests/box/unitSuiteHermetic.test.mjs`) now stops any DB dependency from creeping back in. |
+| pg | `tests/pg/` | Real-PostgreSQL authority: reservation port (fences, all-or-none, TTL/expiry, release, GC), order-intent CAS, residual-projection CAS, trades/crash-recovery, one-shot session, **and the residual-projection bookkeeping + daily-risk seed index catalog probe (`executionAttemptProjection.test.mjs`, moved here from `tests/box/` so the unit suite stays database-free)**. Fails LOUDLY if PostgreSQL is unreachable — it never skips silently. |
 | projector | `tests/projector/` | The bounded Mongo outbox projector and its resilience/secret-redaction guarantees. |
 | tokens | `tests/tokens/` | Outbound broker-token acquisition, key rotation, IST clock, redaction, provider client. |
 | access | `tests/access/` | The site passcode gate (`src/access/*`) — cookies, CSRF, rate limit, session store, middleware. |
@@ -96,6 +119,30 @@ predicate. If you find yourself stubbing a broker's *data* dump broadly, prefer 
 checked-in fixture (as with the scrip master) so the assertion tests real shape. Never
 weaken the guard to "pass through" an unknown host.
 
+## The unit-suite hermetic guard — the unit suite stays database-free
+
+`npm run test:unit` is `node --test "tests/box/*.test.mjs"` and is intended as the
+DATABASE-FREE, NETWORK-FREE unit suite. It regressed once: `executionAttemptProjection.test.mjs`
+imported the `pg` driver and opened a real connection to PostgreSQL on port 55432, so the "unit"
+suite silently depended on a database. That real-PostgreSQL test now lives in `tests/pg/`.
+
+`tests/box/unitSuiteHermetic.test.mjs` makes that regression impossible to reintroduce silently.
+It is a STATIC source scan (it reads the source of every sibling `tests/box/*.test.mjs`, it does
+not execute them, and it strips comments so documentation cannot false-positive). A unit test
+FAILS the guard if it:
+
+1. imports the `pg` or `mongodb` driver (static `import … from`, dynamic `import(…)`, or
+   `require(…)` — the only two real database clients in `package.json`);
+2. embeds a database port (PostgreSQL `55432`, MongoDB `57017`) — the signature of a hard-coded
+   real connection string; or
+3. embeds a connection URL (`postgres://` / `mongodb://`) to a non-loopback host.
+
+The guard also asserts a FLOOR on the number of unit files, so an accidental empty glob or a mass
+deletion cannot make it (and the suite) vacuously pass. It complements — and does not replace —
+the RUNTIME broker-egress interception in `tests/box/hermeticNetwork.test.mjs` +
+`tests/helpers/hermeticNetwork.mjs`: that guard fails closed on live broker HTTP egress; this one
+closes the database-driver hole. **Keep both.**
+
 ## Test files removed during the extraction, and why
 
 Three ported CalSpread test files targeted modules that StrikeEdge deliberately did NOT copy.
@@ -118,9 +165,12 @@ Deleting them is correct: a test importing a `dist/*.js` that will never exist i
   Every other Dhan assertion (segments, token identity, CSV parsing, charges, auth, errors,
   instrument-master quality filtering) is in scope and retained — the file passes with 38 tests.
 
-- **`tests/box/executionAttemptProjection.test.mjs`** — the five `real Mongo:` env-gated tests were
-  removed with the Mongo store and their SQL equivalents written (see map). The offline
-  "every daily-risk seed branch is bounded and index-ordered" test was REWRITTEN (see below).
+- **`tests/pg/executionAttemptProjection.test.mjs`** (moved from `tests/box/`) — the five
+  `real Mongo:` env-gated tests were removed with the Mongo store and their SQL equivalents
+  written (see map). The offline "every daily-risk seed branch is bounded and index-ordered" test
+  was REWRITTEN (see below). The whole file moved from the unit suite to the pg suite because its
+  index-catalog probe connects to a real PostgreSQL; keeping it under `tests/box/` was the exact
+  reason the unit suite was not truly database-free.
 
 ## The obsolete Mongo integration tests → their PostgreSQL equivalents
 
@@ -160,7 +210,7 @@ WRITTEN (marked ✚).
 | real Mongo: a physically legacy row accepts one version-zero CAS | ✚ `tests/pg/projectionCas.test.mjs` "a legacy row with a NULL projection_version accepts exactly one version-zero CAS" |
 | real Mongo: recovery index established and duplicate unresolved rows fail closed | `tests/pg/tradesAndRecovery.test.mjs` "single unresolved crash-recovery attempt: the partial unique index admits exactly one" (`box_single_unresolved_crash_recovery` partial UNIQUE index) |
 | real Mongo: crash-only recovery adopts existing boundary across snapshot changes | `tests/pg/tradesAndRecovery.test.mjs` "single unresolved crash-recovery attempt …" (a second `ensureBoxRecoveryExecutionAttempt` adopts the same row rather than minting a competitor) |
-| real Mongo: the bounded daily-risk seed is indexed and counts an overlapping row once | ✚ replaced by `tests/box/executionAttemptProjection.test.mjs` "the daily-risk seed's supporting indexes actually exist in PostgreSQL (pg_indexes)" — asserts the indexes against `pg_indexes`, plus the dedup-by-id assertion in the SQL-source test |
+| real Mongo: the bounded daily-risk seed is indexed and counts an overlapping row once | ✚ replaced by `tests/pg/executionAttemptProjection.test.mjs` "the daily-risk seed's supporting indexes actually exist in PostgreSQL (pg_indexes)" — asserts the indexes against `pg_indexes`, plus the dedup-by-id assertion in the SQL-source test |
 
 ## Tests WRITTEN to close a coverage gap
 
@@ -169,13 +219,13 @@ WRITTEN (marked ✚).
   Added: concurrent writers apply one version/charge exactly once; a legacy (NULL identity)
   row accepts exactly one version-zero CAS; a stale expected version is rejected without mutating
   the row.
-- ✚ **`tests/box/executionAttemptProjection.test.mjs`** "the daily-risk seed's supporting indexes
+- ✚ **`tests/pg/executionAttemptProjection.test.mjs`** "the daily-risk seed's supporting indexes
   actually exist in PostgreSQL (pg_indexes)" — proves, against PostgreSQL's own catalog, the three
   indexes the seed's `ORDER BY` relies on.
 
 ## The rewritten daily-risk seed test
 
-`tests/box/executionAttemptProjection.test.mjs` — "every daily-risk seed branch is bounded and
+`tests/pg/executionAttemptProjection.test.mjs` — "every daily-risk seed branch is bounded and
 index-ordered (SQL source)" + the pg_indexes probe. The original asserted on the literal Mongoose
 query text (`.sort()/.limit()/$or`) and a `boxExecutionAttemptSchema.index(...)` call in the old
 `model.ts`; both are gone by design. The rewrite pins the SAME behavioural guarantee against the
