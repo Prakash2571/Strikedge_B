@@ -65,7 +65,7 @@ export interface KitePlaceOrderRequest {
 }
 
 export interface KiteBrokerTransport {
-  placeOrder(request: KitePlaceOrderRequest): Promise<{ order_id: string }>;
+  placeOrder(request: KitePlaceOrderRequest, opts?: { beforeSend?: () => void }): Promise<{ order_id: string }>;
   cancelOrder(orderId: string): Promise<void>;
   modifyOrder(orderId: string, request: { quantity?: number; price: number }): Promise<void>;
   getOrder(orderId: string): Promise<KiteTransportOrder | null>;
@@ -104,7 +104,7 @@ export class KiteHttpTransport implements KiteBrokerTransport {
     },
   ) {}
 
-  async placeOrder(request: KitePlaceOrderRequest): Promise<{ order_id: string }> {
+  async placeOrder(request: KitePlaceOrderRequest, opts: { beforeSend?: () => void } = {}): Promise<{ order_id: string }> {
     try {
       const data = await this.request<{ order_id: string }>("POST", "/orders/regular", {
         exchange: request.exchange,
@@ -116,7 +116,7 @@ export class KiteHttpTransport implements KiteBrokerTransport {
         validity: request.validity,
         price: request.price,
         tag: request.tag,
-      }, true);
+      }, true, opts.beforeSend);
       if (!data?.order_id) {
         throw new BrokerAmbiguousSubmitError(
           "transport-pending",
@@ -196,13 +196,21 @@ export class KiteHttpTransport implements KiteBrokerTransport {
     path: string,
     body?: Record<string, string | number>,
     ambiguousSubmit = false,
+    beforeSend?: () => void,
   ): Promise<T> {
+    // Resolve the token FIRST. It is the last thing that can suspend before the wire — in
+    // production it is synchronous, but the type permits a promise, and a promise hop between
+    // the entry guard and `fetch` is exactly the Defect-3 window this fix closes.
     const token = await this.config.accessToken();
     const controller = new AbortController();
+    // A single deadline covers BOTH the network round trip AND the body read below (the timer
+    // is cleared only in `finally`, after `response.json()`), so a stalled body cannot hang
+    // unbounded. Uses setTimeout, which is unaffected by wall-clock steps.
     const timeout = setTimeout(() => controller.abort(), Math.max(250, this.config.timeoutMs));
     const fetchImpl = this.config.fetchImpl ?? fetch;
     try {
-      const response = await fetchImpl(`${this.config.baseUrl ?? "https://api.kite.trade"}${path}`, {
+      const url = `${this.config.baseUrl ?? "https://api.kite.trade"}${path}`;
+      const init = {
         method,
         headers: {
           "X-Kite-Version": "3",
@@ -211,7 +219,14 @@ export class KiteHttpTransport implements KiteBrokerTransport {
         },
         ...(body ? { body: new URLSearchParams(stringValues(body)).toString() } : {}),
         signal: controller.signal,
-      });
+      };
+      // FINAL SYNCHRONOUS SEND GUARD (Defect 3). LAST statement before `fetch`, AFTER the token
+      // await, with NO further `await` until the network call itself. A throw here — a
+      // BrokerPreSubmitRefusedError from the composed live-entry guard — proves that no HTTP
+      // request was transmitted, so the refusal stays a proven local no-POST and never an
+      // ambiguous broker submission. Only placement passes it; reads/cancels leave it undefined.
+      beforeSend?.();
+      const response = await fetchImpl(url, init);
       const payload = await response.json() as { data?: T; message?: string; error_type?: string };
       if (!response.ok) {
         throw new KiteHttpError(
@@ -222,6 +237,9 @@ export class KiteHttpTransport implements KiteBrokerTransport {
       }
       return payload.data as T;
     } catch (error) {
+      // A LOCAL REFUSAL is not a broker outcome: it must propagate untouched, never be dressed
+      // up as an ambiguous submission (which would quarantine an order that was never sent).
+      if (error instanceof BrokerPreSubmitRefusedError) throw error;
       if (ambiguousSubmit && !isDefinitivePlacementRejection(error)) {
         throw new BrokerAmbiguousSubmitError(
           "transport-pending",
@@ -352,14 +370,19 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     // rather than being hidden inside the POST duration.
     this.mark(req.client_order_id, "transport_started");
     let placed: { order_id: string };
+    // Fires at the FINAL SYNCHRONOUS instant before the wire (Defect 3): threaded THROUGH the
+    // adapter pacer AND the transport's token-resolution await down to KiteHttpTransport.request,
+    // where it runs immediately before `fetch` with no further await. Previously it ran inside
+    // the pacer callback, leaving the token-await promise hop between the guard and the send — a
+    // window in which entry could be disarmed while the POST was still on its way to the wire.
+    const beforeSend = (): void => {
+      beforePost?.();
+      // HTTP REQUEST START: marked here because this is the true moment the POST leaves for the
+      // network — post_to_http_response_ms then measures the broker, NOT our rate limiter.
+      this.mark(req.client_order_id, "http_request_started");
+    };
     try {
       placed = await this.call(() => {
-        // Run after pacing, at the final local boundary before the placement
-        // mutation. A thrown refusal proves placeOrder was never called.
-        beforePost?.();
-        // HTTP REQUEST START: inside the paced callback, so post_to_http_response_ms measures
-        // the network and the broker, NOT our own rate limiter.
-        this.mark(req.client_order_id, "http_request_started");
         return this.transport.placeOrder({
           exchange: req.exchange,
           tradingsymbol: req.tradingsymbol,
@@ -370,7 +393,7 @@ export class KiteBrokerAdapter implements BrokerAdapter {
           validity: "DAY",
           price: req.pricing.limit_price,
           tag: order.tag as string,
-        });
+        }, { beforeSend });
       }, "order_mutation");
       this.mark(req.client_order_id, "http_response");
     } catch (error) {
