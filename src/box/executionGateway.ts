@@ -20,6 +20,13 @@ import {
 import { entrySubmissionOrder } from "./entrySubmissionOrder.js";
 import { evaluateLiveEntryGuard, stillWantedSafely } from "./liveEntryGuard.js";
 import {
+  evaluateBookCoherence,
+  livePolicyFromConfig,
+  recheckBookCoherence,
+  type CoherenceDecision,
+  type CoherenceLegObservation,
+} from "./executionCoherence.js";
+import {
   OrderPersistenceAfterFillError,
   type BoxOrderManager,
   type CheckedFeedStamp,
@@ -240,6 +247,34 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
       return liveEntryFailure(args.candidate, args.detection.at, submittedAt, [], "insufficient_quantity", errorMessage(error), this.deps.cfg, tradeId);
     }
 
+    // ── FOUR-LEG BOOK COHERENCE: the live ADMISSION gate ───────────────────────────────────
+    //
+    // THE FIX. Until now this constraint lived ONLY in the paper simulator, so the live gateway
+    // admitted four books spread thousands of ms apart as long as each individual quote age stayed
+    // under the per-leg allowance — per-leg freshness is blind to cross-leg skew. The SAME shared
+    // policy the paper path uses is enforced here, from the CURRENT books, before any exposure.
+    //
+    // Receive-time is the always-available cross-sectional bound (Dhan carries no book exchange
+    // timestamp; Kite's is 1s-granular). Exchange-time dispersion is layered on only when every
+    // leg carries a real one. Receive-time coherence proves the four packets ARRIVED together, not
+    // that the exchange PUBLISHED them together — see executionCoherence.ts.
+    const admission = this.evaluateEntryCoherence(args.candidate, submittedAt);
+    if (!admission.admit) {
+      const rejected = liveEntryFailure(
+        args.candidate,
+        args.detection.at,
+        submittedAt,
+        [],
+        "cross_leg_time_skew",
+        `four-leg coherence refused entry [${admission.reason}]: ${admission.detail}`,
+        this.deps.cfg,
+        tradeId,
+      );
+      rejected.legging.temporal = admission.temporal;
+      rejected.legging.outcome_class = "REFUSED_BEFORE_SUBMIT";
+      return rejected;
+    }
+
     // ── MAXIMUM ₹ PER BOX: the authoritative pre-trade gate ────────────────────────────────
     //
     // Evaluated HERE, from the four IMMUTABLE bounded LIMIT requests that would be
@@ -282,6 +317,29 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     // real time. Still nothing has been transmitted, so this remains a free refusal.
     const wantedAtEnqueue = this.entryGuardRefusal(args.stillWanted, "pre_enqueue");
     if (wantedAtEnqueue) return this.refusedBeforeSubmit(args, submittedAt, tradeId, wantedAtEnqueue);
+
+    // ── COHERENCE RE-CHECK against CURRENT evidence, immediately before transmit ────────────
+    //
+    // A book coherent at admission can be stale by the time the legs transmit — building four
+    // requests, the depth precheck and the capital evaluation all took real time. Re-run the SAME
+    // decision on the CURRENT books, plus a duplicate/stall guard, so a box that deteriorated
+    // between admission and send is refused before any exposure rather than after leg 4.
+    const recheck = this.recheckEntryCoherence(args.candidate, this.now());
+    if (!recheck.admit) {
+      const rejected = liveEntryFailure(
+        args.candidate,
+        args.detection.at,
+        submittedAt,
+        [],
+        "cross_leg_time_skew",
+        `four-leg coherence deteriorated before transmit [${recheck.reason}]: ${recheck.detail}`,
+        this.deps.cfg,
+        tradeId,
+      );
+      rejected.legging.temporal = recheck.temporal;
+      rejected.legging.outcome_class = "REFUSED_BEFORE_SUBMIT";
+      return rejected;
+    }
 
     // The guard travels WITH each leg, alongside its hedge-first rank, so the manager can
     // re-evaluate it at dequeue, after durable persistence, and at the final pre-POST boundary.
@@ -976,6 +1034,53 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
       ...boxCapitalSummary(this.lastCapitalReport),
       limit_source: this.mode === "live" ? "live" : "paper",
     };
+  }
+
+  /**
+   * Observe the four legs' CURRENT books as coherence evidence.
+   *
+   * The socket generation is captured per leg (a cold/unwarm token is treated as belonging to no
+   * current generation, so the gate fails it closed) so a reconnect between legs is caught as a
+   * generation split rather than silently trading books from two different epochs. Movement between
+   * admission and re-check is detected by the store advancing `version`; the reference is the
+   * current version at capture time, so a duplicate-echoed packet leaves both equal.
+   */
+  private coherenceObservations(candidate: BoxCandidate): CoherenceLegObservation[] {
+    const generation = this.deps.feedGeneration?.() ?? null;
+    return BOX_LEG_ROLES.map((role) => {
+      const token = candidate.legs[role].token;
+      const quote = this.deps.quotes.get(token);
+      const warm = this.deps.isTokenWarm ? this.deps.isTokenWarm(token) : true;
+      return {
+        role,
+        received_at: quote ? quote.at : null,
+        exchange_at: quote ? quote.exchange_at : null,
+        current_version: quote ? quote.version : null,
+        reference_version: quote ? quote.version : null,
+        generation: warm ? generation : null,
+        has_depth: quote ? quote.bids.length > 0 && quote.asks.length > 0 : false,
+      } satisfies CoherenceLegObservation;
+    });
+  }
+
+  /** The LIVE coherence admission decision for a candidate's current four books. */
+  private evaluateEntryCoherence(candidate: BoxCandidate, now: number): CoherenceDecision {
+    return evaluateBookCoherence(
+      this.coherenceObservations(candidate),
+      livePolicyFromConfig(this.deps.cfg),
+      now,
+      { currentGeneration: this.deps.feedGeneration?.() ?? null },
+    );
+  }
+
+  /** The LIVE coherence RE-CHECK decision (admission + duplicate/stall guard). */
+  private recheckEntryCoherence(candidate: BoxCandidate, now: number): CoherenceDecision {
+    return recheckBookCoherence(
+      this.coherenceObservations(candidate),
+      livePolicyFromConfig(this.deps.cfg),
+      now,
+      { currentGeneration: this.deps.feedGeneration?.() ?? null },
+    );
   }
 
   private precheck(requests: BrokerOrderRequest[]): Map<string, CheckedFeedStamp> {
