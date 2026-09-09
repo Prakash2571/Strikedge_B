@@ -21,6 +21,11 @@ import {
   type LiveEntryGuardStage,
 } from "./liveEntryGuard.js";
 import {
+  HedgeCoverageLedger,
+  type HedgeOutcomeEvidence,
+  type HedgeRequirement,
+} from "./hedgeCoverageLedger.js";
+import {
   admitBoxOperation,
   BOX_ORDER_PRIORITY,
   type BoxSchedulingOccupancy,
@@ -135,8 +140,30 @@ interface EntryTransportGate {
   readonly decided: Map<number, "posted" | "no_post">;
   /** Waiters parked until every BUY hedge rank has decided. */
   waiters: Array<{ readonly rank: number; readonly wake: () => void }>;
-  /** Set when a BUY hedge leg fails definitively; dependent SELL legs then refuse before POST. */
+  /**
+   * DEFECT-CLOSING NOTE — this field is now a DIAGNOSTIC ONLY.
+   *
+   * It records the first NAMED hedge failure for readable status/audit. It is NOT the thing a
+   * dependent SELL consults for permission any more, precisely because a NAMED failure and a
+   * PROVEN COVERAGE are not complements: a hedge could come back CANCELLED with zero fills — a
+   * total absence of coverage — without being named a failure here, and the old code then POSTed
+   * the naked SELL. Permission is now taken from {@link coverage} below, which requires positive,
+   * attributed proof of fill. See hedgeCoverageLedger.ts.
+   */
   hedgeFailure: string | null;
+  /**
+   * Attributed, single-use, attempt-scoped proof of hedge fill. The AUTHORITATIVE basis for
+   * authorising a dependent uncovered SELL: a SELL may POST only when every BUY hedge of the
+   * attempt is PROVEN here to have filled its full required quantity on the right contract, side
+   * and account. Absent/insufficient proof fails closed.
+   */
+  readonly coverage: HedgeCoverageLedger;
+  /**
+   * The identity every BUY hedge of this attempt must prove, keyed by transport rank. Populated as
+   * each hedge leg is submitted (it declares its own contract/side/quantity), and read by each
+   * dependent SELL to build its coverage requirement set. Ranks `[0, hedgeCount)` are hedges.
+   */
+  readonly hedgeRequirements: Map<number, HedgeRequirement>;
   /** How many BUY hedge legs this attempt has; ranks `[0, hedgeCount)` are the hedges. */
   hedgeCount: number;
 }
@@ -776,10 +803,10 @@ export class BoxOrderManager {
     const entryGuard = request.purpose === "ENTRY" ? entry : undefined;
     // Registered BEFORE any early return below, so that every rejection path from here on can
     // release this rank and cannot strand a higher-ranked sibling waiting on it.
-    if (entryGuard) this.ensureEntryTransportGate(request.attempt_id, entryGuard);
+    if (entryGuard) this.ensureEntryTransportGate(request.attempt_id, entryGuard, request);
     const releaseOnReject = (error: Error): Promise<BrokerOrder> => {
       if (entryGuard) {
-        this.decideEntryTransportRank(request, entryGuard, "no_post", error.message);
+        this.decideEntryTransportRank(request, entryGuard, "no_post", error.message, null);
       }
       return Promise.reject(error);
     };
@@ -1241,12 +1268,67 @@ export class BoxOrderManager {
       // pre-empt that check's own distinct error; the later stages assert it fully.
       entryAdmissible: stage === "pre_enqueue" ? true : this.canEnter(request),
       attemptAborted: null,
-      hedgeFailure: guard.hedge ? null : gate?.hedgeFailure ?? null,
+      // COVERAGE PERMISSION. A hedge leg depends on no coverage, so it passes `null`. A dependent
+      // uncovered SELL must PROVE its hedges: `null` here is a positive verdict from the ledger
+      // that every BUY hedge of this attempt filled its full required quantity on the right
+      // contract/side/account; any non-null value is the specific reason coverage is unproven and
+      // BLOCKS the SELL. This inverts the old "no named failure ⇒ permitted" behaviour that let a
+      // CANCELLED/zero-fill hedge authorise a naked SELL.
+      hedgeCoverageGap: guard.hedge ? null : this.entryHedgeCoverageGap(request, gate, stage),
     });
     if (!decision.allowed) {
       this.entryGuardRefusals.set(stage, (this.entryGuardRefusals.get(stage) ?? 0) + 1);
     }
     return decision;
+  }
+
+  /**
+   * The coverage gap a dependent uncovered SELL must clear before it may POST, or null when every
+   * BUY hedge of the attempt is PROVEN to cover it.
+   *
+   * FAIL CLOSED at every uncertain edge:
+   *   • No gate at all ⇒ no proof of any hedge ⇒ blocked.
+   *   • Fewer registered hedge requirements than the attempt's `hedgeCount` ⇒ a hedge has not even
+   *     declared its identity yet, so its coverage cannot be proven ⇒ blocked.
+   *   • Otherwise the ledger is asked for POSITIVE proof of full fill on every hedge; the first
+   *     unproven hedge's reason is returned.
+   *
+   * This is the exact inversion the defect requires: permission needs proof, not the mere absence
+   * of a named failure.
+   */
+  private entryHedgeCoverageGap(
+    request: BrokerOrderRequest,
+    gate: EntryTransportGate | undefined,
+    stage: LiveEntryGuardStage,
+  ): string | null {
+    // TIMING — coverage is only knowable AFTER the hedge-first barrier. A dependent SELL passes
+    // through pre_build/pre_enqueue/dequeue/post_persist BEFORE it parks on the barrier
+    // ({@link awaitEntryTransportTurn}); at those points its hedges have not yet decided and
+    // coverage is legitimately unproven. Enforcing there would refuse every SELL before it ever
+    // waited for its hedges. The barrier guarantees that by the time `pre_post` runs — the final
+    // boundary, immediately before the HTTP POST — every BUY hedge rank HAS decided, so this is the
+    // one and only checkpoint at which a proven-coverage verdict is both meaningful and safe. The
+    // earlier stages still enforce ownership, arm, breaker and admission exactly as before.
+    if (stage !== "pre_post") return null;
+    if (!gate) {
+      return `no transport gate for attempt ${request.attempt_id}; hedge coverage is unprovable`;
+    }
+    const hedgeCount = gate.hedgeCount;
+    const requirements: HedgeRequirement[] = [];
+    for (let rank = 0; rank < hedgeCount; rank++) {
+      const req = gate.hedgeRequirements.get(rank);
+      if (!req) {
+        return `hedge rank ${rank} has not declared its identity for attempt ${request.attempt_id}; coverage is unprovable`;
+      }
+      requirements.push(req);
+    }
+    // Single-use, attempt-scoped attribution: claim the coverage set for THIS dependent. The claim
+    // only succeeds when the set is fully covered, and prevents one hedge fill from being reused to
+    // back an incompatible dependent under a future multi-lot profile.
+    if (!gate.coverage.claimCoverage(request.role, requirements)) {
+      return gate.coverage.coverageGapFor(requirements) ?? "hedge coverage could not be claimed";
+    }
+    return null;
   }
 
   /** {@link evaluateEntryGuard} as a reason string, matching the `*BlockReason` convention. */
@@ -1274,6 +1356,7 @@ export class BoxOrderManager {
   private ensureEntryTransportGate(
     attemptId: string,
     guard: LiveEntryTransportGuard,
+    request: BrokerOrderRequest,
   ): EntryTransportGate {
     let gate = this.entryTransportGates.get(attemptId);
     if (!gate) {
@@ -1282,6 +1365,8 @@ export class BoxOrderManager {
         decided: new Map(),
         waiters: [],
         hedgeFailure: null,
+        coverage: new HedgeCoverageLedger(attemptId),
+        hedgeRequirements: new Map(),
         hedgeCount: guard.hedgeCount,
       };
       this.entryTransportGates.set(attemptId, gate);
@@ -1290,7 +1375,34 @@ export class BoxOrderManager {
     // Every leg of one attempt reports the same count; take the largest seen so a mis-supplied
     // smaller value can never shrink the set of hedges a SELL must wait for.
     gate.hedgeCount = Math.max(gate.hedgeCount, guard.hedgeCount);
+    // A BUY hedge DECLARES the exact coverage a dependent SELL must later prove: this contract,
+    // this side, this account, this full quantity. Recorded at registration (before the POST) so
+    // the requirement exists independently of, and cannot be forged by, the outcome. A dependent
+    // SELL that finds no requirement for a hedge rank therefore fails closed.
+    if (guard.hedge) {
+      gate.hedgeRequirements.set(guard.transportRank, {
+        attempt_id: attemptId,
+        role: request.role,
+        token: request.token,
+        tradingsymbol: request.tradingsymbol,
+        side: request.side,
+        broker_account: this.brokerAccountKey(),
+        required_quantity: request.quantity,
+      });
+    }
     return gate;
+  }
+
+  /**
+   * A stable key for the broker/account the manager posts through.
+   *
+   * The adapter interface (owned by another agent) exposes only `mode`, so this is derived from it
+   * and is identical for the hedge and its dependent SELL within one manager — which is the
+   * property the account-mismatch check needs. A first-class per-account id would let a future
+   * multi-account deployment distinguish two live accounts; that is recorded in HANDOFF-hedge.md.
+   */
+  private brokerAccountKey(): string {
+    return `broker:${this.deps.adapter.mode}`;
   }
 
   /**
@@ -1309,6 +1421,7 @@ export class BoxOrderManager {
     guard: LiveEntryTransportGuard,
     outcome: "posted" | "no_post",
     reason?: string,
+    terminalOrder?: BrokerOrder | null,
   ): void {
     const gate = this.entryTransportGates.get(request.attempt_id);
     if (!gate) return;
@@ -1322,12 +1435,94 @@ export class BoxOrderManager {
       const how = outcome === "no_post" ? "did not reach the broker" : "failed at the broker";
       gate.hedgeFailure = `${request.role} (${request.side}) ${how}: ${reason}`;
     }
+    // COVERAGE EVIDENCE — the authoritative, attributed record a dependent SELL is authorised from.
+    //
+    // Recorded for a BUY hedge only, since only a hedge can COVER anything. The evidence is the
+    // broker's OWN terminal snapshot (`terminalOrder`) and its cumulative filled quantity, NOT our
+    // failure classification. This is the whole fix: a hedge that returns CANCELLED with zero
+    // fills, OPEN, or partially filled below size now records a terminal-but-insufficient (or
+    // non-terminal) evidence, so the ledger proves NO coverage and the dependent SELL fails closed.
+    // A no-POST or an unproven/ambiguous outcome carries no snapshot and records `null` fill, which
+    // the ledger also reads as zero proven coverage. NEVER guess a fill in the permissive direction.
+    if (guard.hedge) {
+      gate.coverage.record(this.hedgeEvidenceFrom(request, outcome, terminalOrder ?? null, reason));
+    }
     this.wakeEntryTransportWaiters(gate);
     // Drop the gate only once EVERY REGISTERED rank has decided. A woken-but-not-yet-decided leg is
-    // still counted, which is what keeps `hedgeFailure` readable at its own pre-POST checkpoint.
+    // still counted, which is what keeps coverage readable at its own pre-POST checkpoint.
     if (gate.waiters.length === 0 && this.entryAllRanksDecided(gate)) {
       this.entryTransportGates.delete(request.attempt_id);
     }
+  }
+
+  /**
+   * Translate a decided hedge leg into attributed coverage evidence.
+   *
+   * The `confirmed_fill_quantity` is populated ONLY from a broker snapshot that is TERMINAL by the
+   * broker's own state machine ({@link isBrokerOrderTerminal}). While an order can still fill, its
+   * quantity is not proof — recording it as coverage would be a guess, and its shortfall is not yet
+   * a final failure either. A missing snapshot (a proven local no-POST, an ambiguous submit, an
+   * uncertain state) yields `terminal: true, confirmed_fill_quantity: null` when we KNOW no POST
+   * happened, and `terminal: false` otherwise, so the ledger fails closed in every case.
+   */
+  private hedgeEvidenceFrom(
+    request: BrokerOrderRequest,
+    outcome: "posted" | "no_post",
+    order: BrokerOrder | null,
+    reason: string | undefined,
+  ): HedgeOutcomeEvidence {
+    const base = {
+      attempt_id: request.attempt_id,
+      role: request.role,
+      broker_account: this.brokerAccountKey(),
+      requested_quantity: request.quantity,
+    } as const;
+    if (order && isBrokerOrderTerminal(order.state)) {
+      // The order can no longer change: its cumulative filled quantity is the proven coverage. The
+      // contract, side and quantity are taken from the BROKER'S OWN SNAPSHOT, not from our request,
+      // so a fill the broker reports on a DIFFERENT contract or side than the one we intended is
+      // caught by the ledger's attribution checks and covers nothing. Trusting the request here
+      // would let a mis-routed or mismatched fill masquerade as coverage.
+      return {
+        ...base,
+        token: order.token,
+        tradingsymbol: order.tradingsymbol,
+        side: order.side,
+        confirmed_fill_quantity: order.filled_quantity,
+        terminal: true,
+        detail: `broker terminal ${order.state} filled ${order.filled_quantity}/${order.quantity} on ${order.tradingsymbol}/${order.token}`,
+      };
+    }
+    if (outcome === "no_post") {
+      // Proven that nothing reached the broker: terminal with zero coverage. The dependent SELL is
+      // correctly and finally refused rather than left waiting. The intended contract is recorded
+      // for a readable attribution failure, but the null fill is what blocks the SELL.
+      return {
+        ...base,
+        token: request.token,
+        tradingsymbol: request.tradingsymbol,
+        side: request.side,
+        confirmed_fill_quantity: null,
+        terminal: true,
+        detail: reason ? `no broker POST: ${reason}` : "no broker POST",
+      };
+    }
+    // A POST happened but the snapshot is not terminal (OPEN, PARTIALLY_FILLED, UNKNOWN, or an
+    // ambiguous submit with no proven quantity). It can still change, so coverage is not counted
+    // and the shortfall is not a final failure. FAIL CLOSED: not_terminal blocks the SELL.
+    return {
+      ...base,
+      token: order?.token ?? request.token,
+      tradingsymbol: order?.tradingsymbol ?? request.tradingsymbol,
+      side: order?.side ?? request.side,
+      confirmed_fill_quantity: null,
+      terminal: false,
+      detail: reason
+        ? `hedge outcome not proven terminal: ${reason}`
+        : order
+          ? `hedge state ${order.state} is not a terminal proof of fill`
+          : "hedge outcome not proven terminal",
+    };
   }
 
   /** True when every rank that registered for this attempt has reached a decision. */
@@ -1440,6 +1635,12 @@ export class BoxOrderManager {
     const entryGuard = action.entry;
     let postBegan = false;
     let hedgeFailureReason: string | null = null;
+    // The terminal broker snapshot for THIS leg, if one exists, captured so the `finally` can hand
+    // it to the coverage ledger. A hedge's dependent SELL is authorised ONLY from proven fill, so
+    // the ledger needs the authoritative snapshot — not merely "did it fail". Null until a broker
+    // snapshot with a settled cumulative quantity is in hand; a no-POST or unproven outcome leaves
+    // it null, which the ledger reads as zero proven coverage. FAIL CLOSED.
+    let terminalOrder: BrokerOrder | null = null;
     try {
       intent = await this.deps.persistence.create(intent);
       const persistedRequest = requestFromIntent(intent);
@@ -1572,6 +1773,9 @@ export class BoxOrderManager {
           // A REJECTED hedge is a definitive hedge failure: the dependent uncovered SELL legs of
           // this attempt are still parked behind the barrier and must now refuse before POSTing.
           hedgeFailureReason = errorMessage(error);
+          // The reject snapshot is authoritative and terminal — it proves ZERO covering fill,
+          // which is exactly what the ledger must record so the dependent SELL fails closed.
+          terminalOrder = error.order;
           action.reject(error);
           return;
         }
@@ -1609,8 +1813,17 @@ export class BoxOrderManager {
         await this.persistOrder(intent, order, "adapter returned uncertain state; no retry");
         this.noteFailure("adapter returned uncertain order state");
         hedgeFailureReason = `broker state ${order.state} is not proof of a hedge`;
+        // UNKNOWN/RECONCILIATION_REQUIRED is not a terminal proven quantity. Deliberately leave
+        // `terminalOrder` null so the ledger records no coverage: an unprovable hedge must never
+        // authorise the naked SELL that depends on it.
       } else {
         await this.persistOrder(intent, order, "adapter order snapshot");
+        // AUTHORITATIVE SNAPSHOT for coverage. Whatever the state — COMPLETE, CANCELLED, OPEN,
+        // PARTIALLY_FILLED — this is the broker's own report of the leg, and the ledger decides
+        // coverage from its terminal-ness and filled quantity, NOT from whether we named it a
+        // failure. This is the crux of the fix: a CANCELLED/zero-fill hedge now yields zero proven
+        // coverage and blocks the dependent SELL, instead of silently authorising it.
+        terminalOrder = order;
         if (order.state === "REJECTED") {
           this.rejects++;
           this.noteBrokerReject(order, order.reject_reason ?? "broker rejected order");
@@ -1637,6 +1850,7 @@ export class BoxOrderManager {
           entryGuard,
           postBegan ? "posted" : "no_post",
           hedgeFailureReason ?? undefined,
+          terminalOrder,
         );
       }
     }

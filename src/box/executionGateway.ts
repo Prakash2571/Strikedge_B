@@ -422,7 +422,10 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
       circuitClosed: true,
       entryAdmissible: true,
       attemptAborted: null,
-      hedgeFailure: null,
+      // pre_build/pre_enqueue run before any hedge leg exists, so coverage is not applicable here
+      // and is asserted only at the manager's post-barrier pre_post checkpoint. Passing `null`
+      // means "no coverage objection at this stage", NOT "coverage is proven".
+      hedgeCoverageGap: null,
     });
     return decision.allowed ? null : decision.reason;
   }
