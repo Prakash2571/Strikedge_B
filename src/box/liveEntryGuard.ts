@@ -18,6 +18,15 @@
  * input is treated as false by the callers, because an unprovable entry permission is not an
  * entry permission.
  *
+ * COVERAGE IS THE SECOND DEFECT THIS CLOSES. A dependent uncovered SELL used to be authorised
+ * whenever no BUY hedge was NAMED as failed (`hedgeFailure === null`). That is a failure signal,
+ * not a coverage signal: a hedge that returned CANCELLED with zero fills, or OPEN, or partially
+ * filled below its required size, or in any terminal state the classifier had not enumerated, left
+ * `hedgeFailure === null` and the naked SELL was transmitted. The guard now consumes a POSITIVE
+ * coverage verdict (`hedgeCoverageGap === null` means "every hedge is PROVEN to cover this SELL"),
+ * so the default — no proof — refuses. See hedgeCoverageLedger.ts for the attributed, single-use,
+ * attempt-scoped evidence that produces that verdict.
+ *
  * SCOPE — ENTRY ONLY. This guard must never be consulted for an EXIT, a PROTECTIVE_CANCEL or an
  * EMERGENCY_RESIDUAL. Those reduce exposure that is already owned, and none of the conditions
  * below is a reason to leave real risk on the book. The callers enforce that by checking
@@ -49,7 +58,17 @@ export type LiveEntryGuardRefusal =
   | "circuit_open"
   | "entry_not_admissible"
   | "attempt_aborted"
-  | "hedge_leg_failed";
+  /**
+   * A dependent uncovered SELL was refused because its BUY hedges are NOT PROVEN to cover it.
+   *
+   * This is the INVERSION of the old `hedge_leg_failed` code. The old code fired only on a
+   * NAMED hedge failure (a broker rejection, an ambiguous submit); it stayed silent for a hedge
+   * that came back CANCELLED with zero fills, OPEN, partially filled below size, or in any
+   * terminal state the classifier had not enumerated — and the naked SELL was then authorised.
+   * The new code fires whenever coverage is not POSITIVELY PROVEN, so absent/stale/insufficient
+   * evidence blocks the SELL by default. See hedgeCoverageLedger.ts.
+   */
+  | "hedge_coverage_unproven";
 
 export interface LiveEntryGuardInputs {
   readonly stage: LiveEntryGuardStage;
@@ -73,8 +92,23 @@ export interface LiveEntryGuardInputs {
   readonly entryAdmissible: boolean;
   /** An attempt-level abort raised by a sibling leg, or null. */
   readonly attemptAborted: string | null;
-  /** A definitive failure of a BUY hedge this leg depends on, or null. */
-  readonly hedgeFailure: string | null;
+  /**
+   * COVERAGE PERMISSION for a dependent uncovered SELL.
+   *
+   * `null` is a POSITIVE ASSERTION that every BUY hedge this SELL depends on has PROVEN, ATTRIBUTED
+   * coverage of its full required quantity (see hedgeCoverageLedger.ts). A non-null value is the
+   * specific reason coverage could not be proven — no evidence yet, a non-terminal order, a
+   * zero/partial fill, a contract/side/account/attempt mismatch — and it BLOCKS the SELL.
+   *
+   * This inverts the previous `hedgeFailure` semantics. It was "null unless a hedge was named as
+   * failed", which authorised a naked SELL whenever a hedge failed in an UNNAMED way (CANCELLED
+   * zero-fill, etc.). This is "null ONLY WHEN coverage is proven", so unprovable coverage — the
+   * default — fails closed.
+   *
+   * Hedge legs themselves do not depend on coverage, so their callers pass `null` here; only the
+   * uncovered SELL legs supply a real coverage verdict.
+   */
+  readonly hedgeCoverageGap: string | null;
 }
 
 export type LiveEntryGuardDecision =
@@ -109,10 +143,10 @@ export function evaluateLiveEntryGuard(inputs: LiveEntryGuardInputs): LiveEntryG
   if (inputs.attemptAborted !== null) {
     return refuse("attempt_aborted", `the entry attempt was aborted by a sibling leg ${at}: ${inputs.attemptAborted}`);
   }
-  if (inputs.hedgeFailure !== null) {
+  if (inputs.hedgeCoverageGap !== null) {
     return refuse(
-      "hedge_leg_failed",
-      `a BUY hedge leg this order depends on failed ${at}: ${inputs.hedgeFailure}`,
+      "hedge_coverage_unproven",
+      `a dependent SELL was refused ${at} because its BUY hedge coverage is not proven: ${inputs.hedgeCoverageGap}`,
     );
   }
   if (!inputs.entryAdmissible) {

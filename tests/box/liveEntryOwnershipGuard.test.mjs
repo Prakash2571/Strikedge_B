@@ -35,7 +35,7 @@ const allow = {
   circuitClosed: true,
   entryAdmissible: true,
   attemptAborted: null,
-  hedgeFailure: null,
+  hedgeCoverageGap: null,
 };
 
 /* ── the pure decision ────────────────────────────────────────────────────────────────── */
@@ -51,7 +51,11 @@ test("each condition refuses with its own distinct cause", () => {
     [{ entryEnabled: false }, "entry_disarmed"],
     [{ circuitClosed: false }, "circuit_open"],
     [{ attemptAborted: "sibling k1_ce rejected" }, "attempt_aborted"],
-    [{ hedgeFailure: "k2_ce BUY rejected" }, "hedge_leg_failed"],
+    // INVERSION: a dependent SELL is refused when its hedge coverage is NOT PROVEN, not merely when
+    // a hedge was named as failed. A non-null coverage gap is the specific unprovable-coverage
+    // reason (here: a hedge that came back CANCELLED with zero fills — the exact case the old
+    // failure-signal contract let through as a naked SELL).
+    [{ hedgeCoverageGap: "hedge k2_ce not proven covered: confirmed 0 of required 75" }, "hedge_coverage_unproven"],
     [{ entryAdmissible: false }, "entry_not_admissible"],
   ];
   for (const [override, refusal] of cases) {

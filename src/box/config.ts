@@ -576,6 +576,32 @@ export interface BoxConfig {
    * timestamp the check is skipped and the existing receive-time logic stands.
    */
   maxCrossLegExchangeDispersionMs: number;
+  /**
+   * Maximum cross-leg RECEIVE-TIME dispersion (ms) enforced as a LIVE admission
+   * constraint by the shared coherence policy (executionCoherence.ts). Receive-time
+   * is the always-available cross-sectional bound: Dhan supplies no order-book
+   * exchange timestamp at all, and Kite's is 1-second-granular, so this is the
+   * primary gate in live. Distinct from the exchange-dispersion knob so a live
+   * operator can bound arrival spread even when no usable exchange timestamp exists.
+   */
+  maxCrossLegReceiveDispersionMs: number;
+  /**
+   * Maximum plausible (received_at − exchange_at) in ms. A book received BEFORE its
+   * exchange stamp (future skew) or lagging it absurdly is a clock/feed fault, never
+   * coherence evidence. Generous because exchange stamps are coarse (Kite = 1s).
+   */
+  maxReceiveToExchangeDelayMs: number;
+  /**
+   * How LIVE reads a cross-leg dispersion limit of 0.
+   *
+   * false (default): in LIVE a 0 receive-dispersion limit is IMPOSSIBLE-TO-SATISFY,
+   *   not a silent bypass — an unconfigured operator can never accidentally get "no
+   *   cross-leg coherence enforcement" from a 0.
+   * true: 0 explicitly DISABLES the receive-dispersion constraint in live (the
+   *   operator has knowingly opted out; per-leg age and exchange checks still apply).
+   * Paper ALWAYS reads 0 as "disabled" regardless of this flag.
+   */
+  coherenceZeroDispersionDisablesInLive: boolean;
 
   // ---- Entry qualification ----
   /**
@@ -1078,6 +1104,17 @@ export function loadBoxConfig(): BoxConfig {
     // Four-leg exchange-timestamp coherence. 250ms is generous for a genuine
     // cross-sectional snapshot yet rejects legs that are visibly out of step.
     maxCrossLegExchangeDispersionMs: clampInt("BOX_MAX_CROSS_LEG_EXCHANGE_DISPERSION_MS", 250, 0, 60_000),
+    // Four-leg RECEIVE-TIME coherence — the ALWAYS-available cross-sectional bound
+    // (Dhan has no book exchange stamp; Kite's is 1s-granular). 500ms comfortably
+    // admits a genuine simultaneous snapshot delivered over one socket yet rejects
+    // legs whose arrival is visibly out of step. This is the primary LIVE gate.
+    maxCrossLegReceiveDispersionMs: clampInt("BOX_MAX_CROSS_LEG_RECEIVE_DISPERSION_MS", 500, 0, 60_000),
+    // A book cannot be received before the exchange published it; 5s tolerates
+    // coarse (1s) exchange stamps and normal feed latency without flagging a fault.
+    maxReceiveToExchangeDelayMs: clampInt("BOX_MAX_RECEIVE_TO_EXCHANGE_DELAY_MS", 5_000, 0, 120_000),
+    // In LIVE, a 0 cross-leg dispersion limit is impossible-to-satisfy (safe) unless
+    // the operator explicitly opts out here. Paper always reads 0 as "disabled".
+    coherenceZeroDispersionDisablesInLive: bool("BOX_COHERENCE_ZERO_DISPERSION_DISABLES_IN_LIVE", false),
 
     // THE gate: ₹1,200 of expected net profit after every cost.
     minExpectedNetProfit: num("BOX_MIN_EXPECTED_NET_PROFIT", 1200),
@@ -1221,5 +1258,8 @@ export function configSnapshot(cfg: BoxConfig): BoxScannerConfigSnapshot {
     queue_model: cfg.queueModel,
     queue_liquidity_haircut_pct: cfg.queueLiquidityHaircutPct,
     max_cross_leg_exchange_dispersion_ms: cfg.maxCrossLegExchangeDispersionMs,
+    max_cross_leg_receive_dispersion_ms: cfg.maxCrossLegReceiveDispersionMs,
+    max_receive_to_exchange_delay_ms: cfg.maxReceiveToExchangeDelayMs,
+    coherence_zero_dispersion_disables_in_live: cfg.coherenceZeroDispersionDisablesInLive,
   };
 }

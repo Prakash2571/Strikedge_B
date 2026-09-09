@@ -1513,6 +1513,9 @@ export interface BoxScannerConfigSnapshot {
   queue_model?: BoxQueueModel;
   queue_liquidity_haircut_pct?: number;
   max_cross_leg_exchange_dispersion_ms?: number;
+  max_cross_leg_receive_dispersion_ms?: number;
+  max_receive_to_exchange_delay_ms?: number;
+  coherence_zero_dispersion_disables_in_live?: boolean;
 }
 
 /** A persisted Box strategy trade (paper or explicitly gated live). */

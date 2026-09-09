@@ -70,6 +70,11 @@ import {
   temporalCoherence,
 } from "./math.js";
 import { touchPrice, walkDepth } from "./orderPricing.js";
+import {
+  evaluateBookCoherence,
+  paperPolicyFromConfig,
+  type CoherenceLegObservation,
+} from "./executionCoherence.js";
 import { outstandingRoles, type BoxOpenPosition } from "./positions.js";
 import { singleLotCandidateViolation } from "./singleLotInvariant.js";
 import type { BoxQuoteStore } from "./quotes.js";
@@ -698,24 +703,30 @@ export class BoxExecutionSimulator {
       const tokens = BOX_LEG_ROLES.map((role) => candidate.legs[role].token);
 
       // FOUR-LEG TEMPORAL COHERENCE. Measured on the books we are about to trade,
-      // BEFORE committing. When all four legs carry a valid exchange timestamp and
-      // their exchange-time dispersion exceeds the threshold, they are not a
-      // coherent cross-sectional snapshot, so the candidate is not auto-entered.
-      // When any leg lacks an exchange timestamp the check is skipped and the
-      // existing receive-time freshness logic stands.
+      // BEFORE committing. This now delegates to the ONE shared coherence policy
+      // (executionCoherence.ts) that the LIVE gateway also enforces, so paper and
+      // live cannot drift. Paper reads the PAPER policy: a 0 dispersion limit
+      // DISABLES the cross-leg gate (the historical paper behaviour), whereas live
+      // reads 0 as impossible-to-satisfy unless the operator opts out. The measured
+      // `temporal` figures are still surfaced on the record for the trade audit.
+      //
+      // Exchange-time dispersion is applied only when EVERY leg carries a real
+      // exchange timestamp; when any leg lacks one the receive-time constraint
+      // stands. Receive-time coherence proves arrival spread, NOT that the exchange
+      // published the four books simultaneously — see executionCoherence.ts.
       const temporal = this.temporalFor(candidate, detByRole, this.now());
-      const maxDispersion = this.policy.maxCrossLegExchangeDispersionMs;
-      if (
-        maxDispersion > 0 &&
-        temporal.exchange_dispersion_ms !== null &&
-        temporal.exchange_dispersion_ms > maxDispersion
-      ) {
-        const rec: PaperLeggingExecutionRecord = { ...baseRecord(), temporal };
+      const coherence = evaluateBookCoherence(
+        this.coherenceObservations(candidate, detByRole),
+        paperPolicyFromConfig(this.deps.cfg),
+        this.now(),
+      );
+      if (!coherence.admit) {
+        const rec: PaperLeggingExecutionRecord = { ...baseRecord(), temporal: coherence.temporal };
         this.deps.metrics?.recordCrossLegSkewReject();
         return this.leggingRefuse(
           rec,
           "cross_leg_time_skew",
-          `exchange-timestamp dispersion ${temporal.exchange_dispersion_ms}ms exceeds ${maxDispersion}ms`,
+          `four-leg coherence refused entry [${coherence.reason}]: ${coherence.detail}`,
         );
       }
 
@@ -1459,6 +1470,33 @@ export class BoxExecutionSimulator {
       }),
       now,
     );
+  }
+
+  /**
+   * The four legs' CURRENT books as coherence evidence for the shared policy.
+   *
+   * `reference_version` is the DETECTION version, so the shared decision can see whether a book
+   * moved since detection. The paper store carries no socket generation, so `generation` is null
+   * (a single-generation run) and the caller passes no `currentGeneration`; the generation-split
+   * and stale-generation checks are then inert, which is correct for the deterministic simulator.
+   */
+  private coherenceObservations(
+    candidate: BoxCandidate,
+    detByRole: Map<BoxLegRole, BoxLegEvaluation>,
+  ): CoherenceLegObservation[] {
+    return BOX_LEG_ROLES.map((role) => {
+      const q = this.deps.quotes.get(candidate.legs[role].token);
+      const det = detByRole.get(role);
+      return {
+        role,
+        received_at: q?.at ?? null,
+        exchange_at: q?.exchange_at ?? null,
+        current_version: q?.version ?? null,
+        reference_version: det?.quote_version ?? null,
+        generation: null,
+        has_depth: q ? q.bids.length > 0 && q.asks.length > 0 : false,
+      } satisfies CoherenceLegObservation;
+    });
   }
 
   /**

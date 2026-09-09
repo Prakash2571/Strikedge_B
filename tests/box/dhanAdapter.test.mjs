@@ -239,7 +239,11 @@ const REQUEST = {
 function adapter(clientOverrides = {}, cfgOverrides = {}) {
   const calls = { place: 0, byCorrelation: 0, get: 0, cancel: 0, modify: 0 };
   const client = {
-    placeOrder: async () => {
+    placeOrder: async (_req, opts) => {
+      // Faithful to the REAL send boundary: DhanHttp.request invokes beforeSend synchronously
+      // just before the wire, so the fake fires it before "sending" too. A thrown refusal here
+      // must prevent the (simulated) POST, matching production.
+      opts?.beforeSend?.();
       calls.place++;
       throw new DhanNetworkError("timed out");
     },
