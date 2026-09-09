@@ -120,6 +120,10 @@ import { BoxPositionBook, deriveBoxPositionState, fullLotByRole, isBoxPositionFl
 import { exactEntryFillViolation, singleLotCandidateViolation, singleLotPositionViolation } from "./singleLotInvariant.js";
 import { BoxPositionMonitor } from "./positionMonitor.js";
 import { BoxQuoteStore, SpotStore } from "./quotes.js";
+import { orderStreamStatus } from "./orderStreamStatus.js";
+import type { OrderStreamHealth } from "./orderUpdateProjection.js";
+import { zerodhaOrderStreamEnabledFromEnv } from "../brokers/zerodha/orderUpdates.js";
+import { dhanOrderStreamEnabledFromEnv } from "../brokers/dhan/orderFeed.js";
 import { ensureBoxPersistenceReady } from "./repository.js";
 import {
   appendBoxEvent,
@@ -430,6 +434,16 @@ export class BoxEngine {
   private running = false;
   private started = false;
   private startedAt: number | null = null;
+  /**
+   * Order-stream health per broker, keyed by whatever component is CONSUMING that broker's
+   * order-update stream.
+   *
+   * Empty means no consumer exists, which `orderStreamStatus` reports as `not_wired` /
+   * `rest_polling_only`. It is deliberately a plain empty map rather than an optional
+   * dependency with a default-healthy fallback: the absence of a consumer must surface as an
+   * honest operational state, never as silence that reads like health.
+   */
+  private readonly orderStreamConsumers = new Map<BrokerId, OrderStreamHealth>();
   private stoppedAt: number | null = null;
   private lastError: string | null = null;
   private universeBuiltAt: number | null = null;
@@ -4845,6 +4859,23 @@ export class BoxEngine {
       broker_orders_api_healthy: live ? live.health.broker_orders_api === "healthy" : null,
       broker_positions_api_healthy: live ? live.health.broker_positions_api === "healthy" : null,
       market_data_healthy: this.isFeedHealthy(),
+      /**
+       * ORDER-UPDATE STREAM STATUS — deliberately adjacent to `market_data_healthy` because
+       * that adjacency is the point: a healthy market-data feed is NOT evidence that fills are
+       * observed promptly. Zerodha sends order updates as TEXT frames on the same socket that
+       * carries binary ticks; Dhan uses an entirely separate order-update WebSocket. So this is
+       * its own signal, and it names the mechanism currently responsible for seeing a fill.
+       */
+      order_stream: orderStreamStatus({
+        brokers: ["zerodha", "dhan"],
+        gateEnabled: (broker) =>
+          broker === "zerodha" ? zerodhaOrderStreamEnabledFromEnv() : dhanOrderStreamEnabledFromEnv(),
+        // No consumer is registered yet: the parsing/projection layer is implemented and
+        // unit-tested but nothing in the running engine consumes it, so every broker reports
+        // `not_wired` and `rest_polling_only`. Passing a populated map here is the ONLY thing
+        // that will flip that, which keeps the status honest by construction.
+        consumers: this.orderStreamConsumers,
+      }),
       database_healthy: isBoxDbEnabled() && (!live || live.health.persistence === "healthy"),
       daily_risk_seed_healthy: live ? live.health.daily_risk_seed === "healthy" : null,
       reconciliation_complete: live?.health.reconciliation_complete ?? true,
