@@ -66,6 +66,11 @@ import type { AccessSessionConfig } from "./access/sessionStore.js";
 
 import { registerRuntimeStatusRoutes, type RuntimeStatusSnapshot } from "./runtime/statusRoutes.js";
 import { registerBrokerRoutes, type SwitchResult } from "./brokerRoutes.js";
+import {
+  projectExportStatus,
+  projectBrokerSession,
+  projectBrokerHealth,
+} from "./runtime/projections.js";
 
 import { BrokerTokenAcquisitionService } from "./tokens/brokerTokenService.js";
 import { systemClock } from "./tokens/istClock.js";
@@ -86,6 +91,7 @@ import { getPool } from "./pg/pool.js";
 
 import { ShutdownCoordinator, shutdownExitCode } from "./shutdown.js";
 import { clearTrackedIntervals } from "./trackedTimers.js";
+import { ReadinessController } from "./runtime/readiness.js";
 
 /* ========================================================================== */
 /*  1. CONFIGURATION                                                          */
@@ -214,28 +220,71 @@ app.use(corsMiddleware(config));
 const requireOperator = createRequireOperator({ config });
 
 /**
- * Refuse MUTATING requests once shutdown has begun (step 3 of the shutdown order).
+ * THE SINGLE READINESS GATE.
  *
- * Reads remain answerable while the process drains, but a POST arriving during
- * teardown must not be able to start a new Box, arm a session or place an order.
+ * One process-wide state machine (`src/runtime/readiness.ts`) decides both what
+ * `/api/health` reports and whether a mutating request may proceed. It starts in
+ * `starting`, becomes `ready` only when `boot()` has fully completed (PostgreSQL up,
+ * migrations verified/applied, authoritative broker restored, Box durable state
+ * adopted and unresolved order reconciliation finished), and moves to `failed` or
+ * `shutting_down` otherwise.
  */
-let shuttingDown = false;
+const readiness = new ReadinessController();
+
+/**
+ * Refuse EVERY mutating request (POST/PUT/PATCH/DELETE) until the process is fully
+ * `ready`, and keep refusing once shutdown has begun.
+ *
+ * This is the SINGLE consolidated gate that replaces the old `shuttingDown`-only
+ * middleware. It is mounted BEFORE the access routes and the Box module (below) so
+ * no mutating route — /api/access/verify, /api/access/logout, the scanner controls,
+ * broker switching or session arming — can slip past it. A POST arriving while boot
+ * is still adopting positions must not be able to start a Box, arm a session or
+ * place an order; and a POST arriving during teardown must not either.
+ *
+ * Reads (GET/HEAD) remain answerable throughout so nginx health checks and status
+ * polls keep working while the process starts and drains.
+ */
 app.use((req: Request, res: Response, next) => {
-  const mutating = req.method === "POST" || req.method === "PUT" || req.method === "PATCH" || req.method === "DELETE";
-  if (shuttingDown && mutating) {
-    res.status(503).json({ error: "StrikeEdge is shutting down; mutating requests are refused." });
+  const mutating =
+    req.method === "POST" || req.method === "PUT" || req.method === "PATCH" || req.method === "DELETE";
+  if (mutating && !readiness.mutationsAllowed()) {
+    const state = readiness.getState();
+    const message =
+      state === "shutting_down"
+        ? "StrikeEdge is shutting down; mutating requests are refused."
+        : "StrikeEdge is not ready; mutating requests are refused until startup completes.";
+    res.status(503).json({ error: message });
     return;
   }
   next();
 });
 
 /**
- * The ONLY unauthenticated informational endpoint. Deliberately contentless beyond
- * liveness: a health check that reported broker or token state would be a public
- * readout of the trading system.
+ * The ONLY unauthenticated informational endpoint, and deliberately CONTENTLESS
+ * beyond liveness/readiness.
+ *
+ * It answers HTTP 503 with `ready:false` while `starting`, `failed` or
+ * `shutting_down`, and HTTP 200 with `ready:true` ONLY when `ready`. This is what
+ * makes the readiness signal HONEST: a load balancer or nginx health check now sees
+ * "not ready" during the exact window in which migrations, broker restoration, Box
+ * durable-state adoption and order reconciliation are still incomplete.
+ *
+ * A health check that reported broker, token, position, exposure or migration state
+ * would be a public readout of the trading system, so the body carries a coarse
+ * `state` string and the `service` name and NOTHING else. `shutting_down` is kept as
+ * a convenience boolean; it adds no operational detail beyond the `state` already
+ * present.
  */
 app.get("/api/health", (_req: Request, res: Response) => {
-  res.json({ ok: true, service: "strikedge", shutting_down: shuttingDown });
+  const state = readiness.getState();
+  const ready = readiness.isReady();
+  res.status(ready ? 200 : 503).json({
+    service: "strikedge",
+    state,
+    ready,
+    shutting_down: state === "shutting_down",
+  });
 });
 
 registerAccessRoutes(app, {
@@ -409,13 +458,26 @@ const tokenService = new BrokerTokenAcquisitionService({
         source_url: process.env.DHAN_TOKEN_URL ?? "",
       });
     },
+    /**
+     * Is there ALREADY a usable stored token for this IST day?
+     *
+     * NEITHER READ IS `.catch`-ed. Both used to be `.catch(() => null)`, which reported
+     * a PostgreSQL outage or a token-decryption misconfiguration as "no valid token" —
+     * so the service would go and fetch a REPLACEMENT credential from the token
+     * provider for a broker whose stored credential was in fact fine. The rejection now
+     * propagates to the acquisition service, which records the bounded reason in its
+     * per-broker status and retries on its existing schedule instead of acquiring.
+     *
+     * A confirmed-absent row still resolves `false` — that is the normal
+     * "no token yet today" answer and it must keep working.
+     */
     hasValidToken: async (broker, istDay) => {
       if (broker === "zerodha") {
-        const s = await loadKiteSession().catch(() => null);
+        const s = await loadKiteSession();
         // Zerodha tokens are day-scoped: yesterday's token is dead by definition.
         return s !== null && s.login_date === istDay;
       }
-      const s = await loadDhanSession().catch(() => null);
+      const s = await loadDhanSession();
       if (!s) return false;
       // Dhan honours an EXPLICIT expiry. A null expiry is UNKNOWN, not "valid
       // forever": it is accepted here and retired operationally by a 401.
@@ -499,19 +561,6 @@ const tokenService = new BrokerTokenAcquisitionService({
 
 let migrationState = { applied: 0, pending: 0 };
 
-/**
- * Reduce a broker account identity to something safe to display.
- *
- * A Zerodha user id or a Dhan client id is not a credential on its own, but paired
- * with a leaked token it is exactly what an attacker needs to know they have a usable
- * pair — and the dashboard only ever needs to answer "is this the account I expect?".
- * Keep the last four characters, mask the rest.
- */
-function redactIdentity(raw: string | null): string | null {
-  if (!raw) return null;
-  return raw.length <= 4 ? "•".repeat(raw.length) : `${"•".repeat(Math.min(raw.length - 4, 8))}${raw.slice(-4)}`;
-}
-
 registerRuntimeStatusRoutes(app, {
   requireOperator,
   runtime: {
@@ -561,20 +610,13 @@ registerRuntimeStatusRoutes(app, {
      * Re-projected from the outbox snapshot rather than passed through, because the
      * two modules deliberately do not share a type: `src/outbox/status.ts` names its
      * fields in the projector's terms, and the HTTP contract names them in the
-     * operator's. Mapping here keeps a rename on either side from silently changing
-     * the public shape.
+     * operator's. The mapping lives in `src/runtime/projections.ts` (projectExportStatus)
+     * so the contract test can exercise the SAME projection this endpoint uses,
+     * keeping a rename on either side from silently changing the public shape.
      */
     getExportStatus: async () => {
       const s = await getExportStatus(getPool(), mongoExportConfig.enabled);
-      return {
-        enabled: s.enabled,
-        connected: s.connected,
-        backlog_count: s.backlog,
-        oldest_pending_age_ms: s.oldestPendingAgeMs,
-        last_success_at: s.lastSuccessAt,
-        last_error: s.lastError,
-        dead_letter_count: s.deadLettered,
-      };
+      return projectExportStatus(s);
     },
   },
 });
@@ -584,36 +626,8 @@ registerBrokerRoutes(app, {
   manager: {
     activeBroker: () => brokerManager.activeBroker,
     generation: () => brokerManager.generation,
-    sessionFor: (broker) => {
-      const s = brokerManager.sessionFor(broker);
-      // Deliberately RE-PROJECTED rather than spread: `BrokerSessionState` is an
-      // internal shape and a future field on it must not silently become public.
-      // Nothing here can carry a token — the state object has never held one.
-      return {
-        broker,
-        connected: s.authenticated && !s.token_expired,
-        state: !s.authenticated
-          ? "waiting"
-          : s.token_expired
-            ? "expired"
-            : brokerManager.activeBroker === broker
-              ? "ready"
-              : "standby",
-        account_label: redactIdentity(s.client_id),
-        established_at: s.login_at === null ? null : new Date(s.login_at).toISOString(),
-        expires_at: s.token_expires_at === null ? null : new Date(s.token_expires_at).toISOString(),
-      };
-    },
-    healthFor: (broker) => {
-      const h = brokerManager.healthFor(broker);
-      return {
-        broker,
-        authenticated: h.authenticated,
-        data_ready: h.data_ready,
-        trading_ready: h.trading_ready,
-        problems: h.problems,
-      };
-    },
+    sessionFor: (broker) => projectBrokerSession(broker, brokerManager.sessionFor(broker), brokerManager.activeBroker),
+    healthFor: (broker) => projectBrokerHealth(broker, brokerManager.healthFor(broker)),
     switchBlockers: async (broker) => (await brokerManager.switchBlockers(broker)).map((b) => b.reason),
     selectBroker: async (broker, selectedBy): Promise<SwitchResult> => {
       const out = await brokerManager.switchBroker(broker, selectedBy);
@@ -632,21 +646,80 @@ app.use(errorHandler());
 /*  BOOT                                                                      */
 /* ========================================================================== */
 
+/**
+ * LISTEN-WITH-503 (spec option 3b), chosen deliberately over "do not listen until
+ * boot completes".
+ *
+ * The socket is bound FIRST so nginx and any load-balancer health check have a
+ * reachable endpoint immediately — but `/api/health` answers 503 `ready:false` and
+ * every mutating route is refused until `boot()` has fully completed. A closed
+ * socket would make the health check fail with a connection error that is
+ * indistinguishable from "process crashed", whereas an honest 503 says precisely
+ * "up but not ready yet". Readiness only flips to `ready` at the end of `boot()`.
+ */
 const httpServer = app.listen(config.port, () => {
-  console.log(`StrikeEdge backend listening on http://localhost:${config.port}`);
+  console.log(`StrikeEdge backend listening on http://localhost:${config.port} (readiness: starting)`);
   console.log(
     `[Gates] BOX_EXECUTION_MODE=${boxExecutionMode} BOX_LIVE_TRADING_ENABLED=${boxLiveTradingEnabled} ` +
       `ZERODHA_LIVE_TRADING_ENABLED=${zerodhaLiveTradingEnabled} DHAN_LIVE_TRADING_ENABLED=${dhanLiveTradingEnabled} ` +
       `— runtime live controls always start DISARMED.`,
   );
-  void boot().catch((err) => {
-    // Boot failures are LOUD and FATAL. A process that listens on the port and
-    // answers /api/health while having adopted no positions is worse than one that
-    // exited, because a supervisor will restart the latter into the recovery path.
-    console.error("[FATAL] StrikeEdge boot failed:", err instanceof Error ? err.message : err);
-    process.exit(1);
-  });
+  void boot()
+    .then(() => {
+      // Readiness flips to `ready` EXACTLY ONCE, only after every boot step —
+      // including order reconciliation to the engine's defined safe boundary —
+      // has completed. `markReady()` refuses a second transition, so a stray double
+      // call cannot mask a re-boot.
+      if (readiness.markReady()) {
+        console.log("[Readiness] state -> ready. /api/health now answers 200 and mutations are allowed.");
+      } else {
+        console.warn(
+          `[Readiness] refused ready transition from state '${readiness.getState()}' — staying not-ready.`,
+        );
+      }
+    })
+    .catch((err) => {
+      // Boot failures are LOUD and FATAL. A process that listens on the port and
+      // answers /api/health while having adopted no positions is worse than one that
+      // exited, because a supervisor will restart the latter into the recovery path.
+      //
+      // Mark FAILED first (so readiness can NEVER become ready and mutations stay
+      // refused), then run the ordinary shutdown steps to stop/close the partially
+      // initialised resources — WITHOUT flattening or inventing any fill — and exit
+      // non-zero so PM2 restarts us into a clean attempt.
+      const message = err instanceof Error ? err.message : String(err);
+      console.error("[FATAL] StrikeEdge boot failed:", message);
+      readiness.markFailed(err);
+      void failBootAndExit();
+    });
 });
+
+/**
+ * Tear down after a boot failure using the SAME ShutdownCoordinator steps that a
+ * normal shutdown uses, then exit non-zero.
+ *
+ * Reusing the coordinator is the cleanest route: it already stops the session
+ * sweeper, the token service and the feeds, disposes the engine if it booted,
+ * closes the HTTP listener, closes Mongo and closes PG — in the safe order and
+ * WITHOUT flattening positions or inventing fills. Any step that throws because the
+ * resource never initialised is isolated by the coordinator and does not block the
+ * later, data-protecting closes.
+ */
+async function failBootAndExit(): Promise<never> {
+  // Move readiness to shutting_down so nothing can observe a ready process during
+  // the teardown of a failed boot. From `failed` this is a legal transition.
+  readiness.markShuttingDown();
+  try {
+    await shutdownCoordinator.run("BOOT_FAILURE");
+  } catch (teardownErr) {
+    console.error(
+      "[FATAL] error while tearing down after a failed boot:",
+      teardownErr instanceof Error ? teardownErr.message : teardownErr,
+    );
+  }
+  // Always non-zero: the supervisor must restart us into a fresh recovery attempt.
+  process.exit(1);
+}
 
 async function boot(): Promise<void> {
   /* 2. PostgreSQL, then migrations. Nothing else may run before this. */
@@ -669,16 +742,39 @@ async function boot(): Promise<void> {
 
   /* Restore the durable active-broker selection BEFORE anything can price a trade.
      Without this a restart would silently revert to Zerodha and stamp new trades
-     broker:"zerodha" while the operator believed Dhan was active. */
-  await brokerManager.restore().catch((err) =>
-    console.warn("[Broker] failed to restore the active broker:", err instanceof Error ? err.message : err),
-  );
+     broker:"zerodha" while the operator believed Dhan was active.
+
+     DELIBERATELY UNGUARDED. This used to be `.catch(err => console.warn(...))`, which
+     turned the one authoritative read that decides WHICH VENUE TRADES on into a log
+     line: a PostgreSQL outage, a corrupt row or an undecryptable Dhan session all left
+     the process running on the DEFAULT broker at generation 1. Letting the rejection
+     escape `boot()` is the fix — the caller marks startup FAILED, closes the partially
+     initialised resources and exits non-zero so the supervisor restarts us into a
+     clean attempt. A confirmed-absent row (fresh deployment) resolves normally, so
+     first boots are unaffected. */
+  await brokerManager.restore();
 
   /* 4 + 5 + 10 + 11. Box settings, session state, open positions, unresolved intents,
      execution attempts and residual exposure are all reconstructed by engine.boot(),
      which also reconciles unresolved live broker state and starts the ALWAYS-ON
      position monitor. Discovery of NEW boxes stays off (step 12). */
   await boxModule.boot();
+
+  /* READINESS PRECONDITION: unresolved order reconciliation must have completed to
+     the engine's defined safe boundary before the process may report ready. We use
+     the engine's EXISTING signal — `exposureSummary().reconciliationComplete`, the
+     same field the runtime-status route and the broker manager already consume — and
+     do NOT invent a new notion of "reconciled". `engine.boot()` performs the
+     reconciliation of unresolved live broker state as part of step 4/5/10 above, so
+     by this point the signal must be true; if it is not, boot has not reached its
+     safe boundary and marking the process ready would be dishonest. Fail the boot so
+     the caller tears down and the supervisor restarts us into a clean attempt. */
+  if (!boxModule.engine.exposureSummary().reconciliationComplete) {
+    throw new Error(
+      "boot incomplete: order reconciliation did not reach the engine's safe boundary " +
+        "(exposureSummary().reconciliationComplete is false) — refusing to report ready.",
+    );
+  }
 
   /* 6. The projector is started INDEPENDENTLY and is never a boot dependency: a
      MongoDB Atlas outage must not delay position adoption or reconciliation. */
@@ -726,9 +822,13 @@ const shutdownCoordinator = new ShutdownCoordinator({
     },
     {
       // 3. Reads still answer while the process drains; mutations are refused.
+      // Readiness has ALREADY flipped to `shutting_down` (in the signal handler /
+      // boot-failure path) BEFORE any resource close, so this is the belt-and-braces
+      // confirmation of that state at the point the shutdown order names it. The
+      // single readiness gate refuses mutations whenever the state is not `ready`.
       name: "stop accepting mutating HTTP requests",
       run: () => {
-        shuttingDown = true;
+        readiness.markShuttingDown();
       },
     },
     {
@@ -815,6 +915,12 @@ const shutdownCoordinator = new ShutdownCoordinator({
 
 for (const signal of ["SIGTERM", "SIGINT"] as const) {
   process.on(signal, () => {
+    // REQUIREMENT: readiness must flip to non-ready BEFORE any resource is closed.
+    // We do it here, before the coordinator's first step runs, so /api/health starts
+    // answering 503 and mutations are refused the instant a shutdown signal arrives —
+    // not part-way through teardown. From `ready` (or `failed`) this is legal; a
+    // second signal is a harmless no-op.
+    readiness.markShuttingDown();
     void shutdownCoordinator.run(signal).then((result) => {
       // The coordinator never calls process.exit itself, so it stays unit-testable.
       process.exit(shutdownExitCode(result));

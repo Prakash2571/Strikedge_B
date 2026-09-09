@@ -225,6 +225,9 @@ function pickLegPrice(order: BoxMarginOrder): number {
  *
  * An unrecognised value falls back to Zerodha with a warning rather than failing startup:
  * a typo here must not take down a process whose durable record is about to override it.
+ * This fallback affects ONLY a fresh deployment: on any process that has ever persisted a
+ * broker selection, restore() reads the durable record and fails closed on any problem, so
+ * the persisted broker — never this env default — decides ownership.
  */
 function defaultActiveBrokerFromEnv(env: NodeJS.ProcessEnv = process.env): BrokerId {
   const raw = (env.DEFAULT_ACTIVE_BROKER ?? "").trim().toLowerCase();
@@ -567,13 +570,6 @@ export class ActiveBrokerManager {
   }
 
   /**
-   * Restore the persisted broker selection at boot.
-   *
-   * Without this a restart would silently revert to Zerodha and begin pricing trades
-   * from the wrong venue — the trades would even be stamped `broker: "zerodha"`,
-   * making the mistake invisible afterwards.
-   */
-  /**
    * May speculative ENTRY move to Dhan on its own because Zerodha is unavailable?
    *
    * Answers the `AUTO_FALLBACK_TO_DHAN` policy question in one place so the boot wiring and
@@ -597,22 +593,52 @@ export class ActiveBrokerManager {
     return defaultActiveBrokerFromEnv();
   }
 
+  /**
+   * Restore the persisted broker selection at boot. MANDATORY — never best-effort.
+   *
+   * Without this a restart would silently revert to Zerodha and begin pricing trades
+   * from the wrong venue — the trades would even be stamped `broker: "zerodha"`,
+   * making the mistake invisible afterwards.
+   *
+   * FAIL CLOSED. Every failure mode here REJECTS, and the caller (boot) must let the
+   * rejection kill the process:
+   *   - the `active_broker` query failed          → reject (PostgreSQL is the authority)
+   *   - the stored broker is unknown/absent       → reject (DurableStateError)
+   *   - the stored generation is unusable         → reject (DurableStateError)
+   *   - the stored Dhan session cannot be read
+   *     or decrypted                              → reject
+   *
+   * Only a CONFIRMED "no active_broker row" (a fresh deployment) resolves, and only
+   * that case uses `DEFAULT_ACTIVE_BROKER`. This is the difference between "PostgreSQL
+   * told us there is nothing yet" and "we could not ask PostgreSQL": the first is a
+   * first boot, the second is an outage, and adopting a default broker + generation 1
+   * during an outage is exactly how a stale predecessor's durable instrument
+   * reservation starts looking current.
+   */
   async restore(): Promise<void> {
-    const saved = await loadActiveBroker().catch(() => null);
-    if (saved && (BROKER_IDS as readonly string[]).includes(saved.broker)) {
+    // NOT `.catch(() => null)`. A rejection here is a boot failure by design.
+    const saved = await loadActiveBroker();
+    if (saved === null) {
+      // Confirmed absence → fresh deployment. Keep the configured default and the
+      // starting generation. This is the ONLY path that trusts the env variable.
+      console.log(
+        `[Broker] no durable active_broker row — fresh deployment starting on ` +
+          `${this.active} (DEFAULT_ACTIVE_BROKER) at generation ${this.gen}.`,
+      );
+    } else {
+      // `loadActiveBroker` has already validated the broker against BROKER_IDS and
+      // the generation as a positive safe integer, so both are adopted unconditionally.
+      // The generation is adopted even if it is LOWER than the in-memory starting
+      // value: PostgreSQL is the authority on the count, not this process.
       this.active = saved.broker as BrokerId;
-    }
-    // ADOPT THE PERSISTED GENERATION, do not restart the count.
-    //
-    // Durable instrument reservations are stamped with the generation and refuse to
-    // execute when it no longer matches. If this counter went back to 1 on every boot,
-    // a reservation left behind by the previous process would be indistinguishable from
-    // one taken under the current world — the exact stale-worker confusion the stamp is
-    // there to prevent.
-    if (saved && saved.generation > this.gen) {
       this.gen = saved.generation;
+      console.log(
+        `[Broker] restored durable selection ${this.active} at generation ${this.gen}.`,
+      );
     }
     // Rehydrate a still-valid Dhan session so a restart does not force a re-login.
+    // A read/decrypt FAILURE rejects (see adoptStoredDhanSession); only a confirmed
+    // absent/expired session resolves false.
     await this.adoptStoredDhanSession();
     if (this.active === "dhan") this.dhanProblems = this.computeDhanProblems();
   }
@@ -640,9 +666,25 @@ export class ActiveBrokerManager {
    * An EXPIRED stored session is cleared rather than adopted — a dead token installed
    * in memory would make `authenticated` true for one expiry check and then fail at the
    * broker, which is strictly worse than reporting the truth.
+   *
+   * ABSENCE AND FAILURE ARE DIFFERENT ANSWERS
+   *   - PostgreSQL confirmed there is no active Dhan row → `false` ("not connected")
+   *   - the stored session is present but expired         → `false`, and it is invalidated
+   *   - the query failed, or the row cannot be decrypted  → REJECTS
+   *
+   * The third case used to be `.catch(() => null)`, i.e. reported as "Dhan is not
+   * connected". That is a lie with consequences in both directions: at boot it let the
+   * process come up believing a connected broker was unauthenticated, and on the daily
+   * token path it made a decryption misconfiguration look like a missing token, so the
+   * service would discard a perfectly good stored credential and re-acquire. The
+   * rejection now propagates: boot fails closed, and the token acquisition service
+   * records the bounded reason in its status and retries on its existing schedule.
+   *
+   * No plaintext token appears in any error or log on any of these paths.
    */
   async adoptStoredDhanSession(): Promise<boolean> {
-    const session = await loadDhanSession().catch(() => null);
+    // NOT `.catch(() => null)`. A query/decrypt failure must not masquerade as absence.
+    const session = await loadDhanSession();
     if (!session) return false;
     if (isDhanTokenExpired(session.expiry_time)) {
       await clearDhanSession().catch(() => undefined);

@@ -92,16 +92,72 @@ caching, uses a long read timeout, and sets `X-Accel-Buffering: no`:
 - `proxy_set_header X-Accel-Buffering no;` — per-response guarantee that this
   stream is unbuffered even if buffering is enabled elsewhere.
 
-## 6. Health check
+## 6. Health / readiness check
+
+`GET /api/health` is an HONEST readiness probe: it reports operational readiness
+only when the process has finished booting (PostgreSQL up, migrations
+verified/applied, the authoritative broker restored, Box durable state adopted and
+unresolved order reconciliation completed to the engine's safe boundary). It is
+unauthenticated and deliberately CONTENTLESS beyond liveness/readiness — it carries
+no broker, token, position, exposure or migration detail.
 
 ```bash
+# Ready (boot complete):
+curl -sS -o /dev/null -w '%{http_code}\n' https://<host>/api/health   # 200
 curl -s https://<host>/api/health
-# {"ok":true,"service":"strikedge","shutting_down":false}
+# {"service":"strikedge","state":"ready","ready":true,"shutting_down":false}
+
+# Still starting, boot failed, or shutting down:
+#   HTTP 503, body {"service":"strikedge","state":"starting|failed|shutting_down","ready":false,...}
 ```
 
-`shutting_down:true` means the process received SIGTERM and is draining — a load
-balancer should stop routing to it. Also watch `GET /api/runtime/status` and
-`GET /api/export/status` (see `docs/RUNBOOK.md`).
+Response-code contract:
+
+| State           | HTTP | `ready` | Meaning                                                        |
+| --------------- | ---- | ------- | -------------------------------------------------------------- |
+| `starting`      | 503  | false   | Socket is up but boot is still in progress — do not route yet. |
+| `ready`         | 200  | true    | Boot complete; safe to route traffic.                          |
+| `failed`        | 503  | false   | Boot failed; the process exits non-zero and PM2 restarts it.   |
+| `shutting_down` | 503  | false   | Draining after SIGTERM — stop routing to it.                   |
+
+The process uses **listen-with-503**: it binds the socket immediately (so nginx and
+any load-balancer health check always have a reachable endpoint) and answers 503
+until it is genuinely ready, rather than refusing connections during boot. Configure
+your load balancer / nginx upstream health check to treat **200 = in service** and
+**503 = out of service**. All mutating routes (POST/PUT/PATCH/DELETE) are also
+refused with 503 until the process is `ready` and again once it is `shutting_down`.
+Also watch `GET /api/runtime/status` and `GET /api/export/status` (see
+`docs/RUNBOOK.md`).
+
+### Manual risk reduction vs the readiness gate (deliberate tradeoff)
+
+The single readiness gate refuses **all** mutating HTTP requests while the process
+is not `ready`. That set includes the operator's **manual** risk-reducing routes:
+`POST /api/box/live/flatten`, `/api/box/live/cancel-working`, `/api/box/live/reconcile`,
+`/api/box/trades/:id/close`, and the emergency-flatten execution control. So:
+
+- **Manual, operator-initiated reduction is UNAVAILABLE while `starting` and while
+  `shutting_down`** (and `failed`). This is deliberate, not an oversight:
+  - While `starting`, no durable exposure has been adopted yet and reconciliation has
+    not run — a manual flatten would act on an **empty, un-reconciled world**, so it
+    must be refused rather than operate on a system that has not yet learned what it owns.
+  - Refusing mutations while `shutting_down` is **pre-existing** drain behaviour (the
+    old `shuttingDown` middleware already did this); the consolidated gate preserves it.
+- **AUTOMATIC reduction is UNAFFECTED.** Automatic exit, protective cancellation,
+  reconciliation and emergency residual flattening are **engine-internal** and never
+  pass through the HTTP readiness middleware at all — the `ReadinessController` is
+  imported only by the HTTP layer (`src/index.ts`) and by no engine module. An HTTP
+  gate can therefore never stop risk reduction. This is pinned by
+  `tests/readiness/riskReductionGating.test.mjs` (structural + behavioural).
+- **Positions are preserved and re-adopted on restart.** SIGTERM never liquidates;
+  a restart re-adopts open positions, unresolved intents and residual exposure at boot
+  before the process becomes `ready`, at which point manual reduction routes are
+  reachable again.
+
+In short: the window in which manual reduction is unavailable is exactly the window in
+which the process either does not yet know its exposure (`starting`) or is draining
+(`shutting_down`), and throughout both windows the engine's automatic reduction of any
+exposure it does own continues untouched.
 
 ## 7. Backup and restore
 
@@ -158,7 +214,8 @@ nothing.
    schema (usually true for additive migrations), just start the old code. If a
    migration must be undone, do it as a new, reviewed forward migration after
    following §10.
-4. `pm2 start ecosystem.config.cjs` and verify `/api/health` and
+4. `pm2 start ecosystem.config.cjs` and wait for `/api/health` to return **200
+   `ready:true`** (it returns 503 `ready:false` while still booting), then verify
    `/api/runtime/status`.
 
 ## 10. Safe database migration procedure
@@ -173,7 +230,7 @@ Never migrate under a live, armed process.
 4. **Back up** — `pg_dump` (see §7).
 5. **Migrate** — `npm run migrate` (or `-- --check` first to see the delta).
 6. **Verify** — `npm run migrate -- --check` returns OK; app boots; `/api/health`
-   green.
+   returns **200 `ready:true`** (503 `ready:false` until boot completes).
 7. **Restart / re-arm** — start the process; only re-arm live trading
    deliberately, through the gates.
 

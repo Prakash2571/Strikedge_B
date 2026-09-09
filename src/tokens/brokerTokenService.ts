@@ -231,7 +231,29 @@ export class BrokerTokenAcquisitionService {
     rt.istDay = today;
 
     // Already have a valid token for today (e.g. restored on restart)? Do not poll.
-    if (await this.opts.persist.hasValidToken(broker, today).catch(() => false)) {
+    //
+    // A FAILED read is NOT the same answer as "no token". This was
+    // `.catch(() => false)`, which meant a PostgreSQL outage or an undecryptable stored
+    // credential looked like "nothing stored yet" and sent the service off to acquire a
+    // REPLACEMENT token from the provider. Now the bounded reason is recorded in the
+    // per-broker status and the existing retry schedule re-asks, so the authority gets
+    // a chance to come back before a perfectly good credential is superseded.
+    let hasValid: boolean;
+    try {
+      hasValid = await this.opts.persist.hasValidToken(broker, today);
+    } catch (err) {
+      rt.state = "polling";
+      rt.lastError = `stored token read failed: ${
+        err instanceof Error ? err.message.slice(0, 100) : "unknown"
+      }`;
+      console.warn(
+        `[Token] ${broker} stored-token check failed — NOT acquiring a replacement; ` +
+          "retrying on the existing schedule.",
+      );
+      this.armRetry(broker, this.opts.pollIntervalMs);
+      return;
+    }
+    if (hasValid) {
       rt.state = "ready";
       rt.readyForDay = today;
       return;

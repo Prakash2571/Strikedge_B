@@ -22,11 +22,18 @@
  * `loadKiteSession` throw rather than returning null: a null would look like "no
  * session" and trigger a fresh acquisition, quietly discarding a token that is
  * actually fine and only misconfigured. Boot surfaces the throw.
+ *
+ * `loadActiveBroker` follows the same rule and goes further: it distinguishes a
+ * CONFIRMED ABSENT row (`null` — a fresh deployment, the only case that may fall
+ * back to `DEFAULT_ACTIVE_BROKER`) from a row that is PRESENT BUT INVALID (a
+ * `DurableStateError` throw). A failing query is never converted to either — the
+ * rejection propagates so boot fails instead of guessing a broker and a generation.
  */
 
 import { withClient, withTx, query } from "../pg/pool.js";
 import type { PoolClient } from "pg";
 import { createHash } from "node:crypto";
+import { BROKER_IDS } from "../brokers/types.js";
 import {
   decodeEncryptionKey,
   openToken,
@@ -34,6 +41,39 @@ import {
   type SealedToken,
   type TokenAad,
 } from "./tokenCrypto.js";
+
+/* -------------------------------------------------------------------------- */
+/*  Durable-state failures                                                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A durable row EXISTS but is not usable — an unknown broker string, a
+ * non-positive/non-finite generation.
+ *
+ * This is deliberately a distinct type from "there is no row". A missing row is a
+ * legitimate fresh deployment and may fall back to `DEFAULT_ACTIVE_BROKER`; a
+ * PRESENT-BUT-INVALID row means PostgreSQL — the only operational authority —
+ * holds a selection this build cannot honour, and guessing a broker from that
+ * state is how a restart silently trades on the wrong venue. Boot must fail.
+ *
+ * The message is bounded and carries only the field name plus a truncated,
+ * non-secret rendering of the offending value. No token, no SQL, no stack of the
+ * underlying driver error is ever folded in.
+ */
+export class DurableStateError extends Error {
+  readonly code: string;
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = "DurableStateError";
+    this.code = code;
+  }
+}
+
+/** Truncate an untrusted stored value so it can appear in an error safely. */
+function boundedValue(raw: unknown): string {
+  const s = typeof raw === "string" ? raw : String(raw);
+  return s.length > 40 ? `${s.slice(0, 40)}…` : s;
+}
 
 /* -------------------------------------------------------------------------- */
 /*  CalSpread-compatible session shapes                                       */
@@ -368,18 +408,73 @@ export async function saveActiveBroker(
   });
 }
 
-/** The persisted broker selection and its generation, or null when unset. */
+/**
+ * The persisted broker selection and its generation.
+ *
+ * THE FIVE STATES THIS FUNCTION DISTINGUISHES — and why it matters
+ *   1. the query FAILED                → the rejection propagates (never caught here)
+ *   2. PostgreSQL returned NO ROW      → `null`, a confirmed absence
+ *   3. a valid row                     → `{ broker, generation }`
+ *   4. a row whose broker is unknown   → throws DurableStateError
+ *   5. a row whose generation is bad   → throws DurableStateError
+ *
+ * Only case 2 may be answered with `DEFAULT_ACTIVE_BROKER`. Cases 1, 4 and 5 used
+ * to be indistinguishable from case 2 at the call site (`.catch(() => null)` plus a
+ * silent `generation ?? 1` coercion), which meant a PostgreSQL outage or a corrupt
+ * row made a restarted process adopt the configured default broker AND generation 1
+ * while the authority actually held a different selection. Durable instrument
+ * reservations are stamped with the generation, so generation 1 after a real
+ * generation 37 would make a stale predecessor's reservation look current.
+ *
+ * The generation is validated as a positive safe integer, NOT coerced. `bigint`
+ * comes back from `pg` as a string; a value beyond `Number.MAX_SAFE_INTEGER` would
+ * lose precision on conversion and is therefore refused rather than rounded.
+ */
 export async function loadActiveBroker(): Promise<{ broker: string; generation: number } | null> {
-  const { rows } = await query<{ broker: string; generation: string | number }>(
+  const { rows } = await query<{ broker: string | null; generation: string | number | null }>(
     `SELECT broker, generation FROM active_broker WHERE id = 'current'`,
   );
-  const row = rows[0];
-  if (!row?.broker) return null;
-  const generation = typeof row.generation === "string" ? Number(row.generation) : row.generation;
-  return {
-    broker: row.broker,
-    generation: Number.isFinite(generation) && generation > 0 ? generation : 1,
-  };
+  // CASE 2: a confirmed absence — no durable selection has ever been made. This is
+  // the ONLY outcome a caller may answer with the configured default.
+  if (rows.length === 0) return null;
+
+  const row = rows[0] as { broker: string | null; generation: string | number | null };
+
+  // CASE 4: the row exists but names no usable broker. `broker` is NOT NULL in the
+  // schema, so this is corruption or a value written by a build that knew a broker
+  // this one does not. Either way it is not something to paper over with a default.
+  const broker = typeof row.broker === "string" ? row.broker.trim() : "";
+  if (!broker) {
+    throw new DurableStateError(
+      "active_broker_missing_broker",
+      "active_broker row 'current' exists but stores no broker value.",
+    );
+  }
+  if (!(BROKER_IDS as readonly string[]).includes(broker)) {
+    throw new DurableStateError(
+      "active_broker_invalid_broker",
+      `active_broker row 'current' stores an unknown broker "${boundedValue(broker)}" ` +
+        `(known: ${BROKER_IDS.join(", ")}).`,
+    );
+  }
+
+  // CASE 5: the generation must be a positive, exactly-representable integer.
+  const rawGen = row.generation;
+  const generation = typeof rawGen === "string" ? Number(rawGen) : rawGen;
+  if (
+    typeof generation !== "number" ||
+    !Number.isSafeInteger(generation) ||
+    generation <= 0
+  ) {
+    throw new DurableStateError(
+      "active_broker_invalid_generation",
+      `active_broker row 'current' stores an unusable generation "${boundedValue(rawGen)}"; ` +
+        "a positive safe integer is required.",
+    );
+  }
+
+  // CASE 3.
+  return { broker, generation };
 }
 
 /* -------------------------------------------------------------------------- */
