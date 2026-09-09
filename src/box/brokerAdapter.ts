@@ -1,4 +1,5 @@
 import type { LegExecutor } from "./legExecutor.js";
+import type { ExecutionEvidenceQuality } from "./brokerExecutionEvidence.js";
 import type {
   BoxLegRole,
   BoxOptionInstrument,
@@ -43,7 +44,15 @@ export interface BrokerFill {
   /** Stable broker trade id, or a deterministic synthetic identity for paper. */
   fill_id: string;
   quantity: number;
-  price: number;
+  /**
+   * Executed price, or NULL when the broker confirmed the quantity but has not published a price.
+   *
+   * Nullable deliberately. The Dhan projection used to synthesize `price: 0` for a confirmed fill
+   * whose `averageTradedPrice` was absent, which is fabricated P&L rather than absent data — a
+   * listed option cannot trade at zero. Consumers must skip a null price rather than arithmetic it.
+   * See brokerExecutionEvidence.ts.
+   */
+  price: number | null;
   at: number;
 }
 
@@ -104,6 +113,14 @@ export interface BrokerOrder {
   pending_quantity: number;
   average_price: number | null;
   fills: BrokerFill[];
+  /**
+   * WHICH execution fields the broker actually supplied for this snapshot.
+   *
+   * Optional because paper and locally-constructed orders have nothing to disclaim. When a live
+   * adapter sets it, it is the nameable reason an order's accounting is or is not final; see
+   * brokerExecutionEvidence.ts and `executionAccountingComplete`.
+   */
+  execution_evidence?: ExecutionEvidenceQuality;
   reject_family: BrokerRejectFamily | null;
   reject_reason: string | null;
   created_at: number;
@@ -400,11 +417,17 @@ export class PaperBrokerAdapter implements BrokerAdapter {
         average_price: 0,
       };
       const prior = current.net_quantity;
+      // An UNPRICED fill still moves the net quantity — exposure is exposure — but it cannot
+      // contribute to a cost basis. Folding a null in as zero would understate the basis, which is
+      // exactly the fabricated-accounting failure brokerExecutionEvidence.ts exists to prevent.
+      const fillPrice = fill.price;
       if (prior === 0 || Math.sign(prior) === Math.sign(delta)) {
         const total = Math.abs(prior) + Math.abs(delta);
-        current.average_price = total === 0
-          ? 0
-          : ((Math.abs(prior) * current.average_price) + (Math.abs(delta) * fill.price)) / total;
+        current.average_price = fillPrice === null
+          ? current.average_price
+          : total === 0
+            ? 0
+            : ((Math.abs(prior) * current.average_price) + (Math.abs(delta) * fillPrice)) / total;
         current.net_quantity = prior + delta;
       } else if (Math.abs(delta) < Math.abs(prior)) {
         // A partial close realises P&L but does not rewrite the remaining lot's basis.
@@ -415,7 +438,7 @@ export class PaperBrokerAdapter implements BrokerAdapter {
       } else {
         // The close crossed through flat and opened exposure in the opposite direction.
         current.net_quantity = prior + delta;
-        current.average_price = fill.price;
+        if (fillPrice !== null) current.average_price = fillPrice;
       }
       positions.set(key, current);
     }

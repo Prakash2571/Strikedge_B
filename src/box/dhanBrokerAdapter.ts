@@ -52,6 +52,12 @@ import {
   type BrokerRejectFamily,
 } from "./brokerAdapter.js";
 import type { BoxConfig } from "./config.js";
+import {
+  evaluateExecutionEvidence,
+  readCumulativeQuantity,
+  readPositivePrice,
+  readTradedPrice,
+} from "./brokerExecutionEvidence.js";
 import type { ExecutionTimingRecorder } from "./executionTiming.js";
 import type { IBoxOrderIntent } from "./types.js";
 import {
@@ -717,7 +723,18 @@ export class DhanBrokerAdapter implements BrokerAdapter {
     }
   }
 
-  /** Project a Dhan order (+ fills) onto the broker-neutral shape. */
+  /**
+   * Project a Dhan order (+ fills) onto the broker-neutral shape.
+   *
+   * THE SINGLE FUNNEL for EVERY observation path — placement verification, REST polling,
+   * correlation lookup, `listOrders`, restart adoption and (once consumed) websocket updates all
+   * arrive here. So this is where execution evidence is validated, exactly once, for all of them.
+   *
+   * A MISSING cumulative quantity is not a zero (see brokerExecutionEvidence.ts). A terminal-looking
+   * label that carries none cannot freeze accounting: it is projected as RECONCILIATION_REQUIRED
+   * with the reason named, carrying forward the highest quantity already proven, so the durable
+   * reconciler resolves it instead of a hardcoded zero doing so silently.
+   */
   private project(
     template: Pick<
       BrokerOrder | BrokerOrderRequest,
@@ -729,11 +746,34 @@ export class DhanBrokerAdapter implements BrokerAdapter {
   ): BrokerOrder {
     const now = Date.now();
     const quantity = template.quantity;
-    const filled = numberOr(remote.filledQty, 0);
+    const priorFilled = "filled_quantity" in template && typeof template.filled_quantity === "number"
+      ? template.filled_quantity
+      : 0;
+
+    const observedQuantity = readCumulativeQuantity(remote);
+    const observedPrice = readTradedPrice(remote);
+    // The label is mapped using the OBSERVED quantity when there is one, and the prior proven
+    // quantity otherwise — never a fabricated zero, which is what turned TRADED into COMPLETE.
+    const claimedState = dhanOrderState(remote.orderStatus, observedQuantity.value ?? priorFilled, quantity);
+    const verdict = evaluateExecutionEvidence({
+      statusLabel: String(remote.orderStatus ?? ""),
+      claimedState,
+      requestedQuantity: quantity,
+      priorFilled,
+      quantity: observedQuantity,
+      price: observedPrice,
+    });
+
+    const filled = verdict.filledQuantity;
+    // An insufficiently-evidenced terminal claim stays UNCERTAIN. Re-deriving the state from the
+    // accepted quantity also reconciles contradictions (a "CANCELLED with a nonzero fill" surfaces
+    // as a real partial; a "TRADED with a short fill" as PARTIALLY_FILLED, never COMPLETE).
+    const state: BrokerOrderState = verdict.sufficient
+      ? dhanOrderState(remote.orderStatus, filled, quantity)
+      : "RECONCILIATION_REQUIRED";
     const remaining = remote.remainingQuantity !== undefined
       ? numberOr(remote.remainingQuantity, Math.max(0, quantity - filled))
       : Math.max(0, quantity - filled);
-    const state = dhanOrderState(remote.orderStatus, filled, quantity);
     const rejected = state === "REJECTED";
 
     return {
@@ -755,32 +795,38 @@ export class DhanBrokerAdapter implements BrokerAdapter {
       state,
       filled_quantity: filled,
       pending_quantity: remaining,
-      average_price: numberOrNull(remote.averageTradedPrice),
+      average_price: verdict.averagePrice,
       fills: fills.length > 0
-        ? fills.map((t, index) => ({
-            fill_id: t.exchangeTradeId
-              ? `dhan:${t.exchangeTradeId}`
-              : `dhan:${remote.orderId}:${index}:${t.tradedQuantity}:${t.tradedPrice}`,
-            quantity: numberOr(t.tradedQuantity, 0),
-            price: numberOr(t.tradedPrice, 0),
-            at: parseDhanTime(t.exchangeTime ?? t.updateTime ?? t.createTime, now),
-          }))
-        // No trade-book detail: synthesize ONE aggregate fill so exposure is still
-        // exact, matching how the Kite adapter behaves.
+        ? fills.map((t, index) => {
+            const tradePrice = readPositivePrice(t.tradedPrice);
+            return {
+              fill_id: t.exchangeTradeId
+                ? `dhan:${t.exchangeTradeId}`
+                : `dhan:${remote.orderId}:${index}:${t.tradedQuantity}:${t.tradedPrice}`,
+              quantity: numberOr(t.tradedQuantity, 0),
+              // An unpublished trade price is NULL, never zero. Zero would be fabricated P&L.
+              price: tradePrice.value,
+              at: parseDhanTime(t.exchangeTime ?? t.updateTime ?? t.createTime, now),
+            };
+          })
+        // No trade-book detail: synthesize ONE aggregate fill so exposure is still exact, matching
+        // how the Kite adapter behaves. Its price is the OBSERVED average or null — the old code
+        // used `numberOr(..., 0)` here, inventing a zero-cost execution.
         : filled > 0
           ? [{
-              fill_id: `dhan:${remote.orderId}:${filled}:${numberOr(remote.averageTradedPrice, 0)}`,
+              fill_id: `dhan:${remote.orderId}:${filled}:${verdict.averagePrice ?? "unpriced"}`,
               quantity: filled,
-              price: numberOr(remote.averageTradedPrice, 0),
+              price: verdict.averagePrice,
               at: parseDhanTime(remote.exchangeTime ?? remote.updateTime, now),
             }]
           : [],
+      execution_evidence: verdict.quality,
       reject_family: rejected
         ? classifyDhanReject(remote.omsErrorCode ?? null, remote.omsErrorDescription ?? null)
         : null,
       reject_reason: rejected
         ? remote.omsErrorDescription ?? remote.omsErrorCode ?? "Dhan rejected the order."
-        : null,
+        : verdict.detail,
       created_at: parseDhanTime(remote.createTime, now),
       updated_at: parseDhanTime(remote.updateTime ?? remote.exchangeTime, now),
     };
@@ -1022,10 +1068,29 @@ function fromRequest(req: BrokerOrderRequest, now: number, correlationId: string
   };
 }
 
+/**
+ * An order this session did not create, surfaced with an explicit ORPHAN identity.
+ *
+ * Subject to the SAME evidence rules as `project()`: an orphan whose terminal-looking label carries
+ * no cumulative quantity is surfaced as RECONCILIATION_REQUIRED, not as a fully-executed or flat
+ * order. Reconciliation after a restart is exactly when a fabricated zero does the most damage,
+ * because there is no prior session state to contradict it.
+ */
 function orphanOrder(order: DhanOrder): BrokerOrder {
   const now = Date.now();
   const quantity = numberOr(order.quantity, 0);
-  const filled = numberOr(order.filledQty, 0);
+  const observedQuantity = readCumulativeQuantity(order);
+  const observedPrice = readTradedPrice(order);
+  const claimedState = dhanOrderState(order.orderStatus, observedQuantity.value ?? 0, quantity);
+  const verdict = evaluateExecutionEvidence({
+    statusLabel: String(order.orderStatus ?? ""),
+    claimedState,
+    requestedQuantity: quantity,
+    priorFilled: 0,
+    quantity: observedQuantity,
+    price: observedPrice,
+  });
+  const filled = verdict.filledQuantity;
   return {
     client_order_id: `DHAN_ORPHAN:${order.orderId}`,
     broker_order_id: order.orderId,
@@ -1048,13 +1113,16 @@ function orphanOrder(order: DhanOrder): BrokerOrder {
       limit_price: numberOr(order.price, 0) || 0.05,
     },
     limit_price: numberOr(order.price, 0),
-    state: dhanOrderState(order.orderStatus, filled, quantity),
+    state: verdict.sufficient
+      ? dhanOrderState(order.orderStatus, filled, quantity)
+      : "RECONCILIATION_REQUIRED",
     filled_quantity: filled,
     pending_quantity: Math.max(0, quantity - filled),
-    average_price: numberOrNull(order.averageTradedPrice),
+    average_price: verdict.averagePrice,
     fills: [],
+    execution_evidence: verdict.quality,
     reject_family: null,
-    reject_reason: null,
+    reject_reason: verdict.detail,
     created_at: parseDhanTime(order.createTime, now),
     updated_at: parseDhanTime(order.updateTime, now),
   };

@@ -1571,7 +1571,13 @@ function paperLeg(order: BrokerOrder): PaperLegExecution {
     requested_qty: order.quantity,
     fill_qty: filled,
     remaining_qty: order.quantity - filled,
-    fills: order.fills.map((fill) => ({ price: fill.price, qty: fill.quantity, displayed_qty: fill.quantity, effective_qty: fill.quantity, at: fill.at, quote_version: null })),
+    // PRICED SLICES ONLY. `PaperFillSlice.price` is a number by contract, so a fill whose price the
+    // broker has not published is deliberately absent from this list rather than rendered at zero.
+    // The exposure is not lost: `fill_qty` above is the broker's cumulative quantity, and
+    // `average_fill_price` is null, which is how a reader knows the pricing is still pending.
+    fills: order.fills
+      .filter((fill): fill is typeof fill & { price: number } => fill.price !== null)
+      .map((fill) => ({ price: fill.price, qty: fill.quantity, displayed_qty: fill.quantity, effective_qty: fill.quantity, at: fill.at, quote_version: null })),
     quote_version: null,
     book_at: order.updated_at,
     book_exchange_at: null,

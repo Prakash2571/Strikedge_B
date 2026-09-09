@@ -24,6 +24,11 @@ import {
   type TransportPacerStats,
 } from "./brokerPacing.js";
 import type { BoxConfig } from "./config.js";
+import {
+  evaluateExecutionEvidence,
+  readNonNegativeInteger,
+  readPositivePrice,
+} from "./brokerExecutionEvidence.js";
 import type { ExecutionTimingRecorder } from "./executionTiming.js";
 import type { ExecutionMode, IBoxOrderIntent, OrderSide } from "./types.js";
 
@@ -870,8 +875,33 @@ export function classifyKiteReject(error: unknown): BrokerRejectFamily {
   return "generic";
 }
 
+/**
+ * Project one Kite order row onto the broker-neutral shape.
+ *
+ * Subject to the SAME execution-evidence rules as the Dhan projection
+ * (brokerExecutionEvidence.ts). `KiteTransportOrder` declares `filled_quantity` and
+ * `average_price` as numbers, but they are coerced from a JSON payload: a field the API omits
+ * arrives as `undefined`/`NaN` at runtime, and reading that as a confirmed zero is the same
+ * fabrication. Kite order updates also arrive over the websocket postback, which lands here too,
+ * so the validation has to live at this funnel rather than in one caller.
+ */
 function normalizeKiteOrder(raw: KiteTransportOrder, known: BrokerOrder | undefined, now: number): BrokerOrder {
-  const state = kiteState(raw.status, raw.filled_quantity, raw.quantity);
+  const observedQuantity = readNonNegativeInteger(raw.filled_quantity);
+  const observedPrice = readPositivePrice(raw.average_price);
+  const priorFilled = known?.filled_quantity ?? 0;
+  const claimedState = kiteState(raw.status, observedQuantity.value ?? priorFilled, raw.quantity);
+  const verdict = evaluateExecutionEvidence({
+    statusLabel: raw.status,
+    claimedState,
+    requestedQuantity: raw.quantity,
+    priorFilled,
+    quantity: observedQuantity,
+    price: observedPrice,
+  });
+  const filled = verdict.filledQuantity;
+  const state: BrokerOrderState = verdict.sufficient
+    ? kiteState(raw.status, filled, raw.quantity)
+    : "RECONCILIATION_REQUIRED";
   const base = known ?? {
     client_order_id: `KITE_ORPHAN:${raw.order_id}`,
     broker_order_id: raw.order_id,
@@ -912,17 +942,19 @@ function normalizeKiteOrder(raw: KiteTransportOrder, known: BrokerOrder | undefi
     quantity: raw.quantity,
     pricing: { ...base.pricing, limit_price: raw.price },
     limit_price: raw.price,
-    filled_quantity: raw.filled_quantity,
-    pending_quantity: raw.pending_quantity,
-    average_price: raw.filled_quantity > 0 ? raw.average_price : null,
-    fills: raw.filled_quantity > 0 ? [{
-      fill_id: `kite:${raw.order_id}:${raw.filled_quantity}:${raw.average_price}`,
-      quantity: raw.filled_quantity,
-      price: raw.average_price,
+    filled_quantity: filled,
+    pending_quantity: Math.max(0, raw.quantity - filled),
+    average_price: verdict.averagePrice,
+    fills: filled > 0 ? [{
+      fill_id: `kite:${raw.order_id}:${filled}:${verdict.averagePrice ?? "unpriced"}`,
+      quantity: filled,
+      // NULL, never zero: an unpublished average price is absent data, not a free execution.
+      price: verdict.averagePrice,
       at: parseTime(raw.exchange_update_timestamp) ?? now,
     }] : [],
+    execution_evidence: verdict.quality,
     reject_family: state === "REJECTED" ? classifyKiteReject(raw.status_message ?? raw.status) : null,
-    reject_reason: state === "REJECTED" ? raw.status_message ?? raw.status : null,
+    reject_reason: state === "REJECTED" ? raw.status_message ?? raw.status : verdict.detail,
     updated_at: parseTime(raw.exchange_update_timestamp) ?? now,
   };
 }
