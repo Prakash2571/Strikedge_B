@@ -9,14 +9,16 @@ request, with a read-only token and no repository secrets.
    check, so a stale `package-lock.json` fails the build instead of being silently rewritten.
 2. **Build / typecheck** — `npm run build` (which is `tsc -b`, also the typecheck) and an assertion
    that `dist/index.js` was actually emitted.
-3. **All seven suites against REAL databases** — PostgreSQL (`postgres:17.2-alpine`) and MongoDB
+3. **All suites against REAL databases** — PostgreSQL (`postgres:17.2-alpine`) and MongoDB
    (`mongo:7.0.14`) run as pinned service containers, health-checked and then re-probed from inside
-   the job before any test runs. Suites run in order: `test:unit`, `test:pg`, `test:projector`,
-   `test:tokens`, `test:switch`, `test:access`, `test:shutdown`.
+   the job before any test runs. Suites run in order: `test:unit`, `test:invariants`, `test:pg`,
+   `test:projector`, `test:tokens`, `test:switch`, `test:access`, `test:shutdown`, `test:readiness`.
+   (`test:readiness` is hermetic and DB-independent — it drives the startup-readiness state machine
+   plus a loopback express app — but runs here alongside the others under the armed egress guard.)
 4. **No silent skips** — each suite's output is captured, and a dedicated step fails the build if
-   any database-dependent suite (`pg`, `projector`, `tokens`, `switch`, `access`) reports a non-zero
-   `skipped` count or no summary line at all. A test that starts skipping because a database went
-   missing turns the build **red**, not green.
+   any database-dependent suite (`pg`, `projector`, `tokens`, `switch`, `access`) — plus the
+   always-run `readiness` suite — reports a non-zero `skipped` count or no summary line at all. A
+   test that starts skipping because a database went missing turns the build **red**, not green.
 5. **Safety defaults** — asserts `.env.example` never sets `BOX_EXECUTION_MODE=live` or
    `BOX_LIVE_TRADING_ENABLED=true`.
 6. **No committed secrets** — greps the tracked tree for `.env` / credential / key files (allowing

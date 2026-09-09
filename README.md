@@ -58,7 +58,10 @@ npm run migrate -- --check      # assert-only: fails if schema is behind
 npm start                        # node dist/index.js
 ```
 
-Health check: `GET /api/health`. Runtime state: `GET /api/runtime/status`.
+Readiness / health check: `GET /api/health` — **200 `{…,"state":"ready","ready":true}`**
+only once boot has fully completed, **503 `ready:false`** while starting, after a boot
+failure, or while shutting down (contentless beyond liveness/readiness). Runtime state:
+`GET /api/runtime/status`.
 Projection backlog: `GET /api/export/status`.
 
 For production (PostgreSQL setup, PM2, nginx/SSE, backup, the CalSpread→StrikeEdge

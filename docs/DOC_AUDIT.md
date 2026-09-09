@@ -115,7 +115,7 @@ All verified against code, not against the prose:
 - **Proxied port**: `deploy/nginx.conf` upstream `127.0.0.1:3001` == documented default `PORT` (`src/config.ts` `intOr(env.PORT, 3001)`). OK.
 - **`kill_timeout` vs `SHUTDOWN_TIMEOUT_MS`**: `ecosystem.config.cjs kill_timeout: 30000` > `SHUTDOWN_TIMEOUT_MS` default `20000` (read from `src/config.ts` `intOr(env.SHUTDOWN_TIMEOUT_MS, 20_000)`, **not** from the docs). OK — 10s headroom.
 - **SSE settings on the route that serves `/api/box/stream`**: the `location = /api/box/stream` block contains all four — `proxy_buffering off`, `proxy_cache off`, `proxy_read_timeout 3600s`, and `proxy_set_header X-Accel-Buffering no`. The stream route really is `app.get("/api/box/stream", …)` at `src/box/routes.ts:540`. OK.
-- **Health-check path**: `deploy`/docs use `GET /api/health`; the real endpoint is `app.get("/api/health", …)` at `src/index.ts:237` returning `{ ok:true, service:"strikedge", shutting_down }` — exactly the body DEPLOYMENT.md §6 prints. OK.
+- **Health-check path**: `deploy`/docs use `GET /api/health`; the real endpoint is `app.get("/api/health", …)` in `src/index.ts` returning `{ service:"strikedge", state, ready, shutting_down }` with HTTP 200 only when `state==="ready"` and HTTP 503 while `starting`/`failed`/`shutting_down` (FIX-6 honest readiness) — matching the body and response-code table DEPLOYMENT.md §6 prints. OK.
 - **nginx syntax validation**: attempted (see run log). Result recorded below.
 
 ---

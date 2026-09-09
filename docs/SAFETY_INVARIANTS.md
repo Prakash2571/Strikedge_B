@@ -75,6 +75,32 @@ Tests added — `tests/invariants/exitImmunityProtectiveCancel.test.mjs` (3 test
    the **negative control**: proves the gate is `canManageExposure()` (not an accidental dependence
    on entry state), and that test 2 is not vacuous.
 
+### The HTTP readiness gate can NEVER block AUTOMATIC risk reduction
+
+The consolidated HTTP readiness gate (`src/index.ts`) refuses **all** mutating HTTP requests while
+the process is not `ready`, which includes the operator's **manual** risk-reducing routes
+(`/api/box/live/flatten`, `/api/box/live/cancel-working`, `/api/box/live/reconcile`,
+`/api/box/trades/:id/close`, and the emergency-flatten execution control). This is a **deliberate,
+bounded** restriction on MANUAL reduction only:
+
+- While `starting`, no durable exposure has been adopted and reconciliation has not run, so a manual
+  flatten would act on an empty, un-reconciled world — it must be refused. While `shutting_down`,
+  refusing mutations is pre-existing drain behaviour (the old `shuttingDown` middleware). `failed`
+  likewise refuses.
+- **AUTOMATIC reduction is never gated.** Automatic exit, protective cancellation, reconciliation
+  and emergency residual flattening are engine-internal and do NOT pass through the HTTP readiness
+  middleware at all. Structurally, `ReadinessController` is imported **only** by `src/index.ts`; no
+  engine module under `src/box/**` references it or its `mutationsAllowed()`. An HTTP gate therefore
+  cannot stop risk reduction — the invariant that actually matters.
+- Positions are preserved and re-adopted on restart (SIGTERM never liquidates; boot re-adopts before
+  becoming `ready`), so the manual-reduction window closes as soon as the process is `ready`.
+
+Tests added — `tests/readiness/riskReductionGating.test.mjs` (7 tests, all green): each manual route
+returns 503 with the readiness reason while `starting` and while `shutting_down`, is reachable once
+`ready`; the ReadinessController is imported only by the HTTP layer (structural, both directions);
+and a PROTECTIVE_CANCEL and an EXIT reach the broker through the real engine order manager with **no
+readiness controller anywhere in the stack** (behavioural).
+
 ### package.json changed
 
 Added `"test:invariants": "node --test \"tests/invariants/*.test.mjs\""`. **Flagged for

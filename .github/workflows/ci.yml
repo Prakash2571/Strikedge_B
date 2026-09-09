@@ -273,6 +273,26 @@ jobs:
           NODE_OPTIONS: --import ${{ env.EGRESS_GUARD }}
         run: set -o pipefail; npm run test:shutdown 2>&1 | tee tests-out/shutdown.log
 
+      # Startup-readiness suite. Hermetic and DB-INDEPENDENT by design (it drives the
+      # readiness state machine plus a real loopback express app), so it needs neither
+      # PostgreSQL nor MongoDB — but it still runs under the armed egress guard like
+      # every other suite, and is included in the no-silent-skips audit below.
+      - name: Startup-readiness suite (npm run test:readiness)
+        env:
+          NODE_OPTIONS: --import ${{ env.EGRESS_GUARD }}
+        run: set -o pipefail; npm run test:readiness 2>&1 | tee tests-out/readiness.log
+
+      # Frontend/backend contract suite. Validates REAL serialized responses (real loopback HTTP
+      # against the mounted route registrars with a real PG-backed session, plus direct calls to the
+      # real serializers/engine methods) against the versioned schemas in contract/. A backend
+      # response-shape change that breaks the frontend fails HERE. It needs PostgreSQL (the
+      # HTTP-with-session paths use migration 007), runs under the armed egress guard like every
+      # other suite, and is included in the no-silent-skips audit below.
+      - name: Contract suite (npm run test:contract)
+        env:
+          NODE_OPTIONS: --import ${{ env.EGRESS_GUARD }}
+        run: set -o pipefail; npm run test:contract 2>&1 | tee tests-out/contract.log
+
       # ── The egress-guard marker audit (defence in depth) ───────────────────────────────
       #
       # The runtime guard already fails a suite by THROWING on a non-loopback request. This step is
@@ -285,7 +305,7 @@ jobs:
         run: |
           set -euo pipefail
           fail=0
-          for suite in unit pg projector tokens switch access shutdown; do
+          for suite in unit pg projector tokens switch access shutdown readiness contract; do
             log="tests-out/${suite}.log"
             if [ ! -f "$log" ]; then
               echo "FAIL: ${suite}: no captured log — suite did not run."; fail=1; continue
@@ -323,8 +343,10 @@ jobs:
           set -euo pipefail
           # These suites MUST touch a real database and MUST NOT skip. (The Box unit suite is not in
           # this list: its own owner enforces zero skips within the suite; here we guard the ones
-          # that would silently skip specifically because a database is absent.)
-          db_suites="pg projector tokens switch access"
+          # that would silently skip specifically because a database is absent.) The readiness suite
+          # is DB-INDEPENDENT but is included too: it must never skip and must always run, so a glob
+          # that matched no files (the suite never ran) turns the build RED here as well.
+          db_suites="pg projector tokens switch access readiness contract"
           fail=0
           for suite in $db_suites; do
             log="tests-out/${suite}.log"
