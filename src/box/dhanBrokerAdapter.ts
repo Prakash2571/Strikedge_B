@@ -52,6 +52,7 @@ import {
   type BrokerRejectFamily,
 } from "./brokerAdapter.js";
 import type { BoxConfig } from "./config.js";
+import { Deadline, monotonicNow, type MonotonicClock } from "../brokers/deadline.js";
 import {
   evaluateExecutionEvidence,
   readCumulativeQuantity,
@@ -123,6 +124,26 @@ export interface DhanAdapterConfig {
    * different networks and different gateways, so a pooled distribution would describe neither.
    */
   timing?: ExecutionTimingRecorder;
+  /**
+   * MONOTONIC clock for elapsed/deadline measurement (Defect D).
+   *
+   * The poll and protective-cancel loops used `Date.now()`, so a wall-clock step (NTP correction,
+   * VM time sync) could shorten or lengthen a deadline the safety argument depends on. Wall-clock
+   * time is still used for `created_at`/`updated_at`, which are AUDIT stamps and must stay
+   * comparable with broker timestamps; only DURATIONS move to the monotonic clock.
+   *
+   * Optional so existing config literals keep compiling; defaults to `performance.now()`.
+   */
+  monotonic?: MonotonicClock;
+  /**
+   * ABSOLUTE end-to-end budget for ONE order mutation, in ms (Defect D).
+   *
+   * Started BEFORE the adapter's own transport pacer, so the pacer wait, the lower Dhan HTTP
+   * pacing queue, the network round trip and the response body all draw on the SAME budget instead
+   * of each layer restarting its own timer. Absent, the transport's own `timeoutMs` applies as
+   * before and the adapter imposes nothing extra.
+   */
+  orderMutationDeadlineMs?: number;
 }
 
 export function dhanAdapterConfigFromBoxConfig(
@@ -140,6 +161,7 @@ export function dhanAdapterConfigFromBoxConfig(
     workingTimeoutMs: cfg.liveWorkingTimeoutMs,
     partialTimeoutMs: cfg.livePartialTimeoutMs,
     cancelTimeoutMs: cfg.liveCancelTimeoutMs,
+    orderMutationDeadlineMs: cfg.liveOrderMutationDeadlineMs,
     brokerMinIntervalMs: cfg.liveBrokerMinIntervalMs,
     pacing: resolveBrokerPacing("dhan", cfg.liveBrokerMinIntervalMs, cfg.liveBrokerOrderMinIntervalMs),
     maxModifications: cfg.liveMaxModifications,
@@ -300,6 +322,23 @@ export class DhanBrokerAdapter implements BrokerAdapter {
    * paces every HTTP call at `DHAN_MIN_INTERVAL_MS` inside src/brokers/dhan/http.ts, which is
    * why the Dhan order floor in brokerPacing.ts matches that value rather than going lower.
    */
+  /** The MONOTONIC clock in force for elapsed/deadline measurement (Defect D). */
+  private mono(): number {
+    return (this.cfg.monotonic ?? monotonicNow)();
+  }
+
+  /**
+   * An absolute end-to-end budget for one order mutation, or undefined when none is configured.
+   *
+   * Created by the CALLER before `this.call(...)`, so the adapter's own transport-pacer wait is
+   * inside the budget rather than beside it.
+   */
+  private mutationDeadline(): Deadline | undefined {
+    const budget = this.cfg.orderMutationDeadlineMs;
+    if (budget === undefined || !Number.isFinite(budget) || budget <= 0) return undefined;
+    return Deadline.in(budget, () => this.mono());
+  }
+
   private call<T>(op: () => Promise<T>, klass: BrokerPacingClass = "general"): Promise<T> {
     return this.pacer.run(op, klass);
   }
@@ -348,6 +387,10 @@ export class DhanBrokerAdapter implements BrokerAdapter {
       beforePost?.();
       this.mark(req.client_order_id, "http_request_started");
     };
+    // ABSOLUTE END-TO-END BUDGET, started BEFORE the transport pacer (Defect D). The pacer wait,
+    // the lower HTTP pacing queue, the network round trip and the body read share this one budget;
+    // an expiry while queued releases the caller promptly and provably transmits nothing.
+    const mutationDeadline = this.mutationDeadline();
     try {
       placed = await this.call(() => {
         return this.client.placeOrder({
@@ -362,7 +405,7 @@ export class DhanBrokerAdapter implements BrokerAdapter {
           securityId: String(identity.securityId),
           quantity: req.quantity,
           price: req.pricing.limit_price,
-        }, { beforeSend });
+        }, { beforeSend, ...(mutationDeadline ? { deadline: mutationDeadline } : {}) });
       }, "order_mutation");
       this.mark(req.client_order_id, "http_response");
     } catch (err) {
@@ -375,6 +418,18 @@ export class DhanBrokerAdapter implements BrokerAdapter {
       // Recorded on the failure path too: a timeout's duration is only measurable if the
       // response event is marked whether or not it succeeded.
       this.mark(req.client_order_id, "http_response");
+
+      // PROVEN NO-POST vs AMBIGUITY (Defect D). A deadline that expired while the write sat in a
+      // queue was abandoned INSIDE this process before `fetch` was ever called, so there is
+      // categorically nothing at the broker to reconcile. Treating it as ambiguous would spend a
+      // broker read and a rate-budget slot to discover something already known, and would leave the
+      // attempt quarantined as RECONCILIATION_REQUIRED when it is simply a refusal. The transport
+      // only sets `transmitted: false` when it can prove the wire was never used.
+      if (err instanceof DhanNetworkError && err.transmitted === false) {
+        this.orders.delete(req.client_order_id);
+        this.clientByCorrelation.delete(correlationId);
+        throw new BrokerPreSubmitRefusedError(req.client_order_id, "pre_post", true, err.message);
+      }
       // A DEFINITIVE 4xx (not 429) means Dhan understood and refused.
       if (err instanceof DhanError && err.isDefinitive && !(err instanceof DhanRateLimitError)) {
         order.state = "REJECTED";
@@ -562,7 +617,9 @@ export class DhanBrokerAdapter implements BrokerAdapter {
   /** Poll until terminal, then protectively cancel if the deadline passes. */
   private async waitForResolution(clientOrderId: string, initial: BrokerOrder): Promise<BrokerOrder> {
     let current = initial;
-    const startedAt = Date.now();
+    // MONOTONIC (Defect D): these are DURATIONS, and a wall-clock step must never shorten or
+    // lengthen a deadline that decides whether an order is protectively cancelled.
+    const startedAt = this.mono();
     let firstPartialAt: number | null = current.filled_quantity > 0 ? startedAt : null;
 
     // Hard iteration cap in addition to the wall-clock deadlines. A broker that keeps
@@ -579,11 +636,11 @@ export class DhanBrokerAdapter implements BrokerAdapter {
         // Out of budget without a terminal answer: quarantine rather than guess.
         return this.protectiveCancelAndConfirm(clientOrderId, current);
       }
-      const elapsed = Date.now() - startedAt;
+      const elapsed = this.mono() - startedAt;
       const ackDeadlineHit = current.state === "ACKNOWLEDGED" && elapsed > this.cfg.ackTimeoutMs;
       const workingDeadlineHit = elapsed > this.cfg.workingTimeoutMs;
       const partialDeadlineHit =
-        firstPartialAt !== null && Date.now() - firstPartialAt > this.cfg.partialTimeoutMs;
+        firstPartialAt !== null && this.mono() - firstPartialAt > this.cfg.partialTimeoutMs;
 
       if (ackDeadlineHit || workingDeadlineHit || partialDeadlineHit) {
         return this.protectiveCancelAndConfirm(clientOrderId, current);
@@ -592,7 +649,7 @@ export class DhanBrokerAdapter implements BrokerAdapter {
       const refreshed = await this.refresh(clientOrderId);
       if (!refreshed) break;
       current = refreshed;
-      if (current.filled_quantity > 0 && firstPartialAt === null) firstPartialAt = Date.now();
+      if (current.filled_quantity > 0 && firstPartialAt === null) firstPartialAt = this.mono();
     }
     return cloneOrder(current);
   }
@@ -618,7 +675,14 @@ export class DhanBrokerAdapter implements BrokerAdapter {
       // moment we commit to cancelling.
       this.mark(clientOrderId, "cancel_requested");
       try {
-        await this.call(() => this.client.cancelOrder(order.broker_order_id!), "order_mutation");
+        await this.call(
+          () => this.client.cancelOrder(order.broker_order_id!, {
+            // A protective cancel is bounded by its OWN confirmation window, started here so the
+            // pacer wait counts against it (Defect D).
+            deadline: Deadline.in(this.cfg.cancelTimeoutMs, () => this.mono()),
+          }),
+          "order_mutation",
+        );
         // Dhan accepted the cancel REQUEST. Not a cancellation: the loop below keeps confirming
         // precisely because the order may be filling right now.
         this.mark(clientOrderId, "cancel_acknowledged");
@@ -627,13 +691,14 @@ export class DhanBrokerAdapter implements BrokerAdapter {
         console.warn(`[Dhan] protective cancel failed for ${clientOrderId}:`, err);
       }
     }
-    const deadline = Date.now() + this.cfg.cancelTimeoutMs;
+    // MONOTONIC (Defect D). A protective cancel's confirmation window is a safety deadline.
+    const cancelDeadlineAt = this.mono() + this.cfg.cancelTimeoutMs;
     const maxConfirmPolls = Math.max(
       5,
       Math.ceil(this.cfg.cancelTimeoutMs / Math.max(1, this.cfg.brokerMinIntervalMs)) + 5,
     );
     let confirmPolls = 0;
-    while (Date.now() < deadline && confirmPolls < maxConfirmPolls) {
+    while (this.mono() < cancelDeadlineAt && confirmPolls < maxConfirmPolls) {
       confirmPolls++;
       await sleep(this.cfg.brokerMinIntervalMs);
       const refreshed = await this.refresh(clientOrderId);

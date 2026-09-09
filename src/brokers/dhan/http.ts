@@ -181,22 +181,65 @@ export class DhanHttp {
     // absolute budget rather than a fresh timer per layer.
     const deadline = opts.deadline ?? Deadline.in(this.cfg.timeoutMs, () => this.now());
 
+    // ── PRE-ADMISSION CHECK (Defect D) ───────────────────────────────────────────────────
+    //
+    // The deadline starts BEFORE queue admission, so an already-expired budget must not even
+    // join the tail: admitting it would occupy a queue slot for work that can never run.
+    if (deadline.expired()) {
+      throw new DhanNetworkError(
+        `Dhan request abandoned before queue admission: deadline (${deadline.budgetMs}ms) had already expired (${opts.method} ${opts.path}).`,
+        null,
+        false,
+      );
+    }
+
+    /**
+     * Set once the caller has been released by its own deadline.
+     *
+     * THE DEFECT THIS CLOSES. `run` used to be the FIRST place the deadline was consulted, and
+     * `run` only executes once the serialized tail reaches it — i.e. after the preceding request
+     * finishes. A queued write with a 20ms budget behind a 400ms request was therefore settled
+     * ~429ms later. It correctly avoided the POST, but it held its caller (and with it an entry
+     * attempt, a queue slot and any dependent leg's barrier) for twenty times its budget.
+     *
+     * The flag is what makes the release SAFE rather than merely prompt: the queued closure still
+     * runs later, and it must refuse instead of transmitting work whose caller is long gone.
+     */
+    let abandoned = false;
+    /**
+     * Set at the LAST instant before `fetch`, and never cleared.
+     *
+     * This is what keeps `transmitted: false` a PROVEN claim rather than a hopeful one. The expiry
+     * alarm races the queued work, so without this flag it could win while the network call was
+     * already in flight and report a no-POST for a request that had reached the broker — the exact
+     * ambiguity collapse errors.ts exists to prevent. Once the wire has been used the alarm stands
+     * down and the AbortController's timeout produces the (correctly ambiguous) error instead.
+     */
+    let sent = false;
+
     const run = async (): Promise<T> => {
-      // QUEUE + PACING WAIT, bounded by the deadline (Defect 4). If the deadline already
-      // expired while this write sat in the serialized tail, abandon it now rather than
-      // sending it late — an expired queued mutation must NEVER transmit.
-      if (deadline.expired()) {
+      // QUEUE + PACING WAIT, bounded by the deadline (Defect 4). If the deadline expired while
+      // this write sat in the serialized tail — whether or not the caller has already been
+      // released — abandon it rather than sending it late. An expired queued mutation must NEVER
+      // transmit.
+      if (abandoned || deadline.expired()) {
+        abandoned = true;
         throw new DhanNetworkError(
           `Dhan request abandoned before send: deadline (${deadline.budgetMs}ms) expired while queued (${opts.method} ${opts.path}).`,
+          null,
+          false,
         );
       }
       const gap = this.cfg.minIntervalMs - (this.now() - this.lastAt);
       if (gap > 0) {
         // Never sleep past the deadline; a pacing wait must not itself blow the budget.
         await sleep(Math.min(gap, deadline.timerMs()));
-        if (deadline.expired()) {
+        if (abandoned || deadline.expired()) {
+          abandoned = true;
           throw new DhanNetworkError(
             `Dhan request abandoned before send: deadline (${deadline.budgetMs}ms) expired during pacing (${opts.method} ${opts.path}).`,
+            null,
+            false,
           );
         }
       }
@@ -208,6 +251,9 @@ export class DhanHttp {
       opts.beforeSend?.();
 
       this.lastAt = this.now();
+      // From here on the request may have reached the broker, so no later code path may claim a
+      // proven no-POST.
+      sent = true;
 
       // `fetch` has no timeout, so an unresponsive socket would hang forever and wedge the
       // pacing tail behind it. The controller is armed for the REMAINING budget, and — the
@@ -286,8 +332,55 @@ export class DhanHttp {
 
     // Chain onto the tail so requests are paced rather than bursting.
     const scheduled = this.tail.then(run, run);
+    // The tail must always have a handled rejection: the caller may be released by the expiry
+    // alarm below and never observe `scheduled` at all.
     this.tail = scheduled.catch(() => undefined);
-    return scheduled;
+
+    // ── PROMPT SETTLEMENT (Defect D) ─────────────────────────────────────────────────────
+    //
+    // The caller is released the moment ITS OWN budget lapses, not when the queue reaches it. The
+    // queued closure keeps its place in the tail (removing it would break pacing for everything
+    // behind it) but is marked abandoned, so it can only ever refuse.
+    //
+    // The alarm's timer is CANCELLED as soon as the request settles, so a healthy request with a
+    // multi-second budget does not leave a live timer holding the event loop open.
+    let settled = false;
+    // A HOLDER, not a bare `let`: the assignment happens inside the alarm closure, and TypeScript's
+    // control-flow analysis would otherwise narrow the variable to `null` at the `finally` below.
+    const alarm: { cancel: (() => void) | null } = { cancel: null };
+    /** A promise that never settles: "this alarm has no opinion any more." */
+    const standDown = (): Promise<never> => new Promise<never>(() => {});
+    const expiryAlarm = async (): Promise<never> => {
+      // `timerMs()` has a 1ms floor, so this can never spin. The loop exists for an INJECTED
+      // monotonic clock, which may not have reached the deadline when the real timer fires.
+      while (!settled) {
+        // The wire has been used: the real request owns the outcome from here, and its
+        // AbortController already bounds it. Anything this alarm said now would be a guess.
+        if (sent) return standDown();
+        if (deadline.expired()) {
+          abandoned = true;
+          throw new DhanNetworkError(
+            `Dhan request abandoned before send: deadline (${deadline.budgetMs}ms) expired while queued (${opts.method} ${opts.path}).`,
+            null,
+            false,
+          );
+        }
+        const nap = cancellableSleep(deadline.timerMs());
+        alarm.cancel = nap.cancel;
+        await nap.promise;
+        alarm.cancel = null;
+      }
+      return standDown();
+    };
+
+    try {
+      return await Promise.race([scheduled, expiryAlarm()]);
+    } finally {
+      settled = true;
+      // A cancelled nap never resolves, so the alarm simply stops instead of rejecting into a
+      // race nobody is listening to any more.
+      alarm.cancel?.();
+    }
   }
 
   /**
@@ -355,4 +448,26 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+/**
+ * A sleep that can be abandoned.
+ *
+ * Used only by the deadline alarm (Defect D). The alarm exists to release a caller whose budget
+ * lapsed while queued; once the request has settled the alarm is pointless, and leaving its timer
+ * armed would hold the event loop open for the remainder of a multi-second budget. Cancelling
+ * clears the timer and leaves the promise permanently pending, which is exactly what "this alarm no
+ * longer has an opinion" should look like — it must not resolve into a race nobody is watching.
+ */
+function cancellableSleep(ms: number): { promise: Promise<void>; cancel: () => void } {
+  let handle: NodeJS.Timeout | undefined;
+  const promise = new Promise<void>((resolve) => {
+    handle = setTimeout(resolve, ms);
+  });
+  return {
+    promise,
+    cancel: () => {
+      if (handle !== undefined) clearTimeout(handle);
+    },
+  };
 }

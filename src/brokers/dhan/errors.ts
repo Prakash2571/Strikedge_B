@@ -66,11 +66,22 @@ export class DhanRateLimitError extends DhanError {
 /**
  * The request never produced a usable response: timeout, abort, DNS, socket error.
  *
- * ALWAYS ambiguous for a write. This is the case that must never be blindly
- * retried on order submission.
+ * AMBIGUOUS FOR A WRITE BY DEFAULT. This is the case that must never be blindly retried on order
+ * submission — the order may be live at the exchange.
+ *
+ * `transmitted: false` is the ONE exception, and it is a positive claim, not a guess: the request
+ * was abandoned INSIDE this process before `fetch` was ever called, so no bytes reached the broker.
+ * The two cases must stay separate (Defect D): reconciling by correlation id after a proven no-POST
+ * costs a broker read, a rate-budget slot and latency to discover something the process already
+ * knows. Anything that cannot prove it never sent leaves this `true` and stays ambiguous.
  */
 export class DhanNetworkError extends DhanError {
-  constructor(message: string, body: unknown = null) {
+  constructor(
+    message: string,
+    body: unknown = null,
+    /** False ONLY when it is PROVEN that no HTTP request was transmitted. */
+    readonly transmitted: boolean = true,
+  ) {
     super(message, 0, "NETWORK", body);
     this.name = "DhanNetworkError";
   }

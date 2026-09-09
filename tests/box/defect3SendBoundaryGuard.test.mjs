@@ -128,6 +128,19 @@ test("DHAN: NO async wait sits between the guard and the fetch (structural)", as
 
 /* ─────────────────────────────── Zerodha / Kite ─────────────────────────────── */
 
+/**
+ * The base URL these tests hand the REAL `KiteHttpTransport`.
+ *
+ * Loopback on the DISCARD port, not the live broker host. `fetchImpl` is injected, so no request
+ * ever leaves the process and the hostname is never resolved — but naming the live host in
+ * executable test code is exactly what `.github/ci/no-live-hostnames.sh` exists to stop, and
+ * "it happens to be intercepted" is not a property CI can verify. What these tests actually assert
+ * is ORDERING (the send guard fires after the async token hop, immediately before the wire) and
+ * ABSENCE (no fetch at all on a refusal); neither depends on the URL. Loopback:9 is additionally
+ * unroutable, so the fixture is safe even if a future refactor dropped the injected fetch.
+ */
+const KITE_BASE_URL = "http://127.0.0.1:9/kite";
+
 const KITE_REQUEST = {
   client_order_id: "BOX:trade-7:ENTRY:k1_ce:attempt-1",
   role: "k1_ce", trade_id: "trade-7", attempt_id: "attempt-1", purpose: "ENTRY", phase: "entry",
@@ -137,7 +150,7 @@ const KITE_REQUEST = {
 
 function kiteStack(fetchImpl) {
   const transport = new KiteHttpTransport({
-    apiKey: "k", accessToken: () => "tok", timeoutMs: 5_000, baseUrl: "https://api.kite.trade", fetchImpl,
+    apiKey: "k", accessToken: () => "tok", timeoutMs: 5_000, baseUrl: KITE_BASE_URL, fetchImpl,
   });
   const adapter = new KiteBrokerAdapter(transport, {
     executionMode: "live", enabled: true,
@@ -173,7 +186,7 @@ test("KITE: the guard fires AFTER the async token resolution, immediately before
   const transport = new KiteHttpTransport({
     apiKey: "k",
     accessToken: async () => { await Promise.resolve(); tokenResolved = true; return "tok"; },
-    timeoutMs: 5_000, baseUrl: "https://api.kite.trade",
+    timeoutMs: 5_000, baseUrl: KITE_BASE_URL,
     fetchImpl: async () => { events.push("fetch"); return new Response(JSON.stringify({ data: { order_id: "K1" } }), { status: 200, headers: { "content-type": "application/json" } }); },
   });
   const adapter2 = new KiteBrokerAdapter(transport, {

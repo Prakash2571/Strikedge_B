@@ -453,6 +453,15 @@ export interface BoxConfig {
   liveWorkingTimeoutMs: number;
   livePartialTimeoutMs: number;
   liveCancelTimeoutMs: number;
+  /**
+   * ABSOLUTE end-to-end budget for ONE live order mutation (ms).
+   *
+   * Started BEFORE queue admission, so the adapter's transport pacer, the broker HTTP pacing
+   * queue, the network round trip and the response body all draw on this ONE budget rather than
+   * each layer restarting its own timer. A mutation whose budget lapses while still queued is
+   * released promptly and provably transmits nothing. See src/brokers/deadline.ts.
+   */
+  liveOrderMutationDeadlineMs: number;
   liveMaxModifications: number;
   liveMaxChaseTicks: number;
   /**
@@ -1056,6 +1065,7 @@ export function loadBoxConfig(): BoxConfig {
     liveWorkingTimeoutMs: clampInt("BOX_LIVE_WORKING_TIMEOUT_MS", 30_000, 1_000, 10 * 60_000),
     livePartialTimeoutMs: clampInt("BOX_LIVE_PARTIAL_TIMEOUT_MS", 10_000, 500, 5 * 60_000),
     liveCancelTimeoutMs: clampInt("BOX_LIVE_CANCEL_TIMEOUT_MS", 5_000, 250, 60_000),
+    liveOrderMutationDeadlineMs: clampInt("BOX_LIVE_ORDER_MUTATION_DEADLINE_MS", 4_000, 250, 30_000),
     liveMaxModifications: clampInt("BOX_LIVE_MAX_MODIFICATIONS", 2, 0, 10),
     liveMaxChaseTicks: clampInt("BOX_LIVE_MAX_CHASE_TICKS", 2, 0, 20),
     liveBrokerMinIntervalMs: clampInt("BOX_LIVE_BROKER_MIN_INTERVAL_MS", 250, 50, 5_000),
@@ -1241,6 +1251,7 @@ export function configSnapshot(cfg: BoxConfig): BoxScannerConfigSnapshot {
     live_working_timeout_ms: cfg.liveWorkingTimeoutMs,
     live_partial_timeout_ms: cfg.livePartialTimeoutMs,
     live_cancel_timeout_ms: cfg.liveCancelTimeoutMs,
+    live_order_mutation_deadline_ms: cfg.liveOrderMutationDeadlineMs,
     live_max_modifications: cfg.liveMaxModifications,
     live_max_chase_ticks: cfg.liveMaxChaseTicks,
     live_broker_min_interval_ms: cfg.liveBrokerMinIntervalMs,
