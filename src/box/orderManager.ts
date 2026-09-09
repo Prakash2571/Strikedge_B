@@ -109,6 +109,18 @@ export interface LiveEntryTransportGuard {
   readonly hedge: boolean;
   /** How many BUY hedge legs this attempt has. Uncovered SELLs wait for all of them. */
   readonly hedgeCount: number;
+  /**
+   * CROSS-LEG COHERENCE, re-evaluated against the CURRENT four books at the send boundary.
+   *
+   * Supplied by the gateway, which is the only layer that can see all four books, the socket
+   * generation and the configured policy. Returns null when the snapshot is still coherent, or the
+   * reason it is not. Consulted ONLY at `pre_post`, and only while the attempt has taken no
+   * exposure — see `cross_leg_incoherent` in liveEntryGuard.ts for why.
+   *
+   * Optional so that callers which cannot observe the books (and every existing test) are unchanged;
+   * absent means "no objection from here", never "coherence is proven".
+   */
+  readonly sendBoundaryCoherence?: () => string | null;
 }
 
 /**
@@ -284,6 +296,17 @@ export interface OrderManagerStatus {
    * successful one because the guarded write returns the unchanged document either way.
    */
   durableTransitionRefusals: number;
+  /**
+   * Four-leg coherence that had degraded at the SEND BOUNDARY after the attempt already held
+   * exposure, and the most recent reason.
+   *
+   * The completion policy deliberately does not refuse in that state (a complete box is hedged;
+   * abandoning it manufactures a partial entry and a recovery cost), so this is what keeps the
+   * decision VISIBLE rather than silent. A non-zero count with real boxes is the signal that the
+   * configured dispersion limit and the actual feed timing disagree.
+   */
+  coherenceDegradedAfterExposure: number;
+  lastCoherenceDegradation: string | null;
 }
 
 export interface OrderManagerLimits {
@@ -474,6 +497,16 @@ export class BoxOrderManager {
   private flattenChargeMutationGeneration = 0;
   private readonly flattenChargeMutationsByDay = new Map<string, FlattenChargeMutation[]>();
   private reconcileTimer: NodeJS.Timeout | null = null;
+  /**
+   * How many times four-leg coherence had degraded at the send boundary AFTER the attempt already
+   * held exposure, and the most recent reason.
+   *
+   * Counted rather than acted on: the completion policy deliberately does NOT refuse in that state
+   * (see `entryCrossLegCoherenceGap`), so this is the record that keeps the decision visible instead
+   * of silent. Fixed cardinality — a counter and one bounded string.
+   */
+  private coherenceDegradedAfterExposure = 0;
+  private lastCoherenceDegradation: string | null = null;
   private disposed = false;
   private lastReconciledAt: number | null = null;
   /** Guarded durable transitions the intent state machine refused. Bounded counter. */
@@ -1042,6 +1075,8 @@ export class BoxOrderManager {
       orphanOrders: this.orphanOrders.map(cloneOrder),
       lastReconciledAt: this.lastReconciledAt,
       durableTransitionRefusals: this.durableTransitionRefusals,
+      coherenceDegradedAfterExposure: this.coherenceDegradedAfterExposure,
+      lastCoherenceDegradation: this.lastCoherenceDegradation,
     };
   }
 
@@ -1275,6 +1310,9 @@ export class BoxOrderManager {
       // BLOCKS the SELL. This inverts the old "no named failure ⇒ permitted" behaviour that let a
       // CANCELLED/zero-fill hedge authorise a naked SELL.
       hedgeCoverageGap: guard.hedge ? null : this.entryHedgeCoverageGap(request, gate, stage),
+      // CROSS-LEG COHERENCE at the final boundary only, and only while this attempt has taken NO
+      // exposure. See `entryCrossLegCoherenceGap`.
+      crossLegCoherenceGap: this.entryCrossLegCoherenceGap(guard, gate, stage),
     });
     if (!decision.allowed) {
       this.entryGuardRefusals.set(stage, (this.entryGuardRefusals.get(stage) ?? 0) + 1);
@@ -1329,6 +1367,59 @@ export class BoxOrderManager {
       return gate.coverage.coverageGapFor(requirements) ?? "hedge coverage could not be claimed";
     }
     return null;
+  }
+
+  /**
+   * The cross-leg coherence objection at the FINAL send boundary, or null to proceed.
+   *
+   * DEFECT C. The gateway checks four-leg coherence twice, both BEFORE the manager is called. A leg
+   * then waits — queued, persisted, parked on the hedge-first barrier, paced by the adapter — and
+   * the books can deteriorate throughout. Per-leg freshness cannot see it: four books can each be
+   * young while being young at four DIFFERENT instants. This carries the check into the one place
+   * that is actually the send boundary.
+   *
+   * TWO DELIBERATE RESTRICTIONS:
+   *
+   *  1. `pre_post` ONLY. Earlier checkpoints are already covered by the gateway's own pre-enqueue
+   *     evaluation, and re-refusing there would just duplicate a decision with a worse reason.
+   *
+   *  2. NO EXPOSURE ONLY. If any leg of this attempt has already POSTed, the attempt COMPLETES the
+   *     hedged box instead. Refusing leg 4 after legs 1-3 reached the broker manufactures a partial
+   *     entry and a real recovery cost, whereas a complete box is hedged by construction and the
+   *     post-fill economics gate already unwinds one that turned out uneconomic. The degradation is
+   *     still recorded on the attempt's diagnostics, so it is never silently discarded.
+   *
+   * A callback that THROWS has told us nothing, and nothing is not permission — but it is also not
+   * proof of incoherence, and failing an ENTRY closed on a diagnostic bug would be its own defect.
+   * A throw is therefore treated as an explicit objection, matching `stillWantedSafely`.
+   */
+  private entryCrossLegCoherenceGap(
+    guard: LiveEntryTransportGuard,
+    gate: EntryTransportGate | undefined,
+    stage: LiveEntryGuardStage,
+  ): string | null {
+    if (stage !== "pre_post") return null;
+    if (guard.sendBoundaryCoherence === undefined) return null;
+    const alreadyExposed = gate !== undefined &&
+      [...gate.decided.values()].some((outcome) => outcome === "posted");
+    if (alreadyExposed) {
+      // COMPLETION POLICY. Record it, do not refuse it.
+      try {
+        const gap = guard.sendBoundaryCoherence();
+        if (gap !== null) {
+          this.coherenceDegradedAfterExposure++;
+          this.lastCoherenceDegradation = gap;
+        }
+      } catch {
+        this.coherenceDegradedAfterExposure++;
+      }
+      return null;
+    }
+    try {
+      return guard.sendBoundaryCoherence();
+    } catch (error) {
+      return `cross-leg coherence could not be evaluated: ${error instanceof Error ? error.message : String(error)}`;
+    }
   }
 
   /** {@link evaluateEntryGuard} as a reason string, matching the `*BlockReason` convention. */

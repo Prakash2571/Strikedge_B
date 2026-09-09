@@ -68,7 +68,25 @@ export type LiveEntryGuardRefusal =
    * The new code fires whenever coverage is not POSITIVELY PROVEN, so absent/stale/insufficient
    * evidence blocks the SELL by default. See hedgeCoverageLedger.ts.
    */
-  | "hedge_coverage_unproven";
+  | "hedge_coverage_unproven"
+
+  /**
+   * The four legs' books no longer form a coherent snapshot at the FINAL send boundary.
+   *
+   * The gateway evaluates cross-leg coherence twice before enqueueing, but a leg then waits: it is
+   * queued, persisted, parked on the hedge-first barrier and paced by the adapter. Books can
+   * deteriorate throughout that window, and per-leg freshness cannot see it — four books can each
+   * be young while being young at four DIFFERENT instants. Reproduced on e357b83: dispersion rising
+   * from 0 to 1,000ms during pacing under a 500ms limit still transmitted all four legs.
+   *
+   * EXPOSURE-AWARE. This refusal is only ever raised while the attempt has taken NO exposure, which
+   * is the only moment at which refusing is free. Once a leg has POSTed, the policy is to COMPLETE
+   * the hedged box and record the degradation: abandoning legs 2-4 would convert a timing blip into
+   * a partial entry with a real recovery cost, and the post-fill economics gate already rejects a
+   * box that turned out uneconomic. It is never applied to an exit or a protective reduction,
+   * because the guard is only ever passed for ENTRY legs.
+   */
+  | "cross_leg_incoherent";
 
 export interface LiveEntryGuardInputs {
   readonly stage: LiveEntryGuardStage;
@@ -109,6 +127,17 @@ export interface LiveEntryGuardInputs {
    * uncovered SELL legs supply a real coverage verdict.
    */
   readonly hedgeCoverageGap: string | null;
+
+  /**
+   * CROSS-LEG COHERENCE at the send boundary, or null when it is not applicable/has not degraded.
+   *
+   * A non-null value is the specific reason the four books no longer form a usable simultaneous
+   * snapshot — receive dispersion, exchange dispersion, a generation split, a per-leg stall. Only
+   * the `pre_post` checkpoint supplies one, and only while the attempt holds NO exposure; see
+   * `cross_leg_incoherent`. Layers that cannot observe the four books pass `null`, which means
+   * "no objection from here", NOT "coherence is proven".
+   */
+  readonly crossLegCoherenceGap: string | null;
 }
 
 export type LiveEntryGuardDecision =
@@ -147,6 +176,12 @@ export function evaluateLiveEntryGuard(inputs: LiveEntryGuardInputs): LiveEntryG
     return refuse(
       "hedge_coverage_unproven",
       `a dependent SELL was refused ${at} because its BUY hedge coverage is not proven: ${inputs.hedgeCoverageGap}`,
+    );
+  }
+  if (inputs.crossLegCoherenceGap !== null) {
+    return refuse(
+      "cross_leg_incoherent",
+      `the four legs no longer form a coherent snapshot ${at}: ${inputs.crossLegCoherenceGap}`,
     );
   }
   if (!inputs.entryAdmissible) {

@@ -377,6 +377,17 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
           transportRank: slot?.rank ?? 0,
           hedge: slot?.hedge ?? false,
           hedgeCount,
+          // DEFECT C. The SAME four-leg decision, re-run against the CURRENT books at the real send
+          // boundary — after queueing, durable persistence, the hedge-first barrier and adapter
+          // pacing. The gateway supplies it because it is the only layer that can see all four
+          // books, the socket generation and the configured policy. The manager decides WHEN to
+          // honour it (no exposure ⇒ refuse; exposure taken ⇒ complete and record).
+          sendBoundaryCoherence: () => {
+            const verdict = this.recheckEntryCoherence(args.candidate, this.now());
+            return verdict.admit
+              ? null
+              : `[${verdict.reason}] ${verdict.detail}`;
+          },
         });
       }),
     );
@@ -507,6 +518,11 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
       // and is asserted only at the manager's post-barrier pre_post checkpoint. Passing `null`
       // means "no coverage objection at this stage", NOT "coverage is proven".
       hedgeCoverageGap: null,
+      // The gateway runs its OWN coherence admission and re-check around these stages
+      // (see the `evaluateEntryCoherence`/`recheckEntryCoherence` calls in the entry path), so
+      // there is no objection to add here. `null` means "nothing to report from this stage",
+      // not "coherence is proven"; the send boundary supplies the real verdict.
+      crossLegCoherenceGap: null,
     });
     return decision.allowed ? null : decision.reason;
   }
