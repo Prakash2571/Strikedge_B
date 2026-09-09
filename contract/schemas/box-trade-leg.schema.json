@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "box-trade-leg.schema.json",
+  "title": "One leg of a serialized Box trade",
+  "description": "Source: src/box/serialize.ts serializeBoxTrade legs.map(). CLOSED. entry_depth/exit_depth are order-book depth snapshots (bids/asks ladders) whose ladder element shape is broker-fed; the ladder is pinned as an OPEN object/null so the contract catches its presence and nullability without coupling to per-level fields.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "role", "token", "tradingsymbol", "exchange", "strike", "instrument_type", "side",
+    "entry_price", "entry_bid", "entry_bid_qty", "entry_ask", "entry_ask_qty", "entry_quote_at",
+    "entry_depth", "detected_price", "entry_slippage", "exit_price", "exit_bid", "exit_bid_qty",
+    "exit_ask", "exit_ask_qty", "exit_quote_at", "exit_depth", "exit_detected_price", "exit_slippage"
+  ],
+  "properties": {
+    "role": { "enum": ["k1_ce", "k2_ce", "k2_pe", "k1_pe"] },
+    "token": { "type": "number" },
+    "tradingsymbol": { "type": "string" },
+    "exchange": { "type": "string" },
+    "strike": { "type": "number" },
+    "instrument_type": { "enum": ["CE", "PE"] },
+    "side": { "enum": ["BUY", "SELL"] },
+    "entry_price": { "type": ["number", "null"] },
+    "entry_bid": { "type": ["number", "null"] },
+    "entry_bid_qty": { "type": ["number", "null"] },
+    "entry_ask": { "type": ["number", "null"] },
+    "entry_ask_qty": { "type": ["number", "null"] },
+    "entry_quote_at": { "type": ["string", "null"], "format": "date-time" },
+    "entry_depth": { "$comment": "OPEN by design: broker-fed order-book ladder or null.", "type": ["object", "null"] },
+    "detected_price": { "type": ["number", "null"] },
+    "entry_slippage": { "type": ["number", "null"] },
+    "exit_price": { "type": ["number", "null"] },
+    "exit_bid": { "type": ["number", "null"] },
+    "exit_bid_qty": { "type": ["number", "null"] },
+    "exit_ask": { "type": ["number", "null"] },
+    "exit_ask_qty": { "type": ["number", "null"] },
+    "exit_quote_at": { "type": ["string", "null"], "format": "date-time" },
+    "exit_depth": { "$comment": "OPEN by design: broker-fed order-book ladder or null.", "type": ["object", "null"] },
+    "exit_detected_price": { "type": ["number", "null"] },
+    "exit_slippage": { "type": ["number", "null"] }
+  }
+}

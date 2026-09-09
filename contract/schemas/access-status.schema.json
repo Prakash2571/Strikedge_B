@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "access-status.schema.json",
+  "title": "GET /api/access/status (200)",
+  "description": "Session probe. Source: src/access/routes.ts status handler. Obtained via REAL HTTP. Two shapes: no live session -> {authenticated:false}; live session -> authenticated:true with role, expires_at and (only when the CSRF cookie is present and matches) csrf_token. Closed on both branches so an added field is caught.",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["authenticated"],
+      "properties": {
+        "authenticated": { "const": false }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["authenticated", "role", "expires_at"],
+      "properties": {
+        "authenticated": { "const": true },
+        "role": { "enum": ["full", "trade"] },
+        "expires_at": { "type": "string", "format": "date-time" },
+        "csrf_token": { "type": "string" }
+      }
+    }
+  ]
+}

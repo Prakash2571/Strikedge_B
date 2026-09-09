@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "box-leg-evaluation.schema.json",
+  "title": "A per-leg quote evaluation",
+  "description": "One element of a BoxOpportunity.legs array. Source: src/box/math.js evaluateCandidate leg shape (BoxLegEvaluation). CLOSED. quote_at is an epoch-millis number (or null), NOT an ISO string, on this in-memory diagnostic path.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "role", "side", "token", "tradingsymbol", "strike", "instrument_type", "price",
+    "qty_at_touch", "bid", "bid_qty", "ask", "ask_qty", "quote_at", "exchange_at", "age_ms",
+    "fresh", "executable"
+  ],
+  "properties": {
+    "role": { "enum": ["k1_ce", "k2_ce", "k2_pe", "k1_pe"] },
+    "side": { "enum": ["BUY", "SELL"] },
+    "token": { "type": "number" },
+    "tradingsymbol": { "type": "string" },
+    "strike": { "type": "number" },
+    "instrument_type": { "enum": ["CE", "PE"] },
+    "price": { "type": ["number", "null"] },
+    "qty_at_touch": { "type": ["number", "null"] },
+    "bid": { "type": ["number", "null"] },
+    "bid_qty": { "type": ["number", "null"] },
+    "ask": { "type": ["number", "null"] },
+    "ask_qty": { "type": ["number", "null"] },
+    "quote_at": { "type": ["number", "null"] },
+    "exchange_at": { "type": ["number", "null"] },
+    "age_ms": { "type": ["number", "null"] },
+    "fresh": { "type": "boolean" },
+    "executable": { "type": "boolean" }
+  }
+}

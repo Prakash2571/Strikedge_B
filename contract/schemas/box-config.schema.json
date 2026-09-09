@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "box-config.schema.json",
+  "title": "GET /api/box/config (200)",
+  "description": "The active Box scanner configuration. Source: src/box/engine.ts getConfig(). Obtained via a DIRECT call to the REAL BoxEngine.getConfig() on a hermetically-constructed engine (inert market-data/feed/broker/charge stubs, no I/O): the /api/box/config route registrar simply does res.json(engine.getConfig()), so the engine method is the authoritative producer of the exact wire bytes and needs no live database or feed to call. CLOSED at top level and for the tunable bounds so an added field is caught.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "min_expected_net_profit", "min_gross_edge", "min_net_edge", "execution_mode",
+    "simulated_decision_ms", "simulated_latency_ms", "expected_entry_slippage",
+    "expected_exit_slippage", "enable_short_box", "directions", "min_captured_pct",
+    "reconcile_charges", "charge_reconcile_warn_pct", "require_priced_charges", "safety_buffer",
+    "quote_max_age_ms", "feed_max_age_ms", "underlying_max_age_ms", "strikes_each_side",
+    "strike_level", "max_strikes", "max_candidates_per_underlying", "prefilter_gross_threshold",
+    "convergence_floor", "convergence_pct", "min_exit_net_pnl", "profit_capture_pct",
+    "expiry_safety_minutes", "max_subscribed_tokens", "lots", "universe", "indicative_discovery",
+    "closed_cache_enabled", "tunable"
+  ],
+  "properties": {
+    "min_expected_net_profit": { "type": "number" },
+    "min_gross_edge": { "type": "number" },
+    "min_net_edge": { "type": "number" },
+    "execution_mode": { "type": "string" },
+    "simulated_decision_ms": { "type": "number" },
+    "simulated_latency_ms": { "type": "number" },
+    "expected_entry_slippage": { "type": "number" },
+    "expected_exit_slippage": { "type": "number" },
+    "enable_short_box": { "type": "boolean" },
+    "directions": { "type": "array", "items": { "enum": ["LONG_BOX", "SHORT_BOX"] } },
+    "min_captured_pct": { "type": "number" },
+    "reconcile_charges": { "type": "boolean" },
+    "charge_reconcile_warn_pct": { "type": "number" },
+    "require_priced_charges": { "type": "boolean" },
+    "safety_buffer": { "type": "number" },
+    "quote_max_age_ms": { "type": "number" },
+    "feed_max_age_ms": { "type": "number" },
+    "underlying_max_age_ms": { "type": "number" },
+    "strikes_each_side": { "type": "number" },
+    "strike_level": { "type": "number" },
+    "max_strikes": { "type": "number" },
+    "max_candidates_per_underlying": { "type": "number" },
+    "prefilter_gross_threshold": { "type": "number" },
+    "convergence_floor": { "type": "number" },
+    "convergence_pct": { "type": "number" },
+    "min_exit_net_pnl": { "type": "number" },
+    "profit_capture_pct": { "type": "number" },
+    "expiry_safety_minutes": { "type": "number" },
+    "max_subscribed_tokens": { "type": "number" },
+    "lots": { "type": "number" },
+    "universe": { "type": "string" },
+    "indicative_discovery": { "type": "boolean" },
+    "closed_cache_enabled": { "type": "boolean" },
+    "tunable": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["min_expected_net_profit", "safety_buffer"],
+      "properties": {
+        "min_expected_net_profit": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["min", "max"],
+          "properties": { "min": { "type": "number" }, "max": { "type": "number" } }
+        },
+        "safety_buffer": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["min", "max"],
+          "properties": { "min": { "type": "number" }, "max": { "type": "number" } }
+        }
+      }
+    }
+  }
+}

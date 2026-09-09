@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "box-opportunities.schema.json",
+  "title": "GET /api/box/opportunities (200)",
+  "description": "Source: src/box/routes.ts GET /api/box/opportunities returns { opportunities: engine.getOpportunities(limit), status: engine.getStatus() }. The opportunities array element is validated by box-opportunity.schema.json; status by box-status.schema.json.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["opportunities", "status"],
+  "properties": {
+    "opportunities": { "type": "array", "items": { "$ref": "box-opportunity.schema.json" } },
+    "status": { "$ref": "box-status.schema.json" }
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "sse-envelope.schema.json",
+  "title": "A parsed Box SSE frame",
+  "description": "The frame src/box/engine.ts writeFrame() emits: on the wire it is the text `event: <name>\\ndata: <JSON>\\n\\n`. This schema describes the frame PARSED into { event, data }: `event` is the event name, `data` is the JSON-parsed payload. Obtained by building a REAL frame string via the same writeFrame formatting the engine uses over a real snapshot() payload, then parsing it back. A 'snapshot' frame's data must additionally satisfy box-sse-snapshot.schema.json (asserted separately in the suite). The envelope is CLOSED; data is left OPEN here because the payload varies by event name and is validated per-event.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["event", "data"],
+  "properties": {
+    "event": { "type": "string" },
+    "data": {
+      "$comment": "OPEN by design: the payload shape depends on the event name; the snapshot payload is validated by box-sse-snapshot.schema.json.",
+      "type": ["object", "array", "string", "number", "boolean", "null"]
+    }
+  }
+}

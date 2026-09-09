@@ -74,6 +74,10 @@ export interface RuntimeStatusProvider {
 
 /** The Mongo async-replica outbox backlog health. NEVER includes payloads. */
 export interface ExportStatusSnapshot {
+  /** Whether the projector is configured to run at all (URI present + export enabled). */
+  enabled: boolean;
+  /** Whether the projector currently holds a live Mongo connection. */
+  connected: boolean;
   /** Rows in the outbox not yet acknowledged by Mongo. */
   backlog_count: number;
   /** Age in ms of the oldest pending row, or null when the backlog is empty. */

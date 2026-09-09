@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "access-verify.schema.json",
+  "title": "POST /api/access/verify (200 success)",
+  "description": "Response of a successful passcode verification. Source: src/access/routes.ts registerAccessRoutes verify handler. Obtained via REAL HTTP against the real registrar with a real PG session. NEVER carries a token beyond the CSRF token the SPA needs; no passcode, no key material.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["authenticated", "role", "csrf_token", "expires_at"],
+  "properties": {
+    "authenticated": { "const": true },
+    "role": { "enum": ["full", "trade"] },
+    "csrf_token": { "type": "string" },
+    "expires_at": { "type": "string", "format": "date-time" }
+  }
+}

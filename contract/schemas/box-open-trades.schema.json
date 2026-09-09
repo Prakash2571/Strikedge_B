@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "box-open-trades.schema.json",
+  "title": "GET /api/box/trades and /api/box/trades/open (200)",
+  "description": "Source: src/box/routes.ts. GET /api/box/trades returns { dbEnabled, open, trades } (open = getOpenPositions(), trades = DB-backed serializeBoxTrade list). GET /api/box/trades/open returns { dbEnabled, open } only. Modelled with trades OPTIONAL so both routes validate against the same schema; both are CLOSED otherwise.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["dbEnabled", "open"],
+  "properties": {
+    "dbEnabled": { "type": "boolean" },
+    "open": { "type": "array", "items": { "$ref": "box-open-position.schema.json" } },
+    "trades": { "type": "array", "items": { "$ref": "box-trade.schema.json" } }
+  }
+}

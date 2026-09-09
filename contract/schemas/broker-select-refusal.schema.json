@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "broker-select-refusal.schema.json",
+  "title": "POST /api/broker/select (409 refused)",
+  "description": "A refused broker switch, carrying the FULL blocker list. Source: src/brokerRoutes.ts POST /api/broker/select refusal branch. Obtained via REAL HTTP with a provider whose selectBroker returns ok:false and blockers.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["error", "code", "blockers", "active_broker"],
+  "properties": {
+    "error": { "type": "string" },
+    "code": { "const": "switch_refused" },
+    "blockers": { "type": "array", "items": { "type": "string" } },
+    "active_broker": { "enum": ["zerodha", "dhan"] }
+  }
+}

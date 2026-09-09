@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "margin-provenance.schema.json",
+  "title": "Margin + provenance pair (as served on a Box trade)",
+  "description": "The margin figure and WHICH model produced it. Source: src/box/serialize.ts (margin, margin_source) + migrations/008_trade_margin_source.sql CHECK constraint + tests/pg/marginProvenance.test.mjs. Validated against a DIRECT serializer sample. The point of provenance: a dhan_per_leg_fallback figure over-states a hedged Box and must never read as a netted basket margin, so the model name is served alongside the number rather than collapsed to a boolean.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["margin", "margin_source"],
+  "properties": {
+    "margin": { "type": ["number", "null"] },
+    "margin_source": {
+      "type": ["string", "null"],
+      "enum": ["kite_basket", "dhan_multi", "dhan_per_leg_fallback", "unavailable", null]
+    }
+  }
+}

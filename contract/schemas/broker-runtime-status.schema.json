@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "broker-runtime-status.schema.json",
+  "title": "Per-broker runtime status element",
+  "description": "One entry of runtime-status.brokers. Source: src/runtime/statusRoutes.ts BrokerRuntimeStatus. NEVER includes a token. last_error is a bounded, redacted string.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "broker",
+    "token_state",
+    "ist_day",
+    "last_attempt_at",
+    "last_success_at",
+    "last_error",
+    "feed_connected",
+    "wanted_token_count",
+    "subscribed_token_count",
+    "last_depth_age_ms",
+    "reconnect_count"
+  ],
+  "properties": {
+    "broker": { "enum": ["zerodha", "dhan"] },
+    "token_state": { "enum": ["waiting", "polling", "ready", "invalid", "configuration_error"] },
+    "ist_day": { "type": ["string", "null"] },
+    "last_attempt_at": { "type": ["string", "null"] },
+    "last_success_at": { "type": ["string", "null"] },
+    "last_error": { "type": ["string", "null"] },
+    "feed_connected": { "type": "boolean" },
+    "wanted_token_count": { "type": "integer", "minimum": 0 },
+    "subscribed_token_count": { "type": "integer", "minimum": 0 },
+    "last_depth_age_ms": { "type": ["number", "null"] },
+    "reconnect_count": { "type": "integer", "minimum": 0 }
+  }
+}

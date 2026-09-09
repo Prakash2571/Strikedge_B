@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "box-chains.schema.json",
+  "title": "GET /api/box/chains (200)",
+  "description": "Source: src/box/routes.ts GET /api/box/chains. Without ?underlying it returns { chains: engine.listChainSymbols() } (a symbol list). With ?underlying it returns the full engine.getChain() detail object, or 404. Two branches via oneOf. The LIST branch is validated against a real listChainSymbols() sample (direct call). The DETAIL branch is derived from src/box/engine.ts getChain() and is CLOSED; it is not driven by a positive sample here because populating a monitored window requires a full universe build (board + instrument dump), which cannot be stood up hermetically without a broker feed — so the detail shape is pinned structurally from source. Its per-side quote object and strike rows are closed too.",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["chains"],
+      "properties": {
+        "chains": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["underlying", "name", "is_index", "expiry"],
+            "properties": {
+              "underlying": { "type": "string" },
+              "name": { "type": "string" },
+              "is_index": { "type": "boolean" },
+              "expiry": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "underlying", "name", "is_index", "expiry", "lot_size", "quantity", "atm_strike",
+        "strike_step", "spot", "spot_age_ms", "strikes"
+      ],
+      "properties": {
+        "underlying": { "type": "string" },
+        "name": { "type": "string" },
+        "is_index": { "type": "boolean" },
+        "expiry": { "type": "string" },
+        "lot_size": { "type": "number" },
+        "quantity": { "type": "number" },
+        "atm_strike": { "type": ["number", "null"] },
+        "strike_step": { "type": ["number", "null"] },
+        "spot": { "type": ["number", "null"] },
+        "spot_age_ms": { "type": ["number", "null"] },
+        "strikes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["strike", "is_atm", "ce", "pe"],
+            "properties": {
+              "strike": { "type": "number" },
+              "is_atm": { "type": "boolean" },
+              "ce": { "anyOf": [{ "$ref": "box-chain-quote.schema.json" }, { "type": "null" }] },
+              "pe": { "anyOf": [{ "$ref": "box-chain-quote.schema.json" }, { "type": "null" }] }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

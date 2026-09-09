@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "export-status.schema.json",
+  "title": "GET /api/export/status (200)",
+  "description": "Mongo async-replica outbox backlog health. Source: src/runtime/statusRoutes.ts ExportStatusSnapshot, built by src/runtime/projections.ts projectExportStatus (the SAME projection the endpoint uses). NEVER includes payloads.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["enabled", "connected", "backlog_count", "oldest_pending_age_ms", "last_success_at", "last_error", "dead_letter_count"],
+  "properties": {
+    "enabled": { "type": "boolean" },
+    "connected": { "type": "boolean" },
+    "backlog_count": { "type": "integer", "minimum": 0 },
+    "oldest_pending_age_ms": { "type": ["number", "null"] },
+    "last_success_at": { "type": ["string", "null"] },
+    "last_error": { "type": ["string", "null"] },
+    "dead_letter_count": { "type": "integer", "minimum": 0 }
+  }
+}

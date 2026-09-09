@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "broker-select-success.schema.json",
+  "title": "POST /api/broker/select (200 success)",
+  "description": "A successful broker switch. Source: src/brokerRoutes.ts POST /api/broker/select ok branch. Obtained via REAL HTTP with a provider whose selectBroker returns ok:true.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["ok", "active_broker", "generation"],
+  "properties": {
+    "ok": { "const": true },
+    "active_broker": { "enum": ["zerodha", "dhan"] },
+    "generation": { "type": "integer", "minimum": 0 }
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "box-opportunity.schema.json",
+  "title": "A single Box opportunity (wire shape)",
+  "description": "One element of opportunities.opportunities and snapshot.opportunities. Source: src/box/types.ts BoxOpportunity, produced by src/box/scanner.ts listOpportunities(). Obtained via a DIRECT call to a REAL BoxScanner driven with the shared test fixtures (real evaluateCandidate + real quote store): the /api/box/opportunities route returns engine.getOpportunities() unchanged. CLOSED.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "key", "underlying", "name", "is_index", "expiry", "direction", "lower_strike", "upper_strike",
+    "box_width", "lot_size", "quantity", "entry_box_cost", "gross_edge", "entry_charges",
+    "estimated_exit_charges", "execution_cost", "safety_buffer", "projected_net_edge",
+    "expected_net_profit", "min_expected_net_profit", "charge_origin", "entry_sides",
+    "liquidity_ok", "depth_ok", "worst_age_ms", "price_source", "status", "reject", "legs",
+    "updated_at"
+  ],
+  "properties": {
+    "key": { "type": "string" },
+    "underlying": { "type": "string" },
+    "name": { "type": "string" },
+    "is_index": { "type": "boolean" },
+    "expiry": { "type": "string" },
+    "direction": { "enum": ["LONG_BOX", "SHORT_BOX"] },
+    "lower_strike": { "type": "number" },
+    "upper_strike": { "type": "number" },
+    "box_width": { "type": "number" },
+    "lot_size": { "type": "number" },
+    "quantity": { "type": "number" },
+    "entry_box_cost": { "type": ["number", "null"] },
+    "gross_edge": { "type": ["number", "null"] },
+    "entry_charges": { "type": ["number", "null"] },
+    "estimated_exit_charges": { "type": ["number", "null"] },
+    "execution_cost": { "type": "number" },
+    "safety_buffer": { "type": "number" },
+    "projected_net_edge": { "type": ["number", "null"] },
+    "expected_net_profit": { "type": ["number", "null"] },
+    "min_expected_net_profit": { "type": "number" },
+    "charge_origin": { "type": "string" },
+    "entry_sides": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["role", "side", "tradingsymbol"],
+        "properties": {
+          "role": { "enum": ["k1_ce", "k2_ce", "k2_pe", "k1_pe"] },
+          "side": { "enum": ["BUY", "SELL"] },
+          "tradingsymbol": { "type": "string" }
+        }
+      }
+    },
+    "liquidity_ok": { "type": "boolean" },
+    "depth_ok": { "type": "boolean" },
+    "worst_age_ms": { "type": ["number", "null"] },
+    "price_source": { "enum": ["touch", "last_close"] },
+    "status": {
+      "enum": ["WATCHING", "INDICATIVE", "UNPRICED", "ELIGIBLE", "PAPER_OPENED", "LIVE_OPENED", "OPEN", "REJECTED"]
+    },
+    "reject": { "type": ["string", "null"] },
+    "legs": { "type": "array", "items": { "$ref": "box-leg-evaluation.schema.json" } },
+    "updated_at": { "type": "number" }
+  }
+}

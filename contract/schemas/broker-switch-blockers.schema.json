@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "broker-switch-blockers.schema.json",
+  "title": "GET /api/broker/switch-blockers (200)",
+  "description": "Why switching to a target broker would be refused, without attempting it. Source: src/brokerRoutes.ts GET /api/broker/switch-blockers handler. Obtained via REAL HTTP.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["broker", "blockers"],
+  "properties": {
+    "broker": { "enum": ["zerodha", "dhan"] },
+    "blockers": { "type": "array", "items": { "type": "string" } }
+  }
+}

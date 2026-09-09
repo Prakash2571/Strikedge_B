@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "box-events.schema.json",
+  "title": "GET /api/box/events (200)",
+  "description": "Source: src/box/routes.ts GET /api/box/events returns { events: loadBoxEvents(limit) }. ENVELOPE is CLOSED. An event is an append-only decision-ledger row (IBoxTradeEvent) whose per-event payload varies by event_type; its element is pinned as an OPEN object, validated against a real (empty) events array from the hermetic engine. The per-leg quote snapshot within an event uses toEventLegs (see box-event-leg.schema.json), exercised directly in the suite.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["events"],
+  "properties": {
+    "events": {
+      "$comment": "OPEN element by design: append-only ledger row (IBoxTradeEvent), payload varies by event_type.",
+      "type": "array",
+      "items": { "type": "object" }
+    }
+  }
+}

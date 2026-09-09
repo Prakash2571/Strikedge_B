@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "box-event-leg.schema.json",
+  "title": "A per-leg quote snapshot in the decision ledger",
+  "description": "Source: src/box/serialize.ts toEventLegs (BoxEventLeg). Obtained via a DIRECT call to the REAL toEventLegs over a real evaluateCandidate result. CLOSED. quote_at is a Date -> ISO string (or null) after JSON round-trip.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["role", "side", "token", "tradingsymbol", "price", "bid", "bid_qty", "ask", "ask_qty", "quote_at", "age_ms"],
+  "properties": {
+    "role": { "enum": ["k1_ce", "k2_ce", "k2_pe", "k1_pe"] },
+    "side": { "enum": ["BUY", "SELL"] },
+    "token": { "type": "number" },
+    "tradingsymbol": { "type": "string" },
+    "price": { "type": ["number", "null"] },
+    "bid": { "type": ["number", "null"] },
+    "bid_qty": { "type": ["number", "null"] },
+    "ask": { "type": ["number", "null"] },
+    "ask_qty": { "type": ["number", "null"] },
+    "quote_at": { "type": ["string", "null"], "format": "date-time" },
+    "age_ms": { "type": ["number", "null"] }
+  }
+}

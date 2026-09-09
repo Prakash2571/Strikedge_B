@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "box-trades-history.schema.json",
+  "title": "GET /api/box/trades/history (200)",
+  "description": "Source: src/box/routes.ts GET /api/box/trades/history. Two scope envelopes, distinguished by the scope const. scope=all returns the full serializeBoxTrade list (trades element = box-trade). scope=today returns LITE rows whose execution-audit blobs are stripped (see liteClosedTrade); their exact reduced field set is engine-owned, so the today trades element is pinned as an OPEN object while the ENVELOPE around it is CLOSED. Validated against a real scope=all response (direct serializer) and a real empty scope=today envelope.",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dbEnabled", "scope", "source", "cacheEnabled", "lite", "trades"],
+      "properties": {
+        "dbEnabled": { "type": "boolean" },
+        "scope": { "const": "all" },
+        "source": { "type": "string" },
+        "cacheEnabled": { "type": "boolean" },
+        "lite": { "type": "boolean" },
+        "trades": { "type": "array", "items": { "$ref": "box-trade.schema.json" } }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dbEnabled", "scope", "source", "day", "cacheEnabled", "lite", "trades"],
+      "properties": {
+        "dbEnabled": { "type": "boolean" },
+        "scope": { "const": "today" },
+        "source": { "enum": ["memory", "postgres", "none"] },
+        "day": { "type": ["string", "null"] },
+        "cacheEnabled": { "type": "boolean" },
+        "lite": { "type": "boolean" },
+        "trades": {
+          "$comment": "OPEN element by design: lite closed-today rows have execution-audit blobs stripped; the reduced shape is engine-owned (liteClosedTrade).",
+          "type": "array",
+          "items": { "type": "object" }
+        }
+      }
+    }
+  ]
+}

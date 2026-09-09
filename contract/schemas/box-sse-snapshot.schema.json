@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "box-sse-snapshot.schema.json",
+  "title": "The Box SSE 'snapshot' event payload",
+  "description": "The `data:` JSON of a 'snapshot' SSE frame. Source: src/box/engine.ts snapshot() = { status, opportunities, open_trades }. Obtained via a DIRECT call to REAL BoxEngine.snapshot() (JSON round-tripped). CLOSED; each part re-uses its own contract.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "opportunities", "open_trades"],
+  "properties": {
+    "status": { "$ref": "box-status.schema.json" },
+    "opportunities": { "type": "array", "items": { "$ref": "box-opportunity.schema.json" } },
+    "open_trades": { "type": "array", "items": { "$ref": "box-open-position.schema.json" } }
+  }
+}

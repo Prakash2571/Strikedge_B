@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "broker-status.schema.json",
+  "title": "GET /api/broker/status (200)",
+  "description": "Active broker + redacted session/health for both brokers. Source: src/brokerRoutes.ts GET /api/broker/status handler. Obtained via REAL HTTP with an inert ActiveBrokerProvider.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["active_broker", "generation", "brokers"],
+  "properties": {
+    "active_broker": { "enum": ["zerodha", "dhan"] },
+    "generation": { "type": "integer", "minimum": 0 },
+    "brokers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["broker", "session", "health"],
+        "properties": {
+          "broker": { "enum": ["zerodha", "dhan"] },
+          "session": { "$ref": "broker-session.schema.json" },
+          "health": { "$ref": "broker-health.schema.json" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "broker-session.schema.json",
+  "title": "Redacted broker session descriptor",
+  "description": "Source: src/brokerRoutes.ts RedactedBrokerSession, built by src/runtime/projections.ts projectBrokerSession (the SAME projection the endpoint uses). NEVER a token or key material. account_label/established_at/expires_at are REQUIRED with a nullable type: projectBrokerSession ALWAYS populates all three (possibly null), so requiring them (rather than marking them optional) matches the real ActiveBrokerManager output and keeps the wire shape closed. The bytes on the wire are unchanged — this only makes the schema match reality.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["broker", "connected", "state", "account_label", "established_at", "expires_at"],
+  "properties": {
+    "broker": { "enum": ["zerodha", "dhan"] },
+    "connected": { "type": "boolean" },
+    "state": { "enum": ["waiting", "expired", "ready", "standby"] },
+    "account_label": { "type": ["string", "null"] },
+    "established_at": { "type": ["string", "null"] },
+    "expires_at": { "type": ["string", "null"] }
+  }
+}

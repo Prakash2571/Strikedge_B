@@ -1,0 +1,152 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "box-execution-control.schema.json",
+  "title": "GET /api/box/execution-control (200)",
+  "description": "READ-ONLY execution-control surface. Source: src/box/engine.ts getExecutionControl(). Obtained via a DIRECT call to the REAL BoxEngine.getExecutionControl() on a hermetically-constructed engine: the route registrar does res.json(engine.getExecutionControl()). TOP LEVEL and the mode/session/risk/execution/arm sub-objects are CLOSED so an added field is caught. `risk.capital` is an engine-owned capital-diagnostics blob (OPEN). `arm.*` verdicts re-use a shared arm-verdict shape.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "execution_mode", "paper_execution_profile", "broker", "deployment_live_capable",
+    "live_capability_detail", "live_runtime_armed", "entry_enabled", "emergency_flatten_enabled",
+    "mode", "session", "risk", "execution", "arm", "block_reason", "block_detail"
+  ],
+  "properties": {
+    "execution_mode": { "type": "string" },
+    "paper_execution_profile": { "type": "string" },
+    "broker": { "enum": ["zerodha", "dhan"] },
+    "deployment_live_capable": { "type": "boolean" },
+    "live_capability_detail": { "type": "string" },
+    "live_runtime_armed": { "type": "boolean" },
+    "entry_enabled": { "type": "boolean" },
+    "emergency_flatten_enabled": { "type": "boolean" },
+    "mode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["selection", "label", "runtime_selectable", "live_requires_restart", "transition_blockers"],
+      "properties": {
+        "selection": { "type": "string" },
+        "label": { "type": "string" },
+        "runtime_selectable": { "type": "array", "items": { "type": "string" } },
+        "live_requires_restart": { "type": "boolean" },
+        "transition_blockers": { "type": "array" }
+      }
+    },
+    "session": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state", "session_id", "armed", "armed_at", "armed_by", "max_completed_trades",
+        "completed_trades", "consumed_cycles", "remaining_trades", "current_trade_id",
+        "in_flight_trade_ids", "aborted_attempts", "arm_count", "block_reason", "readable",
+        "enforcing", "write_failed"
+      ],
+      "properties": {
+        "state": { "type": "string" },
+        "session_id": { "type": ["string", "null"] },
+        "armed": { "type": "boolean" },
+        "armed_at": { "type": ["string", "number", "null"] },
+        "armed_by": { "type": ["string", "null"] },
+        "max_completed_trades": { "type": "number" },
+        "completed_trades": { "type": "number" },
+        "consumed_cycles": { "type": "number" },
+        "remaining_trades": { "type": ["number", "null"] },
+        "current_trade_id": { "type": ["string", "null"] },
+        "in_flight_trade_ids": { "type": "array", "items": { "type": "string" } },
+        "aborted_attempts": { "type": "number" },
+        "arm_count": { "type": "number" },
+        "block_reason": { "type": ["string", "null"] },
+        "readable": { "type": "boolean" },
+        "enforcing": { "type": "boolean" },
+        "write_failed": { "type": "boolean" }
+      }
+    },
+    "risk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_box_capital_rupees", "paper_max_box_capital_rupees", "max_box_capital_enforced",
+        "max_box_capital_metric", "capital", "one_active_box_per_underlying", "active_underlyings",
+        "claimed_underlyings", "max_open_boxes", "open_boxes", "residual_legs", "daily_loss_limit",
+        "realised_pnl_today"
+      ],
+      "properties": {
+        "max_box_capital_rupees": { "type": "number" },
+        "paper_max_box_capital_rupees": { "type": "number" },
+        "max_box_capital_enforced": { "type": "boolean" },
+        "max_box_capital_metric": { "type": "string" },
+        "capital": { "$comment": "OPEN by design: engine-owned capital diagnostics.", "type": "object" },
+        "one_active_box_per_underlying": { "type": "boolean" },
+        "active_underlyings": { "type": "array" },
+        "claimed_underlyings": { "type": "array" },
+        "max_open_boxes": { "type": "number" },
+        "open_boxes": { "type": "number" },
+        "residual_legs": { "type": "number" },
+        "daily_loss_limit": { "type": "number" },
+        "realised_pnl_today": { "type": ["number", "null"] }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "live_entry_submit_concurrency", "max_concurrent_executions",
+        "effective_broker_min_interval_ms", "effective_broker_order_min_interval_ms",
+        "broker_order_interval_floor_ms", "broker_order_interval_source", "broker_pacing_rationale",
+        "pacing_source_of_truth", "four_leg_burst_pacing_budget_ms", "entry_burst", "queued",
+        "in_flight", "circuit", "artificial_latency_applied_to_live",
+        "paper_only_simulated_decision_ms", "paper_only_simulated_latency_ms"
+      ],
+      "properties": {
+        "live_entry_submit_concurrency": { "type": "number" },
+        "max_concurrent_executions": { "type": "number" },
+        "effective_broker_min_interval_ms": { "type": "number" },
+        "effective_broker_order_min_interval_ms": { "type": "number" },
+        "broker_order_interval_floor_ms": { "type": "number" },
+        "broker_order_interval_source": { "type": "string" },
+        "broker_pacing_rationale": { "type": "string" },
+        "pacing_source_of_truth": { "type": "string" },
+        "four_leg_burst_pacing_budget_ms": { "type": "number" },
+        "entry_burst": { "$comment": "OPEN by design: engine-owned entry-burst diagnostics or null.", "type": ["object", "null"] },
+        "queued": { "type": "number" },
+        "in_flight": { "type": "number" },
+        "circuit": { "type": "string" },
+        "artificial_latency_applied_to_live": { "const": false },
+        "paper_only_simulated_decision_ms": { "type": "number" },
+        "paper_only_simulated_latency_ms": { "type": "number" }
+      }
+    },
+    "arm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["preconditions", "entry", "exposure_management", "emergency_flatten"],
+      "properties": {
+        "preconditions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "deploymentLiveCapable", "brokerAuthenticated", "reconciliationHealthy",
+            "reconciliationComplete", "feedHealthy", "feedWarmedUp", "circuitClosed",
+            "recoveryActive", "unknownOrders", "durableReservationsAvailable"
+          ],
+          "properties": {
+            "deploymentLiveCapable": { "type": "boolean" },
+            "brokerAuthenticated": { "type": "boolean" },
+            "reconciliationHealthy": { "type": "boolean" },
+            "reconciliationComplete": { "type": "boolean" },
+            "feedHealthy": { "type": "boolean" },
+            "feedWarmedUp": { "type": "boolean" },
+            "circuitClosed": { "type": "boolean" },
+            "recoveryActive": { "type": "boolean" },
+            "unknownOrders": { "type": "number" },
+            "durableReservationsAvailable": { "type": "boolean" }
+          }
+        },
+        "entry": { "$ref": "arm-verdict.schema.json" },
+        "exposure_management": { "$ref": "arm-verdict.schema.json" },
+        "emergency_flatten": { "$ref": "arm-verdict.schema.json" }
+      }
+    },
+    "block_reason": { "type": ["string", "null"] },
+    "block_detail": { "type": ["string", "null"] }
+  }
+}

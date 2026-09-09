@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "box-chain-quote.schema.json",
+  "title": "One side (CE or PE) of a chain strike row",
+  "description": "Source: src/box/engine.ts getChain() per-side object. CLOSED. Derived structurally from source (see box-chains.schema.json for why the detail branch is not positively sampled hermetically).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["token", "tradingsymbol", "bid", "bid_qty", "ask", "ask_qty", "last", "age_ms", "marks"],
+  "properties": {
+    "token": { "type": "number" },
+    "tradingsymbol": { "type": "string" },
+    "bid": { "type": "number" },
+    "bid_qty": { "type": "number" },
+    "ask": { "type": "number" },
+    "ask_qty": { "type": "number" },
+    "last": { "type": "number" },
+    "age_ms": { "type": ["number", "null"] },
+    "marks": { "type": "array", "items": { "type": "string" } }
+  }
+}

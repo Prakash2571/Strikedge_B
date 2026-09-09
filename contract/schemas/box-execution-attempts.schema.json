@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "box-execution-attempts.schema.json",
+  "title": "GET /api/box/execution-attempts (200)",
+  "description": "Source: src/box/routes.ts GET /api/box/execution-attempts returns { dbEnabled, attempts: engine.listExecutionAttempts(limit) }. ENVELOPE is CLOSED. An attempt row is a DB-projected paper_legging abort record whose column set is owned by the executionAttemptProjection; its element is pinned as an OPEN object (presence + object-ness), validated against a real (empty) attempts array from the hermetic engine.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["dbEnabled", "attempts"],
+  "properties": {
+    "dbEnabled": { "type": "boolean" },
+    "attempts": {
+      "$comment": "OPEN element by design: DB-projected execution-attempt row (executionAttemptProjection).",
+      "type": "array",
+      "items": { "type": "object" }
+    }
+  }
+}

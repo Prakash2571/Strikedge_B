@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "arm-verdict.schema.json",
+  "title": "A live-arm verdict",
+  "description": "Source: src/box/engine.ts evaluateLiveArm(). ok + a blocker list of {code, detail} objects, empty when ok:true.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["ok", "blockers"],
+  "properties": {
+    "ok": { "type": "boolean" },
+    "blockers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["code", "detail"],
+        "properties": {
+          "code": { "type": "string" },
+          "detail": { "type": "string" }
+        }
+      }
+    }
+  }
+}

@@ -34,10 +34,25 @@ export function parseBrokerId(raw: unknown): BrokerId | null {
 export interface RedactedBrokerSession {
   broker: BrokerId;
   connected: boolean;
-  /** Opaque account label if the broker exposes one; never a credential. */
-  account_label?: string | null;
-  established_at?: string | null;
-  expires_at?: string | null;
+  /**
+   * Lifecycle state of this broker's session, derived (never a raw token):
+   *   waiting  — not authenticated yet
+   *   expired  — authenticated but the token is past its expiry
+   *   ready    — authenticated, unexpired AND the active broker
+   *   standby  — authenticated, unexpired but not the active broker
+   */
+  state: "waiting" | "expired" | "ready" | "standby";
+  /**
+   * Opaque account label if the broker exposes one; never a credential.
+   *
+   * REQUIRED-NULLABLE, not optional: `sessionFor` (via projectBrokerSession) ALWAYS
+   * populates all three of account_label/established_at/expires_at — as a value or as
+   * an explicit `null`. Declaring them `string | null` (rather than `?`) matches that
+   * reality and keeps the contract schema closed. The wire bytes are unchanged.
+   */
+  account_label: string | null;
+  established_at: string | null;
+  expires_at: string | null;
 }
 
 /** A redacted broker health descriptor. */

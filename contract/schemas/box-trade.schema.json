@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "box-trade.schema.json",
+  "title": "A serialized Box trade (wire shape)",
+  "description": "Source: src/box/serialize.ts serializeBoxTrade. This is the element of trades-history.trades and open-trades.trades (the DB-backed list). Obtained via a DIRECT call to the REAL serializer (JSON round-tripped): the /api/box/trades route needs a live BoxEngine + Mongo + a market feed to reach, so the pure serializer that produces the exact wire bytes is called directly. Top level and legs are CLOSED so an added/removed/renamed field is caught. The execution/reconciliation/depth blobs are audit sub-documents whose internal shape is engine-owned and intentionally OPEN (see per-property $comment).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id", "execution_mode", "broker", "underlying", "name", "is_index", "expiry", "direction",
+    "lower_strike", "upper_strike", "lot_size", "quantity", "status", "legs", "box_width",
+    "margin", "margin_source", "entry_box_cost", "entry_gross_edge", "entry_charges",
+    "estimated_exit_charges", "safety_buffer", "entry_net_edge", "expected_net_profit",
+    "entry_execution_cost", "charge_origin", "charge_rate_version", "entry_charge_reconciliation",
+    "exit_charge_reconciliation", "entry_execution", "entry_legging", "exit_execution",
+    "opened_at", "current_remaining_edge", "current_captured_edge", "current_captured_pct",
+    "exit_box_value", "exit_charges", "gross_pnl", "total_charges", "net_pnl",
+    "realised_net_pnl", "closed_at", "exit_reason", "exit_blocked_reason", "expiry_safety",
+    "scanner_config_snapshot", "error"
+  ],
+  "properties": {
+    "id": { "type": "string" },
+    "execution_mode": { "type": "string" },
+    "broker": { "enum": ["zerodha", "dhan"] },
+    "underlying": { "type": "string" },
+    "name": { "type": "string" },
+    "is_index": { "type": "boolean" },
+    "expiry": { "type": "string" },
+    "direction": { "enum": ["LONG_BOX", "SHORT_BOX"] },
+    "lower_strike": { "type": "number" },
+    "upper_strike": { "type": "number" },
+    "lot_size": { "type": "number" },
+    "quantity": { "type": "number" },
+    "status": { "type": "string" },
+    "legs": { "type": "array", "items": { "$ref": "box-trade-leg.schema.json" } },
+    "box_width": { "type": "number" },
+    "margin": { "type": ["number", "null"] },
+    "margin_source": {
+      "$comment": "MARGIN PROVENANCE. Which model produced `margin`. null means the trade predates provenance capture; the four model names are enforced by a DB CHECK constraint (migration 008). See migrations/008_trade_margin_source.sql and tests/pg/marginProvenance.test.mjs.",
+      "type": ["string", "null"],
+      "enum": ["kite_basket", "dhan_multi", "dhan_per_leg_fallback", "unavailable", null]
+    },
+    "entry_box_cost": { "type": ["number", "null"] },
+    "entry_gross_edge": { "type": ["number", "null"] },
+    "entry_charges": { "type": ["number", "null"] },
+    "estimated_exit_charges": { "type": ["number", "null"] },
+    "safety_buffer": { "type": "number" },
+    "entry_net_edge": { "type": ["number", "null"] },
+    "expected_net_profit": { "type": ["number", "null"] },
+    "entry_execution_cost": { "type": ["number", "null"] },
+    "charge_origin": { "type": "string" },
+    "charge_rate_version": { "type": ["string", "null"] },
+    "entry_charge_reconciliation": {
+      "$comment": "OPEN by design: an engine-owned reconciliation audit blob (or null). Its internal fields are not part of the frontend contract; the contract pins its PRESENCE and nullability only.",
+      "type": ["object", "null"]
+    },
+    "exit_charge_reconciliation": {
+      "$comment": "OPEN by design: see entry_charge_reconciliation.",
+      "type": ["object", "null"]
+    },
+    "entry_execution": {
+      "$comment": "OPEN by design: engine-owned execution audit blob (or null).",
+      "type": ["object", "null"]
+    },
+    "entry_legging": {
+      "$comment": "OPEN by design: engine-owned legging audit blob (or null).",
+      "type": ["object", "null"]
+    },
+    "exit_execution": {
+      "$comment": "OPEN by design: engine-owned execution audit blob (or null).",
+      "type": ["object", "null"]
+    },
+    "opened_at": { "type": "string", "format": "date-time" },
+    "current_remaining_edge": { "type": ["number", "null"] },
+    "current_captured_edge": { "type": ["number", "null"] },
+    "current_captured_pct": { "type": ["number", "null"] },
+    "exit_box_value": { "type": ["number", "null"] },
+    "exit_charges": { "type": ["number", "null"] },
+    "gross_pnl": { "type": ["number", "null"] },
+    "total_charges": { "type": ["number", "null"] },
+    "net_pnl": { "type": ["number", "null"] },
+    "realised_net_pnl": { "type": ["number", "null"] },
+    "closed_at": { "type": ["string", "null"], "format": "date-time" },
+    "exit_reason": { "type": ["string", "null"] },
+    "exit_blocked_reason": { "type": ["string", "null"] },
+    "expiry_safety": { "type": "boolean" },
+    "scanner_config_snapshot": {
+      "$comment": "OPEN by design: a FROZEN copy of the config the trade was taken under (BoxScannerConfigSnapshot). It is a settings audit blob, deliberately versioned by the engine; pinning every field here would couple the wire contract to internal config churn. Presence + object-ness are pinned.",
+      "type": "object"
+    },
+    "error": { "type": ["string", "null"] }
+  }
+}
