@@ -11,7 +11,25 @@
  * Docs: https://kite.trade/docs/connect/v3/
  */
 
+import { Deadline } from "./brokers/deadline.js";
+
 const KITE_API_ROOT = "https://api.kite.trade";
+
+/**
+ * Default per-request deadline for KiteClient's REST calls (Defect 4).
+ *
+ * `fetch` has NO timeout of its own, and every method here did `await res.json()` /
+ * `await res.text()` AFTER it with nothing bounding either the headers or the body — a single
+ * stalled Zerodha socket could hang a profile probe, a quote refresh or the entry-time basket
+ * margin forever. The historical endpoints have their own gate/watchdog (HistoricalGate); this
+ * bound covers everything else. 8s is generous for a REST call yet finite, and an operator can
+ * lower it via `KITE_HTTP_TIMEOUT_MS`.
+ */
+const KITE_HTTP_TIMEOUT_MS = (() => {
+  const raw = process.env.KITE_HTTP_TIMEOUT_MS;
+  const v = raw === undefined || raw.trim() === "" ? NaN : Number(raw);
+  return Number.isFinite(v) ? Math.min(30_000, Math.max(500, Math.round(v))) : 8_000;
+})();
 
 export interface KiteConfig {
   apiKey: string;
@@ -399,6 +417,63 @@ export class KiteClient {
   }
 
   /**
+   * Run a fetch+body-read under a SINGLE absolute deadline (Defect 4).
+   *
+   * The AbortController's signal is threaded into `fetch`, and the timer is cleared only AFTER
+   * `fn` has consumed the body — so a stalled header AND a stalled body both abort, rather than
+   * the body read hanging unbounded once headers arrive. The `Deadline` uses a monotonic clock,
+   * so an NTP step cannot make the timeout fire early or never. On abort, `fetch`/`res.json()`
+   * reject with an AbortError, which the callers already translate into a `KiteError`.
+   *
+   * This is a READ/idempotent bound only. KiteClient issues no order mutations (those go through
+   * KiteHttpTransport), so timing out here is always safe to surface — there is no write whose
+   * outcome could be left ambiguous.
+   */
+  private async withDeadline<T>(fn: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    const deadline = Deadline.in(KITE_HTTP_TIMEOUT_MS);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), deadline.timerMs());
+    try {
+      return await fn(controller.signal);
+    } catch (err) {
+      if (err instanceof Error && err.name === "AbortError") {
+        throw new KiteError(`Kite request exceeded ${KITE_HTTP_TIMEOUT_MS}ms deadline.`, 504);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * A bounded authenticated GET returning `{ status, ok, json }` (Defect 4).
+   *
+   * Both the headers and the JSON body are consumed INSIDE the deadline, so neither can hang
+   * unbounded. Callers keep their exact success/error handling; only the transport is bounded.
+   */
+  private async getJson<J>(url: string): Promise<{ status: number; ok: boolean; json: J }> {
+    return this.withDeadline(async (signal) => {
+      const res = await fetch(url, { headers: this.authHeader(), signal });
+      const json = (await res.json()) as J;
+      return { status: res.status, ok: res.ok, json };
+    });
+  }
+
+  /** A bounded authenticated JSON POST returning `{ status, ok, json }` (Defect 4). */
+  private async postJson<J>(url: string, body: unknown): Promise<{ status: number; ok: boolean; json: J }> {
+    return this.withDeadline(async (signal) => {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { ...this.authHeader(), "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal,
+      });
+      const json = (await res.json()) as J;
+      return { status: res.status, ok: res.ok, json };
+    });
+  }
+
+  /**
    * Step 2/3 — DISABLED IN STRIKEEDGE.
    *
    * The Zerodha request-token exchange is removed: StrikeEdge never performs its
@@ -454,20 +529,19 @@ export class KiteClient {
 
   /** Authenticated user profile (the /user/ docs endpoint). */
   async getProfile(): Promise<Record<string, unknown>> {
-    const res = await fetch(`${KITE_API_ROOT}/user/profile`, {
-      headers: this.authHeader(),
+    // Header AND body under one deadline: the body read lives inside the callback so a stalled
+    // body aborts too, instead of `res.json()` hanging after the headers arrive.
+    const { status, ok, json } = await this.withDeadline(async (signal) => {
+      const res = await fetch(`${KITE_API_ROOT}/user/profile`, { headers: this.authHeader(), signal });
+      const body = (await res.json()) as { status: string; data?: Record<string, unknown>; message?: string };
+      return { status: res.status, ok: res.ok, json: body };
     });
-    const json = (await res.json()) as {
-      status: string;
-      data?: Record<string, unknown>;
-      message?: string;
-    };
-    if (!res.ok || json.status !== "success" || !json.data) {
+    if (!ok || json.status !== "success" || !json.data) {
       // A rejected/expired token means the session is dead — drop it.
-      if (res.status === 401 || res.status === 403) this.clearSession();
+      if (status === 401 || status === 403) this.clearSession();
       throw new KiteError(
-        json.message ?? `Failed to fetch profile (HTTP ${res.status}).`,
-        res.status || 500,
+        json.message ?? `Failed to fetch profile (HTTP ${status}).`,
+        status || 500,
       );
     }
     return json.data;
@@ -484,19 +558,16 @@ export class KiteClient {
     for (let i = 0; i < identifiers.length; i += 500) {
       const chunk = identifiers.slice(i, i + 500);
       const qs = chunk.map((id) => `i=${encodeURIComponent(id)}`).join("&");
-      const res = await fetch(`${KITE_API_ROOT}/quote/ohlc?${qs}`, {
-        headers: this.authHeader(),
-      });
-      const json = (await res.json()) as {
+      const { status, ok, json } = await this.getJson<{
         status: string;
         data?: Record<string, OhlcQuote>;
         message?: string;
-      };
-      if (!res.ok || json.status !== "success" || !json.data) {
-        if (res.status === 401 || res.status === 403) this.clearSession();
+      }>(`${KITE_API_ROOT}/quote/ohlc?${qs}`);
+      if (!ok || json.status !== "success" || !json.data) {
+        if (status === 401 || status === 403) this.clearSession();
         throw new KiteError(
-          json.message ?? `Failed to fetch quotes (HTTP ${res.status}).`,
-          res.status || 500,
+          json.message ?? `Failed to fetch quotes (HTTP ${status}).`,
+          status || 500,
         );
       }
       for (const v of Object.values(json.data)) {
@@ -515,19 +586,16 @@ export class KiteClient {
     for (let i = 0; i < identifiers.length; i += 500) {
       const chunk = identifiers.slice(i, i + 500);
       const qs = chunk.map((id) => `i=${encodeURIComponent(id)}`).join("&");
-      const res = await fetch(`${KITE_API_ROOT}/quote?${qs}`, {
-        headers: this.authHeader(),
-      });
-      const json = (await res.json()) as {
+      const { status, ok, json } = await this.getJson<{
         status: string;
         data?: Record<string, RawFullQuote>;
         message?: string;
-      };
-      if (!res.ok || json.status !== "success" || !json.data) {
-        if (res.status === 401 || res.status === 403) this.clearSession();
+      }>(`${KITE_API_ROOT}/quote?${qs}`);
+      if (!ok || json.status !== "success" || !json.data) {
+        if (status === 401 || status === 403) this.clearSession();
         throw new KiteError(
-          json.message ?? `Failed to fetch quotes (HTTP ${res.status}).`,
-          res.status || 500,
+          json.message ?? `Failed to fetch quotes (HTTP ${status}).`,
+          status || 500,
         );
       }
       for (const v of Object.values(json.data)) {
@@ -557,19 +625,16 @@ export class KiteClient {
     for (let i = 0; i < identifiers.length; i += 500) {
       const chunk = identifiers.slice(i, i + 500);
       const qs = chunk.map((id) => `i=${encodeURIComponent(id)}`).join("&");
-      const res = await fetch(`${KITE_API_ROOT}/quote?${qs}`, {
-        headers: this.authHeader(),
-      });
-      const json = (await res.json()) as {
+      const { status, ok, json } = await this.getJson<{
         status: string;
         data?: Record<string, RawFullQuote>;
         message?: string;
-      };
-      if (!res.ok || json.status !== "success" || !json.data) {
-        if (res.status === 401 || res.status === 403) this.clearSession();
+      }>(`${KITE_API_ROOT}/quote?${qs}`);
+      if (!ok || json.status !== "success" || !json.data) {
+        if (status === 401 || status === 403) this.clearSession();
         throw new KiteError(
-          json.message ?? `Failed to fetch quotes (HTTP ${res.status}).`,
-          res.status || 500,
+          json.message ?? `Failed to fetch quotes (HTTP ${status}).`,
+          status || 500,
         );
       }
       for (const v of Object.values(json.data)) {
@@ -598,19 +663,16 @@ export class KiteClient {
     for (let i = 0; i < identifiers.length; i += 500) {
       const chunk = identifiers.slice(i, i + 500);
       const qs = chunk.map((id) => `i=${encodeURIComponent(id)}`).join("&");
-      const res = await fetch(`${KITE_API_ROOT}/quote?${qs}`, {
-        headers: this.authHeader(),
-      });
-      const json = (await res.json()) as {
+      const { status, ok, json } = await this.getJson<{
         status: string;
         data?: Record<string, RawDepthQuote>;
         message?: string;
-      };
-      if (!res.ok || json.status !== "success" || !json.data) {
-        if (res.status === 401 || res.status === 403) this.clearSession();
+      }>(`${KITE_API_ROOT}/quote?${qs}`);
+      if (!ok || json.status !== "success" || !json.data) {
+        if (status === 401 || status === 403) this.clearSession();
         throw new KiteError(
-          json.message ?? `Failed to fetch quotes (HTTP ${res.status}).`,
-          res.status || 500,
+          json.message ?? `Failed to fetch quotes (HTTP ${status}).`,
+          status || 500,
         );
       }
       for (const v of Object.values(json.data)) {
@@ -635,19 +697,16 @@ export class KiteClient {
     for (let i = 0; i < identifiers.length; i += 500) {
       const chunk = identifiers.slice(i, i + 500);
       const qs = chunk.map((id) => `i=${encodeURIComponent(id)}`).join("&");
-      const res = await fetch(`${KITE_API_ROOT}/quote?${qs}`, {
-        headers: this.authHeader(),
-      });
-      const json = (await res.json()) as {
+      const { status, ok, json } = await this.getJson<{
         status: string;
         data?: Record<string, RawDepthQuote>;
         message?: string;
-      };
-      if (!res.ok || json.status !== "success" || !json.data) {
-        if (res.status === 401 || res.status === 403) this.clearSession();
+      }>(`${KITE_API_ROOT}/quote?${qs}`);
+      if (!ok || json.status !== "success" || !json.data) {
+        if (status === 401 || status === 403) this.clearSession();
         throw new KiteError(
-          json.message ?? `Failed to fetch quotes (HTTP ${res.status}).`,
-          res.status || 500,
+          json.message ?? `Failed to fetch quotes (HTTP ${status}).`,
+          status || 500,
         );
       }
       for (const v of Object.values(json.data)) {
@@ -674,24 +733,16 @@ export class KiteClient {
   async getBasketMargin(
     orders: BasketOrder[],
   ): Promise<{ initial: number; final: number; total: number }> {
-    const res = await fetch(
-      `${KITE_API_ROOT}/margins/basket?consider_positions=true`,
-      {
-        method: "POST",
-        headers: { ...this.authHeader(), "Content-Type": "application/json" },
-        body: JSON.stringify(orders),
-      },
-    );
-    const json = (await res.json()) as {
+    const { status, ok, json } = await this.postJson<{
       status: string;
       data?: { initial?: { total?: number }; final?: { total?: number } };
       message?: string;
-    };
-    if (!res.ok || json.status !== "success" || !json.data) {
-      if (res.status === 401 || res.status === 403) this.clearSession();
+    }>(`${KITE_API_ROOT}/margins/basket?consider_positions=true`, orders);
+    if (!ok || json.status !== "success" || !json.data) {
+      if (status === 401 || status === 403) this.clearSession();
       throw new KiteError(
-        json.message ?? `Failed to fetch basket margin (HTTP ${res.status}).`,
-        res.status || 500,
+        json.message ?? `Failed to fetch basket margin (HTTP ${status}).`,
+        status || 500,
       );
     }
     const initial = json.data.initial?.total ?? 0;
@@ -714,23 +765,17 @@ export class KiteClient {
   async getOrderCharges(orders: ChargeOrder[]): Promise<OrderCharges[]> {
     if (orders.length === 0) return [];
 
-    const res = await fetch(`${KITE_API_ROOT}/charges/orders`, {
-      method: "POST",
-      headers: { ...this.authHeader(), "Content-Type": "application/json" },
-      body: JSON.stringify(orders),
-    });
-
-    const json = (await res.json()) as {
+    const { status, ok, json } = await this.postJson<{
       status: string;
       data?: unknown;
       message?: string;
-    };
+    }>(`${KITE_API_ROOT}/charges/orders`, orders);
 
-    if (!res.ok || json.status !== "success" || !Array.isArray(json.data)) {
-      if (res.status === 401 || res.status === 403) this.clearSession();
+    if (!ok || json.status !== "success" || !Array.isArray(json.data)) {
+      if (status === 401 || status === 403) this.clearSession();
       throw new KiteError(
-        json.message ?? `Failed to fetch order charges (HTTP ${res.status}).`,
-        res.status || 500,
+        json.message ?? `Failed to fetch order charges (HTTP ${status}).`,
+        status || 500,
       );
     }
 
@@ -771,17 +816,20 @@ export class KiteClient {
     prio: HistoricalPriority,
   ): Promise<unknown[][]> {
     return historicalGate.run(prio, async () => {
-      const res = await fetch(url, { headers: this.authHeader() });
-      const json = (await res.json()) as {
+      // Inside the gate for pacing, but the network+body are ALSO bounded by the request
+      // deadline (Defect 4): the gate's slot watchdog only hands the SLOT back, it never aborts
+      // a stalled socket, so without this a hung body read would still occupy a connection and
+      // return to no one.
+      const { status, ok, json } = await this.getJson<{
         status: string;
         data?: { candles?: unknown[][] };
         message?: string;
-      };
-      if (!res.ok || json.status !== "success" || !json.data?.candles) {
-        if (res.status === 401 || res.status === 403) this.clearSession();
+      }>(url);
+      if (!ok || json.status !== "success" || !json.data?.candles) {
+        if (status === 401 || status === 403) this.clearSession();
         throw new KiteError(
-          json.message ?? `Failed to fetch historical data (HTTP ${res.status}).`,
-          res.status || 500,
+          json.message ?? `Failed to fetch historical data (HTTP ${status}).`,
+          status || 500,
         );
       }
       return json.data.candles;
