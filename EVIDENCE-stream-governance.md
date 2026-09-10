@@ -205,3 +205,158 @@ src/box/engine.ts:  reconcileSweep: async (_ingestRest) => { await this.orderMan
   gate therefore refuses a priced cancel on an expired session. The order-stream table's own
   AUTH_EXPIRED keeps protectiveCancel=true (an existing pinned test requires this, and the reduction
   itself is risk-reducing) — the refusal correctly comes from the session, not the order socket.
+
+
+---
+
+# EVIDENCE — Fix Agent 2: env-flag gating honesty (D2), duplicate fill-ledger store (D3), effective-config doc honesty (D7)
+
+Branch: feat/order-stream-integration
+Baseline HEAD for Agent 2: b603d63 (Agent 1's evidence commit).
+Agent 1 left: TOTAL pass=2031 fail=0 skipped=0. Agent 2 must keep fail=0 and not drop the pass count.
+
+---
+
+## DEFECT D2 — the Zerodha flag only changed a label, not the observation path
+
+### REPRODUCTION (confirmed by reading the code before fixing)
+- The order-stream consumer is ALWAYS constructed in live mode (engine.ts:790), because it is
+  needed for REST reconciliation and honest health even when the stream is off. `streamEnabled`
+  (from the flag) is passed to it.
+- The consumer's `streamEnabled` only drives HEALTH: `OrderUpdateProjection.setStreamEnabled(false)`
+  sets the health state to DISABLED but does NOT gate `ingest()` — a stream observation ingested
+  while "disabled" still attributes, applies to the ledger, and calls `applyToAdapter` (waking the
+  order's waiter).
+- The engine's `ingestBoxLaneOrderText` (the box lane's Kite-postback WS callback, wired
+  unconditionally via registry.ts:495 ← index.ts:198) was guarded ONLY by
+  `if (!this.orderStreamConsumer) return` — NEVER by the env flag. So a postback resolved a
+  production order waiter EVEN WITH `ZERODHA_ORDER_STREAM_ENABLED` unset, while `orderStreamStatus`
+  reported `gated_off` / `rest_polling_only`. A flag controlling a label but not the capability.
+
+### FAILING-FIRST → PASSING
+New test: tests/box/zerodhaFlagGatesObservation.test.mjs
+
+First failure (the honest gate predicate did not exist):
+```
+SyntaxError: The requested module '../../dist/brokers/zerodha/orderUpdates.js' does not provide an
+export named 'zerodhaTextFramesConsumed'
+✖ tests/box/zerodhaFlagGatesObservation.test.mjs  fail 1
+```
+The reproduction test itself demonstrates the defect behaviourally: with `streamEnabled: false`
+(the value the engine passes when the flag is unset), a stream observation STILL resolves the REAL
+KiteBrokerAdapter waiter with the REST getOrder poll never reached — proving the flag was not on
+the observation path.
+
+### DECISION: OPTION (a) — the flag GENUINELY GATES the observation path. WHY:
+1. It makes the DEFAULT deployment safe: unset ⇒ the verified REST-polling baseline, unchanged.
+2. It keeps REST polling as the fallback (unchanged).
+3. It makes the CODE match the meaning the DOCS ALREADY PROMISED — orderUpdates.ts said
+   "OFF BY DEFAULT ... When off, ticker.ts keeps discarding text frames"; env.example says OFF =
+   REST is the authority. Only the code failed to honour it. Option (b) (always-on, remove the
+   flag) would delete a switch operators rely on to stage a supervised rollout.
+
+### FIX
+- Added `zerodhaTextFramesConsumed()` in src/brokers/zerodha/orderUpdates.ts — the honest,
+  behaviour-named observation-path gate (currently the same single flag; documented as such).
+- `engine.ingestBoxLaneOrderText` now DROPS the frame before parse/enqueue unless the gate is armed.
+  The `order_events` ingestion queue has exactly ONE enqueuer (engine.ts:5546), so this is the
+  single correct chokepoint: unarmed ⇒ no postback consumed, no waiter woken by the stream, REST is
+  the sole mechanism — exactly what `orderStreamStatus` reports.
+- STATUS PAYLOAD SHAPE UNCHANGED. The existing `gated_off` / `rest_polling_only` reporting is now
+  TRUE instead of misleading. Contract NOT bumped.
+- Corrected env.example comment to state OFF ⇒ postbacks are NOT consumed (REST polling only).
+
+Passing:
+```
+✔ D2 reproduction: the consumer's streamEnabled flag alone does NOT gate ingestion
+✔ D2 fix: the text-frame observation gate is CLOSED when the flag is unset
+```
+Plus a source call-site assertion in wiredNotInert.test.mjs:
+```
+✔ D2: the Zerodha text-frame OBSERVATION path is gated by the flag, not just the status label
+```
+Commit: 9fca48e.
+
+---
+
+## DEFECT D3 — two competing fill-ledger stores, a comment claiming "ONE TRUTH"
+
+### REPRODUCTION (confirmed by reading the code before fixing)
+Two independent per-order `CumulativeFillLedger` stores, both fed from the SAME `BrokerOrder`
+snapshot on the SAME code path (`persistOrder`):
+- Store 1: `OrderUpdateProjection.ledgers` (in the consumer), fed by stream events and by REST via
+  `noteStreamBrokerSnapshot` (orderManager.ts). THE projection of truth (attributes, dedups, wakes).
+- Store 2: `orderManager.fillLedgers` (a BoundedTtlCache), fed independently by
+  `rememberFillIdentities`, called right after `noteStreamBrokerSnapshot` in `persistOrder`.
+A comment read "ONE TRUTH" while two stores existed.
+
+Crucially, `grep applied_overfill|\.trip\(` proved the two are NOT redundant: the PROJECTION (Store 1)
+computes `applied_overfill` but NEVER trips a breaker (orderStreamConsumer.ts:257 only decides
+whether to wake the adapter). ONLY Store 2 calls `this.trip(...)` on overfill (orderManager.ts).
+So Store 2 is a GENUINE, DISTINCT safety protection: an independent overfill circuit-breaker
+tripwire that the projection does not provide.
+
+### RESOLUTION: OPTION B — keep Store 2 deliberately, rename it, disclose it, pin the invariant.
+- Renamed `fillLedgers` → `overfillTripwireLedgers`; `rememberFillIdentities` → `checkOverfillTripwire`.
+- Rewrote the field/method comments to state plainly it is NOT the single truth but an independent,
+  redundant-by-design overfill tripwire that shares no state with the projection it guards.
+- Corrected the "ONE TRUTH" comment at the `noteStreamBrokerSnapshot` call site to "ONE PROJECTION
+  OF TRUTH", naming the projection as the single truth and the tripwire as a separate cross-check.
+- Added read-only diagnostic `overfillTripwireCumulative(clientOrderId)` so a test can compare the
+  two stores' attributed cumulative on live objects.
+
+### FAILING-FIRST → PASSING (real PostgreSQL, isolated schema per test; broker network mocked)
+New test: tests/pg/fillLedgerTwoStores.test.mjs
+
+Failing-first was produced by SIMULATING THE REMOVAL of Store 2 (commenting out the
+`this.checkOverfillTripwire(order)` call site) — i.e. proving the test catches the loss of the
+protection a consolidation would remove:
+```
+✖ D3 (1): an overfilled broker snapshot TRIPS the breaker (overfill protection preserved)
+    actual: 'persistence lost after confirmed fill BOX:...'   (breaker NOT tripped by the tripwire)
+✖ D3 (2): the projection and the overfill tripwire NEVER disagree about attributed cumulative
+    actual: undefined                                          (overfillTripwireCumulative gone)
+ℹ pass 0  ℹ fail 2
+```
+With Store 2 restored (the real code), both pass:
+```
+✔ D3 (1): an overfilled broker snapshot TRIPS the breaker (overfill protection preserved)
+✔ D3 (2): the projection and the overfill tripwire NEVER disagree about attributed cumulative
+ℹ pass 2  ℹ fail 0
+```
+
+### PROTECTIONS PROVEN STILL TO HOLD
+- OVERFILL BREAKER TRIP (Store 2's unique protection): D3(1) proves an 80-of-75 overfill trips the
+  circuit breaker with the exact reason "...exceeding the 75 requested".
+- CROSS-STORE AGREEMENT: D3(2) proves the projection cumulative == the tripwire cumulative (both 75).
+- COUNTED EXACTLY ONCE: re-driving the SAME durable intent re-feeds BOTH stores; neither advances
+  past 75 and the breaker does not trip on a legitimate exact fill (idempotence/monotonicity).
+- BONUS third guard observed: real PostgreSQL rejects filled>quantity via the
+  `box_order_intents_filled_le_qty` check constraint — a durable-layer overfill guard independent of
+  both in-memory stores. Left intact.
+
+Nothing was consolidated away, so no protection was removed; the second store is kept, renamed and
+honestly documented as an independent overfill tripwire.
+
+---
+
+## DEFECT D7 — effectiveConfig header claimed "for a status route" that does not exist
+
+### REPRODUCTION
+`resolveEffectiveConfig` (effectiveConfig.ts:263) is invoked ONLY by its own CLI `main` and by the
+parity test; no HTTP route, engine path or status payload calls it. The header comment claimed it
+was "for a status route or a test".
+
+### FIX (documentation-only)
+Rewrote the header's "WHO CONSUMES THIS" / "RUNTIME SURFACES" block to describe it honestly as an
+OPERATOR PRE-FLIGHT CLI TOOL (`node dist/box/effectiveConfig.js`) with no running-process caller.
+Verified the docs (CONFIGURATION.md, DEPLOYMENT.md, RUNBOOK.md, MUMBAI_EC2_PROFILE.md) already
+describe it only as a pre-arm CLI command — no doc implied a running-process integration, so no doc
+change was needed. Existing tests unaffected:
+```
+$ node --test tests/box/effectiveConfig.test.mjs   # pass 14 fail 0
+```
+
+---
+
+## VERIFICATION (Agent 2 finishing state) — see the "FINAL VERIFICATION" appendix below for command output.

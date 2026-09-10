@@ -34,11 +34,24 @@
  * loaded config field-for-field. It is not a parallel parser that could drift: it
  * is a provenance-annotated view of the one the engine boots from.
  *
+ * WHO CONSUMES THIS (be honest — audit D7)
+ * This module is an OPERATOR PRE-FLIGHT TOOL, invoked ONLY by its own CLI `main`
+ * (`node dist/box/effectiveConfig.js`) below. It is NOT wired into the running
+ * trading process: no HTTP route, engine path, or status payload calls
+ * `resolveEffectiveConfig()`. That is by design and useful — an operator runs it
+ * BEFORE boot to see what a `.env` will actually resolve to (and where each value
+ * came from) — but nothing in the live process reads it, so this comment must not
+ * imply a "status route" that does not exist. The tests that call it
+ * (config.test.mjs / effectiveConfig.test.mjs) verify the resolver matches the
+ * loader; they are the only other callers.
+ *
  * RUNTIME SURFACES
- *   - `resolveEffectiveConfig()` — structured data, for a status route or a test.
- *   - `renderEffectiveConfig()`  — a human-readable table, for logs / an operator.
- *   - `node dist/box/effectiveConfig.js` — prints the table for the CURRENT env,
- *     with `--json` for the structured form. No new dependency; pure Node.
+ *   - `resolveEffectiveConfig()` — structured data, consumed by the CLI `main` below
+ *     and by the parity test. No running-process caller.
+ *   - `renderEffectiveConfig()`  — a human-readable table, for the CLI's stdout / logs.
+ *   - `node dist/box/effectiveConfig.js` — the operator pre-flight command: prints the
+ *     table for the CURRENT env, with `--json` for the structured form. No new
+ *     dependency; pure Node. This is the ONLY production entry point.
  */
 
 import { loadBoxConfig, type BoxConfig } from "./config.js";

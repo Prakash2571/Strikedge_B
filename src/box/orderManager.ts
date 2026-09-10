@@ -423,19 +423,27 @@ export class BoxOrderManager {
   };
   private readonly queue: QueueAction[] = [];
   /**
-   * Per-order cumulative-fill ledgers (audit divergence D5).
+   * INDEPENDENT OVERFILL TRIPWIRE — deliberately a SECOND, redundant fill accounting (audit D3).
    *
-   * REPLACES a dead `fillIdentities` set whose `continue` skipped nothing and which nothing ever
-   * read. Every observed broker snapshot for an order is now routed through a ledger that
-   * enforces the invariants the brief requires: a duplicate broker event contributes no
-   * quantity, an out-of-order snapshot cannot rewind the cumulative total, and an overfill is
-   * surfaced rather than silently clamped.
+   * This is NOT the single projection of truth. That is {@link OrderUpdateProjection} inside the
+   * order-stream consumer (see `noteStreamBrokerSnapshot`), through which stream AND REST
+   * observations are attributed, deduplicated and woken. This second set of per-order ledgers is a
+   * separate, adversarial CROSS-CHECK fed from the SAME broker snapshot on the SAME code path: its
+   * ONLY job is to trip the circuit breaker if the broker ever reports MORE filled than we asked
+   * for. It is redundant BY DESIGN — an overfill is a "our own quantity model is wrong" signal, and
+   * a safety tripwire that shares no state with the thing it guards is worth its small cost.
    *
-   * The authoritative position arithmetic remains the Mongo-guarded path below; this ledger is
-   * the verification layer that turns a violated invariant into a tripped breaker instead of a
-   * quiet accounting error. Bounded by TTL and count, so a long session cannot leak.
+   * REPLACED a dead `fillIdentities` set whose `continue` skipped nothing and which nothing read.
+   * Every observed broker snapshot for an order is routed through a ledger that enforces the same
+   * invariants: a duplicate broker event contributes no quantity, an out-of-order snapshot cannot
+   * rewind the cumulative total, and an overfill is surfaced rather than silently clamped.
+   *
+   * The authoritative position arithmetic remains the Mongo-guarded path below. Because BOTH this
+   * tripwire and the projection are idempotent, monotonic and fed the SAME cumulative snapshot,
+   * they can NEVER disagree about attributed cumulative quantity for an order (pinned by
+   * tests/box/fillLedgerTwoStores.test.mjs). Bounded by TTL and count, so a long session cannot leak.
    */
-  private readonly fillLedgers: BoundedTtlCache<CumulativeFillLedger>;
+  private readonly overfillTripwireLedgers: BoundedTtlCache<CumulativeFillLedger>;
   private readonly activeClientIds = new Set<string>();
   private readonly knownIntents = new Map<string, IBoxOrderIntent>();
   private orphanOrders: BrokerOrder[] = [];
@@ -578,10 +586,10 @@ export class BoxOrderManager {
     },
   ) {
     this.tradingDay = this.dayKey();
-    // Bounded: one ledger per in-flight order, expiring well after any order's lifetime. Sized
-    // generously relative to the concurrency cap so nothing in a normal session is evicted while
-    // still live, and hard-capped so nothing can leak.
-    this.fillLedgers = new BoundedTtlCache<CumulativeFillLedger>({
+    // Bounded: one tripwire ledger per in-flight order, expiring well after any order's lifetime.
+    // Sized generously relative to the concurrency cap so nothing in a normal session is evicted
+    // while still live, and hard-capped so nothing can leak.
+    this.overfillTripwireLedgers = new BoundedTtlCache<CumulativeFillLedger>({
       maxEntries: 512,
       ttlMs: 60 * 60_000,
       now: () => this.now(),
@@ -934,7 +942,15 @@ export class BoxOrderManager {
   }
 
   /**
-   * Route an observed broker snapshot through this order's cumulative-fill ledger.
+   * INDEPENDENT OVERFILL TRIPWIRE — route an observed broker snapshot through this order's
+   * SECOND, redundant fill ledger whose SOLE purpose is to trip the breaker on an overfill.
+   *
+   * This is deliberately NOT the projection of truth (that is the order-stream consumer's
+   * {@link OrderUpdateProjection}, fed by `noteStreamBrokerSnapshot` on this SAME code path). It is
+   * an adversarial cross-check: it shares no state with the projection, so a bug in either one is
+   * caught by the other. Because both are idempotent, monotonic and fed the same cumulative
+   * snapshot, they can never disagree about attributed cumulative quantity (pinned by
+   * tests/box/fillLedgerTwoStores.test.mjs).
    *
    * THE INVARIANTS THIS ENFORCES (Phase 6 / Phase 29):
    *
@@ -948,13 +964,13 @@ export class BoxOrderManager {
    * persistence of a real fill. It is emphatically NOT fail-open with respect to the overfill
    * finding, which is a safety signal.
    */
-  private rememberFillIdentities(order: BrokerOrder): void {
+  private checkOverfillTripwire(order: BrokerOrder): void {
     let overfill: { cumulative: number; requested: number } | null = null;
     try {
-      let ledger = this.fillLedgers.get(order.client_order_id);
+      let ledger = this.overfillTripwireLedgers.get(order.client_order_id);
       if (!ledger) {
         ledger = new CumulativeFillLedger(order.client_order_id, order.quantity);
-        this.fillLedgers.set(order.client_order_id, ledger);
+        this.overfillTripwireLedgers.set(order.client_order_id, ledger);
       }
       const result = ledger.apply({
         cumulativeQty: order.filled_quantity,
@@ -977,6 +993,18 @@ export class BoxOrderManager {
         `broker reported ${overfill.cumulative} filled for ${order.client_order_id}, exceeding the ${overfill.requested} requested`,
       );
     }
+  }
+
+  /**
+   * The overfill-tripwire ledger's cumulative for an order, or `undefined` if none exists.
+   *
+   * READ-ONLY DIAGNOSTIC (audit D3). Exposed only so a test can pin the invariant that the
+   * independent overfill tripwire and the order-stream consumer's projection of truth NEVER
+   * disagree about attributed cumulative quantity — both are fed the same cumulative snapshots and
+   * are idempotent+monotonic, so they must always match. It is not part of any decision path.
+   */
+  overfillTripwireCumulative(clientOrderId: string): number | undefined {
+    return this.overfillTripwireLedgers.get(clientOrderId)?.cumulative;
   }
 
   /** Report a real broker rejection for statistics. Fail-open. */
@@ -2342,10 +2370,12 @@ export class BoxOrderManager {
     order: BrokerOrder,
     message: string,
   ): Promise<IBoxOrderIntent> {
-    // ONE TRUTH. Feed this authoritative broker snapshot into the SAME order-stream projection the
-    // stream feeds, deduplicated and monotonic — so a REST/adapter snapshot and a stream event of
-    // the same fill are never double-counted, and the broker order id is bound to our client id.
-    // Fail-open; it runs off the existing guarded durable write below, not a second persistence path.
+    // ONE PROJECTION OF TRUTH. Feed this authoritative broker snapshot into the SAME order-stream
+    // projection the stream feeds (the OrderUpdateProjection in the consumer), deduplicated and
+    // monotonic — so a REST/adapter snapshot and a stream event of the same fill are never
+    // double-counted, and the broker order id is bound to our client id. That projection is the
+    // single truth for attribution and waking waiters. Fail-open; it runs off the existing guarded
+    // durable write below, not a second persistence path.
     this.noteStreamBrokerSnapshot(intent, order);
     // TIMING: record the broker's CUMULATIVE quantity for this snapshot, and — if the order has
     // reached a terminal state — close and publish the trace. Both are fail-open no-ops when
@@ -2358,7 +2388,7 @@ export class BoxOrderManager {
     } catch {
       /* telemetry must never affect execution */
     }
-    this.rememberFillIdentities(order);
+    this.checkOverfillTripwire(order);
     try {
       const result = await this.deps.persistence.update(
         intent.client_order_id,
