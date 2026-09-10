@@ -74,7 +74,9 @@
     "config",
     "order_stream",
     "execution_funnel",
-    "economic_admission"
+    "economic_admission",
+    "market_data_state",
+    "market_data_health"
   ],
   "properties": {
     "running": {
@@ -170,6 +172,24 @@
         "object",
         "null"
       ]
+    },
+    "market_data_state": {
+      "$comment": "MARKET-DATA transport health, DISTINCT from order-stream health and from the crude market_data_healthy boolean. READY is reachable only after fresh usable depth per traded instrument in the current connection generation; a socket merely being open is not READY. Source: MarketDataStateMachine.state().",
+      "type": "string",
+      "enum": [
+        "DISABLED",
+        "CONNECTING",
+        "AUTHENTICATING",
+        "SYNCHRONIZING",
+        "READY",
+        "DEGRADED",
+        "DISCONNECTED",
+        "AUTH_EXPIRED"
+      ]
+    },
+    "market_data_health": {
+      "$comment": "OPEN by design: the MarketDataStateMachine diagnostics (generation, per-instrument readiness, transport-heartbeat / last-frame / last-valid-depth ages, backlog signal). An engine-owned observability object pinned as presence + object-ness. Source: MarketDataStateMachine.diagnostics().",
+      "type": "object"
     },
     "database_healthy": {
       "type": "boolean"

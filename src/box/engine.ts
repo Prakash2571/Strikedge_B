@@ -125,6 +125,7 @@ import { orderStreamStatus } from "./orderStreamStatus.js";
 import type { OrderStreamHealth } from "./orderUpdateProjection.js";
 import { OrderStreamConsumer } from "./orderStreamConsumer.js";
 import { MarketDataStateMachine, marketDataPermissions, type MarketDataState } from "./streamHealthPolicy.js";
+import { StagePipeline } from "./boundedQueue.js";
 import { parseKiteOrderFrame, zerodhaOrderStreamEnabledFromEnv } from "../brokers/zerodha/orderUpdates.js";
 import { dhanOrderStreamEnabledFromEnv, type DhanOrderFeed } from "../brokers/dhan/orderFeed.js";
 import { ensureBoxPersistenceReady } from "./repository.js";
@@ -598,6 +599,19 @@ export class BoxEngine {
    */
   private readonly marketDataMachine: MarketDataStateMachine;
   /**
+   * THE BACKPRESSURE PIPELINE (GAP 2).
+   *
+   * Decouples ingestion from processing so a slow stage cannot block order-state processing on the
+   * single event loop. The `order_events` stage is NEVER-DROP: a WebSocket callback ENQUEUES the
+   * raw frame and returns (staying lightweight), and a bounded microtask pump drains it into the
+   * order-stream consumer; under overload it signals the market-data machine's backlog (blocking
+   * NEW ENTRY and prompting reconciliation) while still delivering every event — a missing order
+   * event is never a zero fill. Constructed on the monotonic clock.
+   */
+  private readonly ingestPipeline: StagePipeline;
+  /** True while a pipeline drain is scheduled, so overlapping frames coalesce into one pump. */
+  private ingestPumpScheduled = false;
+  /**
    * The inner (uncoordinated) gateway.
    *
    * Retained only so read-only diagnostics can reach the per-Box capital report, which is computed
@@ -645,6 +659,27 @@ export class BoxEngine {
       now: () => this.executionClock.mono(),
       heartbeatMaxAgeMs: this.cfg.feedMaxAgeMs,
       bookMaxAgeMs: this.cfg.quoteMaxAgeMs,
+    });
+    // The backpressure pipeline. The order-event stage is NEVER-DROP: a raw postback frame is
+    // enqueued by the (lightweight) WS callback and drained by a bounded microtask pump into the
+    // order-stream consumer. Capacity is a pressure THRESHOLD, not a cap — the queue holds and
+    // delivers every event, and an overload only raises the backlog signal that blocks new entry.
+    this.ingestPipeline = new StagePipeline({ now: () => this.executionClock.mono() });
+    this.ingestPipeline.addStage<string>({
+      name: "order_events",
+      capacity: this.cfg.orderEventQueuePressureThreshold,
+      overflow: "never-drop",
+      handler: (raw) => this.processOrderEventFrame(raw),
+      onOverload: (info) => {
+        // Record the degraded condition and BLOCK new entry via the market-data backlog signal.
+        // Exposure management (exit/cancel) is unaffected: it does not route through this queue.
+        this.lastError =
+          `order-event ingestion backlog (${info.depth} queued) — new entry paused, reconciling`;
+        this.marketDataMachine.onProcessingBacklog(true);
+        // A backlog means events may be arriving faster than we apply them: reconcile against the
+        // broker so the durable truth is re-established, never inferred from the gap.
+        void this.orderManager?.reconcile().catch(() => undefined);
+      },
     });
     this.environmentMonitor = new ExecutionEnvironmentMonitor({
       enabled: this.cfg.executionEventLoopMetricsEnabled,
@@ -5410,13 +5445,51 @@ export class BoxEngine {
    * the Zerodha stream is armed.
    */
   ingestBoxLaneOrderText(raw: string): void {
+    if (!this.orderStreamConsumer) return;
+    // KEEP THE WS CALLBACK LIGHTWEIGHT: enqueue the raw frame and return. Parsing and ingestion
+    // happen off the socket callback in a bounded microtask pump, so a slow projection/analytics
+    // stage can never block the socket that also carries the market-data ticks. The order-event
+    // queue is NEVER-DROP, so a burst is retained and delivered, never silently discarded.
+    this.ingestPipeline.enqueue("order_events", raw, "order_events");
+    this.scheduleIngestPump();
+  }
+
+  /** Parse + ingest ONE order-event frame. Runs in the drain pump, never inside the WS callback. */
+  private processOrderEventFrame(raw: string): void {
     const consumer = this.orderStreamConsumer;
     if (!consumer) return;
     const frame = parseKiteOrderFrame(raw);
     if (frame.type === "order" && frame.observation) {
       consumer.ingestStreamObservation(frame.observation);
     }
-    // A `message`/`error`/`unknown` frame carries no fill evidence; it is intentionally dropped.
+    // A `message`/`error`/`unknown` frame carries no fill evidence; it is intentionally dropped —
+    // this is dropping a NON-order informational frame, NOT an order event.
+  }
+
+  /**
+   * Schedule ONE bounded drain of the ingestion pipeline on a microtask.
+   *
+   * Coalesced: overlapping enqueues share a single scheduled pump, so a burst of frames does not
+   * spawn a pump each. The drain is bounded (drains the queued snapshot and returns), never leaves
+   * a dangling timer, and clears the backlog signal once the order-event queue is no longer
+   * overloaded so new entry can resume.
+   */
+  private scheduleIngestPump(): void {
+    if (this.ingestPumpScheduled) return;
+    this.ingestPumpScheduled = true;
+    queueMicrotask(() => {
+      void this.ingestPipeline
+        .pumpUntilIdle({ stages: ["order_events"] })
+        .catch(() => undefined)
+        .finally(() => {
+          this.ingestPumpScheduled = false;
+          // Once the order-event queue has drained back within its threshold, lift the backlog
+          // signal so NEW ENTRY can resume (exposure management was never blocked).
+          if (!this.ingestPipeline.stage("order_events").isOverloaded()) {
+            this.marketDataMachine.onProcessingBacklog(false);
+          }
+        });
+    });
   }
 
   /**

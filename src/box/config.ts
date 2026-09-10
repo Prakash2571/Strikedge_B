@@ -722,6 +722,16 @@ export interface BoxConfig {
    * universe. When it trips, no entry and no automatic exit happens at all.
    */
   feedMaxAgeMs: number;
+  /**
+   * ORDER-EVENT INGESTION backpressure threshold: the number of queued raw order-event frames
+   * (the never-drop backpressure queue) above which the pipeline reports OVERLOAD. Overload blocks
+   * NEW ENTRY (via the market-data backlog signal) and triggers a broker reconciliation while the
+   * queue continues to hold and deliver EVERY event — a missing order event is never a zero fill,
+   * so this is a pressure threshold, never a cap that could drop data. Sized generously: order
+   * events are low-volume relative to market data, so a sustained backlog past this is a real
+   * processing-lag incident worth pausing entry over.
+   */
+  orderEventQueuePressureThreshold: number;
   /** Maximum age (ms) of the underlying value used to place the ATM window. */
   underlyingMaxAgeMs: number;
 
@@ -1178,6 +1188,11 @@ export function loadBoxConfig(): BoxConfig {
 
     quoteMaxAgeMs: num("BOX_QUOTE_MAX_AGE_MS", 15_000),
     feedMaxAgeMs: num("BOX_FEED_MAX_AGE_MS", 5_000),
+    // Order-event ingestion backpressure threshold. Order postbacks are low-volume relative to
+    // market data, so a sustained backlog past this many queued frames is a genuine processing-lag
+    // incident: overload pauses NEW ENTRY and prompts reconciliation while the never-drop queue
+    // keeps delivering every event. Not a cap — data is never dropped.
+    orderEventQueuePressureThreshold: num("BOX_ORDER_EVENT_QUEUE_PRESSURE", 512),
     underlyingMaxAgeMs: num("BOX_UNDERLYING_MAX_AGE_MS", 10_000),
 
     strikesEachSide: 3,
