@@ -55,5 +55,5 @@ Same fix applied to `DhanBrokerAdapter`.
 ## Not finished in this track (handed to later tracks)
 
 - Market-data generation invalidation / per-instrument readiness (item 4).
-- Rate/economic/funnel wiring (item 8).
+- Rate/economic/funnel wiring (item 8) — **now completed**, see `EVIDENCE-rate-econ-funnel.md`.
 - Frontend surfacing of the new stream health (item 10).
