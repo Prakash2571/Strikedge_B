@@ -141,13 +141,14 @@ export function makeDurablePersistence({ clock, createDelayMs = () => 0, updateD
  *   { kind: "reject", family }                   — broker rejects the placement
  *   { kind: "cancel", fillAtMs, filledQty }      — never completes; protective-cancel terminal
  */
-export function makeKiteTransport({ clock, plan, assume, rand, onSend, onProgress }) {
+export function makeKiteTransport({ clock, plan, assume, rand, onSend, onProgress, onCancelTerminal }) {
   const state = new Map();       // brokerOrderId -> snapshot
   const byClient = new Map();     // tag -> brokerOrderId (planned outcome lookup uses tag)
   let placeCalls = 0;
   let getCalls = 0;
   let cancelCalls = 0;
   let nextId = 1;
+  let rateLimitCooldownMs = 0;
 
   // Notify the runner that a broker order made observable progress (partial or terminal), so a
   // healthy stream can deliver the SAME confirmed truth sooner. Bounded: fires only on an actual
@@ -165,10 +166,17 @@ export function makeKiteTransport({ clock, plan, assume, rand, onSend, onProgres
     placeCalls: () => placeCalls,
     getOrderCalls: () => getCalls,
     cancelCalls: () => cancelCalls,
+    rateLimitCooldownMs: () => rateLimitCooldownMs,
     _state: state,
     async placeOrder(req, opts) {
       // Assumed POST latency (network + gateway + matching-engine ACK), an INPUT not a measurement.
-      const postMs = assume.postMs(rand);
+      let postMs = assume.postMs(rand);
+      // A rate-limit cooldown is NOT a resend — the mutation is never replayed. It delays THIS
+      // placement's completion (429 + Retry-After), what the real budget imposes on the next send.
+      if (rand() < assume.rateLimitRate) {
+        rateLimitCooldownMs += assume.retryAfterMs;
+        postMs += assume.retryAfterMs;
+      }
       opts?.beforeSend?.();
       placeCalls++;
       // The send instant is NOW — beforeSend fired at the true post-pacing send boundary.
@@ -240,11 +248,13 @@ export function makeKiteTransport({ clock, plan, assume, rand, onSend, onProgres
     },
     async cancelOrder(orderId) {
       cancelCalls++;
+      const requestedAt = clock.now();
       // Assumed cancel-ack latency, then the broker reports the terminal cumulative snapshot.
       await clock.wait(assume.cancelMs(rand));
       const s = state.get(orderId);
       if (s && s.status !== "COMPLETE") {
         s.status = "CANCELLED"; s.pending_quantity = 0;
+        onCancelTerminal?.(s.tag, requestedAt, clock.now());
         progress(orderId);
       }
     },

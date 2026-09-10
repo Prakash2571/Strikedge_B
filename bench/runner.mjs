@@ -100,10 +100,15 @@ export async function runComposedEntry({ scenario, seed }) {
   // consumer exists) forwards it as a stream event. Kept in a holder so the transport can be built
   // before the consumer without a circular reference.
   const progressHandler = { fn: null };
+  let cancelToTerminalMs = null;
   const transport = makeKiteTransport({
     clock, plan, assume, rand: rng,
     onSend: (tag, at) => { if (!sendAtByTag.has(tag)) sendAtByTag.set(tag, at); },
     onProgress: (tag, brokerId, snap) => progressHandler.fn?.(tag, brokerId, snap),
+    onCancelTerminal: (tag, reqAt, termAt) => {
+      const span = termAt - reqAt;
+      if (cancelToTerminalMs === null || span > cancelToTerminalMs) cancelToTerminalMs = span;
+    },
   });
 
   const adapter = new KiteBrokerAdapter(
@@ -238,11 +243,13 @@ export async function runComposedEntry({ scenario, seed }) {
     first_fill_ms: firstFillAt !== null ? firstFillAt - t0 : null,
     four_leg_completion_ms: fourLegComplete ? (terminalAt.length ? Math.max(...terminalAt) - t0 : null) : null,
     fill_dispersion_ms: terminalAt.length >= 2 ? Math.max(...terminalAt) - Math.min(...terminalAt) : 0,
+    cancel_to_terminal_ms: cancelToTerminalMs,
     persistence_wait_ms: persistence.persistenceWaitMs(),
     pacing_wait_ms: adapter.pacingStats().totalWaitMs,
     order_mutation_wait_ms: adapter.pacingStats().orderMutationWaitMs,
+    rate_limit_cooldown_ms: transport.rateLimitCooldownMs(),
     rest_polls: transport.getOrderCalls(),
-    stream_events: adapter.streamObservationStats?.().applied ?? 0,
+    adapter_ext_observations: adapter.streamObservationStats?.().applied ?? 0,
     legs_transmitted: legsTransmitted,
     completed, partial, cancelled, rejected,
     four_leg_completed: fourLegComplete,
