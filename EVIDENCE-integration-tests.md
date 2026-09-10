@@ -53,3 +53,55 @@ an evidence doc. `file:line` points at the load-bearing assertion or the test de
 | 5 | Final-send coherence blocks the queued regression | `tests/box/defectCSendBoundaryCoherence.test.mjs:71` — REAL gateway→manager→adapter; coherence good at enqueue, degraded during pacing → 0 POST |
 
 The revert-proof for each of these five is recorded in the "Revert proofs" section below.
+
+## Revert proofs (each fix reverted locally, rebuilt, test re-run, then restored)
+
+Procedure for every proof below: apply a minimal local edit to the PRODUCTION source that neutralises
+exactly the fix, `npm run build`, run the proving test (expect FAIL), then restore the source and
+rebuild (expect PASS). `git diff --stat src/` was EMPTY after every restore.
+
+| Proof | Reverted seam (src) | Observed failure with the fix reverted |
+|---|---|---|
+| 1 — stream resolves production waiter | `kiteBrokerAdapter.applyOrderUpdate` → early `return undefined` | `orderStreamRealWaiter.test.mjs` HANGS (killed at 60s, rc=124): the waiter never wakes on the event and only REST could resolve it |
+| 2 — rate exhaustion prevents transmission | `kiteBrokerAdapter.refusePlacementIfBudgetExhausted` → early `return` | both Kite cases FAIL (time out at 20s): the over-budget placement reaches the transport, the expected `BrokerPreSubmitRefusedError` never fires |
+| 3 — missing funds/margin blocks entry | `executionGateway` economic-admission `if (economic && !allowed)` disabled | 4 tests FAIL (MISSING/STALE funds, MISSING margin, INSUFFICIENT funds): entry admitted, legs submitted |
+| 4 — real events increment the funnel | `ExecutionFunnel.recordCandidateEvaluated` → early `return` | `funnelProductionWiring.test.mjs` "real scanner evaluations increment the funnel" FAILS: `candidates_evaluated` stays 0 |
+| 5 — final-send coherence blocks the queued regression | `orderManager.entryCrossLegCoherenceGap` → early `return null` | `defectCSendBoundaryCoherence.test.mjs` C1 FAILS: all four legs POST despite dispersion rising to 1,000 ms during pacing |
+
+The two NEW tests added by this track were revert-proofed the same way:
+
+| New test | Reverted seam | Observed failure |
+|---|---|---|
+| `persistenceFailureBoundary.test.mjs` (after-fill) | `orderManager.persistOrder` catch → swallow the loss instead of throwing `OrderPersistenceAfterFillError` | the after-fill test FAILS: the submit resolves cleanly, hiding a confirmed fill |
+| `disconnectDuringStage.test.mjs` (entry stages) | `executionGateway` `marketDataEntryPermitted` gate disabled | the 6 not-READY entry-refusal tests FAIL: entry transmits all four legs while the socket is CONNECTING/AUTHENTICATING/SYNCHRONIZING/DEGRADED/DISCONNECTED/AUTH_EXPIRED |
+
+## Test counts
+
+- BEFORE (tracked baseline): **1961 pass / 0 fail / 0 skip** (unit 1679).
+- AFTER (tracked): **1975 pass / 0 fail / 0 skip** (unit 1693) — +14 tests
+  (`persistenceFailureBoundary` 4 + `disconnectDuringStage` 10).
+- Per-suite AFTER: unit 1693, invariants 3, tokens 48, access 31, switch 32, shutdown 11,
+  readiness 24, contract 44, pg 72, projector 17.
+- `npm run build` passes; `bash .github/ci/no-live-hostnames.sh` and
+  `node .github/ci/no-egress-guard.mjs` both pass.
+
+> The aggregate `run-suites.sh` reports 1975 pass / **1 fail** ONLY because the untracked,
+> sibling-owned `tests/box/composedBenchmarkSmoke.test.mjs` (item 9) fails against its in-progress
+> `bench/**` harness. Running the box suite EXCLUDING that untracked file gives unit 1693 pass / 0
+> fail / 0 skip. That file is not part of this track and is not mine to modify.
+
+## CI configuration state
+
+`.github/workflows/ci.yml` runs, and was verified to run:
+- All test suites (`test:unit`, `test:invariants`, `test:pg`, `test:projector`, `test:tokens`,
+  `test:switch`, `test:access`, `test:shutdown`, `test:readiness`, `test:contract`) as steps in
+  job `test`, each under the armed egress guard (`NODE_OPTIONS=--import ./.github/ci/no-egress-guard.mjs`).
+  My two new tests are in `tests/box/*.test.mjs` and run inside `test:unit` automatically.
+- The contract verification: `test:contract` imports and exercises `contract/validate.mjs` and
+  `contract/digest.mjs`, including a digest-staleness check (`negativeControls.test.mjs`).
+- Both scans as backstops: job `no-live-hostnames` runs `.github/ci/no-live-hostnames.sh`; the
+  egress guard is armed into every suite AND audited by the "Assert the egress guard armed and
+  blocked nothing" step; plus `safety-defaults` and `no-committed-secrets` jobs.
+- No CI change was required: the workflow already runs the suites, the contract verification and
+  both scans, and the new tests are picked up by the existing `test:unit` glob.
+
