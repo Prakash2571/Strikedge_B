@@ -8,6 +8,38 @@ fallbacks (from `src/config.ts`, `src/box/config.ts`, `src/pg/pool.ts`,
 Legend: **Req?** = required. "yes" means the process cannot function without it;
 "prod" means required in production only; "no" means it has a safe default.
 
+## Configuration precedence and the effective-config surface
+
+Precedence, lowest to highest:
+
+1. **Code default** — `src/config.ts`, `src/box/config.ts`, `src/pg/pool.ts`.
+2. **Process environment** — the `.env` loaded into `process.env` by the process
+   manager (or a PM2 `env` block). Higher wins.
+
+There is no separate config-file layer: a `.env` is loaded INTO the environment
+before the code runs, so environment is the only external source. Two rules make an
+effective value differ from what you typed: an **out-of-range** numeric value is
+**clamped** into range, and an **unparseable** value **falls back** to the default
+(an unrecognised boolean reads as `false`, so a safety gate is never armed by a typo).
+Runtime operator API controls (arming, execution permission) are a separate,
+session-scoped permission plane that can withdraw a permission but never widen a
+configured numeric limit.
+
+To see the RESOLVED value of every Box knob AND where it came from
+(`default` / `env` / `env_clamped` / `env_invalid_fallback`), run the effective-config
+surface on the deployment host after the `.env` is loaded:
+
+```bash
+node dist/box/effectiveConfig.js            # human-readable table
+node dist/box/effectiveConfig.js --json     # structured
+```
+
+It uses the SAME parser as `loadBoxConfig` (proven by `tests/box/effectiveConfig.test.mjs`)
+and refuses to report a configuration that would not boot. `/api/box/status` `.config`
+also publishes the parsed configuration in force. If either disagrees with your `.env`,
+they are what is running.
+
+
 ## Application (`src/config.ts`)
 
 | Variable | Default | Req? | What it does | If wrong |
@@ -186,9 +218,34 @@ unchanged from CalSpread so a mixed fleet reads the same keys.
 Every `BOX_*` strategy knob in `.env.example` is **optional**; the defaults are
 the shipped specification and keep execution in `paper_latency`. The loader
 validates and clamps each one and fails closed. The full annotated list lives in
-`.env.example`; the ten calibration/live-timing variables are below.
+`.env.example`; the live/safety and calibration variables are below.
 
-### The ten calibration / live-timing variables
+### Live execution, safety and admission (`src/box/config.ts`)
+
+| Variable | Default | Req? | What it does | If wrong |
+| --- | --- | --- | --- | --- |
+| `BOX_EXECUTION_MODE` | `paper_latency` | no | `paper_touch`\|`paper_latency`\|`paper_legging`\|`live`. | Unknown value FAILS boot; `live` needs the kill switch. |
+| `BOX_LIVE_TRADING_ENABLED` | `false` | no | The deployment kill switch; `live` mode is rejected at boot without it. | Both this and `live` mode required to place a real order. |
+| `BOX_LIVE_MAX_OPEN_BOXES` | `1` | no | Concurrent open boxes (clamp 0..20). | Higher ⇒ more concurrent risk. |
+| `BOX_LIVE_MAX_CONCURRENT_EXECUTIONS` | `1` | no | Concurrent execution pipelines (clamp 1..4). | — |
+| `BOX_ONE_ACTIVE_BOX_PER_UNDERLYING` | `false` | no | One box per underlying, on top of contract exclusion. | Set `true` for the conservative profile. |
+| `BOX_SESSION_MAX_COMPLETED_TRADES` | `0` | no | Completed-box cap for an armed session; `0`=unlimited (clamp 0..10000). | Set `1` to arm a one-shot session. |
+| `BOX_LIVE_MAX_BOX_CAPITAL_RUPEES` | `0` | no | GROSS order notional cap (₹), NOT margin/max-loss; `0`=disabled (clamp 0..1e9). | A placeholder to set, never an approved budget. |
+| `BOX_LIVE_REQUIRE_FUNDS_COVER` | `false` | no | Refuse entry unless fresh broker funds cover the requirement. | `true` recommended for live; blocks on stale/missing funds. |
+| `BOX_LIVE_REQUIRE_MARGIN_EVIDENCE` | `false` | no | Refuse entry without fresh basket-margin evidence. | Fails CLOSED (no source wired) — leave off until wired. |
+| `BOX_LIVE_FUNDS_FRESHNESS_MAX_AGE_MS` | `5000` | no | Max age of a funds observation counted fresh (clamp 250..600000). | — |
+| `BOX_LIVE_MARGIN_FRESHNESS_MAX_AGE_MS` | `5000` | no | Max age of a margin observation counted fresh (clamp 250..600000). | — |
+| `BOX_LIVE_DAILY_LOSS_LIMIT` | `5000` | no | Loss breaker: stops NEW entry, not a max loss (clamp 0..1e7). | — |
+| `BOX_LIVE_ORDER_MUTATION_DEADLINE_MS` | `4000` | no | ONE end-to-end budget per mutation, started before queue admission (clamp 250..30000). | Too low ⇒ premature abandonment; too high ⇒ slow give-up. |
+| `BOX_LIVE_ENTRY_SUBMIT_CONCURRENCY` | `1` | no | Entry-role submissions in transport at once (1..4). | 4 does NOT make entry atomic. |
+| `BOX_LIVE_BROKER_ORDER_MIN_INTERVAL_MS` | `0` | no | Order-mutation pacing; `0`=derive from broker floor, override clamped UP (clamp 0..5000). | Never goes below the broker's hard floor. |
+| `BOX_ORDER_EVENT_QUEUE_PRESSURE` | `512` | no | Never-drop order-event backpressure THRESHOLD; overload blocks entry + reconciles, never drops. | Not a cap; data is never dropped. |
+| `BOX_MAX_CROSS_LEG_RECEIVE_DISPERSION_MS` | `500` | no | Primary LIVE four-leg coherence gate (clamp 0..60000). | `0` is impossible-to-satisfy in live unless explicitly opted out. |
+| `BOX_MAX_CROSS_LEG_EXCHANGE_DISPERSION_MS` | `250` | no | Exchange-time dispersion gate (clamp 0..60000). | Kite stamps are whole SECONDS — set ≥1000 or rely on the receive gate. |
+| `BOX_DEPLOYMENT_REGION` | — | no | Calibration dataset region label (e.g. `mumbai`); NEVER auto-detected. | Wrong label pools cross-region latency. |
+
+### The calibration / live-timing variables
+
 
 | Variable | Default | Req? | What it does | If wrong |
 | --- | --- | --- | --- | --- |
