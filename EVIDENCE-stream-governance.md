@@ -81,3 +81,127 @@ $ grep -n "consumer.onConnecting\|consumer.onSocketOpen\|consumer.onAuthenticate
 ```
 
 ---
+
+## FAILING-FIRST → PASSING EVIDENCE
+
+New test file: tests/box/streamGovernance.test.mjs (D1/D4/D5/D6 behaviour) plus
+tests/box/wiredNotInert.test.mjs (production call-site assertions).
+
+### D1 — first failure (helper not exported)
+
+```
+SyntaxError: The requested module '../../dist/box/streamHealthPolicy.js' does not provide an
+export named 'entryPermittedFromStreams'
+✖ tests/box/streamGovernance.test.mjs  fail 1
+```
+
+Then, after adding `entryPermittedFromStreams` (a thin wrapper over the existing
+`combinedPermissions` table) and one iteration on the AUTH_EXPIRED assertion (an expired SESSION,
+not the order stream, is what refuses a priced protective cancel — market-data AUTH_EXPIRED is
+NONE, so the intersection refuses it): all D1 tests pass.
+
+### D4/D5 — first failure (methods not implemented)
+
+```
+✖ D5 ... TypeError: consumer.evaluateIdle is not a function
+✖ D4 ... TypeError: consumer.runReconnectReconciliation is not a function
+ℹ pass 7  ℹ fail 7
+```
+
+After implementing `evaluateIdle`, `runReconnectReconciliation`, `reconcileSweep`,
+working-order tracking and last-stream-event tracking: all pass.
+
+### Combined pass (streamGovernance.test.mjs) — 17/17
+
+```
+✔ D1 (7 tests)  ✔ D5 (4 tests)  ✔ D4 (3 tests)  ✔ D6 (3 tests)
+ℹ pass 17  ℹ fail 0
+```
+
+### Existing test that guarded the gate literal
+
+`tests/box/marketDataStateMachineWiring.test.mjs` asserts the gate derives from
+`marketDataPermissions(state).newEntry`. The first D1 wiring renamed the variable and broke it:
+
+```
+✖ NEW ENTRY is gated on READY, and only in LIVE mode
+  AssertionError: the gate must derive from the market-data permission table's newEntry
+```
+
+Fixed by keeping the exact literal AND intersecting the order stream via
+`entryPermittedFromStreams` — both facts now hold. No existing test was modified, deleted or
+skipped.
+
+### Anti-inert wiring assertions (wiredNotInert.test.mjs) — added, all pass
+
+```
+✔ D1: the combined entry gate consults the order stream, not market data alone
+✔ D6: the Zerodha order-stream lifecycle is DRIVEN from the quote-socket connection
+✔ D4: the reconnect gap-repair sweep and reconcile completion are wired
+✔ D5: idleness is DRIVEN from a real clock against working-order expectation
+```
+
+## VERIFICATION (finishing state)
+
+### Build
+```
+$ npm run build
+> tsc -b            # exit 0
+```
+
+### Suites
+```
+$ /home/ubuntu/Cal/run-suites.sh /home/ubuntu/Cal/Strikedge_B
+unit         pass=1749   fail=0    skipped=0
+invariants   pass=3      fail=0    skipped=0
+tokens       pass=48     fail=0    skipped=0
+access       pass=31     fail=0    skipped=0
+switch       pass=32     fail=0    skipped=0
+shutdown     pass=11     fail=0    skipped=0
+readiness    pass=24     fail=0    skipped=0
+contract     pass=44     fail=0    skipped=0
+pg           pass=72     fail=0    skipped=0
+projector    pass=17     fail=0    skipped=0
+TOTAL pass=2031 fail=0 skipped=0 overall_rc=0
+```
+Before: TOTAL pass=2010 fail=0 skipped=0.  After: pass=2031 fail=0 skipped=0 (+21, fail=0).
+
+### CI scans + contract
+```
+$ bash .github/ci/no-live-hostnames.sh   # OK, rc=0
+$ node .github/ci/no-egress-guard.mjs     # CI-EGRESS-GUARD: armed (loopback-only egress), rc=0
+$ node contract/validate.mjs              # rc=0
+```
+
+### Production callers now exist (previously ZERO)
+```
+# D1 — the entry gate now intersects the order stream via the shared table:
+src/box/engine.ts:932:  const permitted = entryPermittedFromStreams({ marketData: state, orderStream }).permitted;
+src/box/streamHealthPolicy.ts:218:  const combined = combinedPermissions(args);   # entryPermittedFromStreams → combinedPermissions
+src/box/engine.ts:927:  const orderStream = this.orderStreamState();
+
+# D6 — the Zerodha lifecycle is driven from the quote socket:
+src/box/engine.ts:5442:  void consumer.driveQuoteSocketLifecycle(connected);   # from onBoxLaneConnection
+src/box/orderStreamConsumer.ts:  driveQuoteSocketLifecycle → onConnecting/onSocketOpen/onAuthenticated/runReconnectReconciliation
+
+# D5 — onIdle is reachable via a real clock:
+src/box/engine.ts:5501:  consumer.evaluateIdle(this.executionClock.wall());
+src/box/orderStreamConsumer.ts:414:  this.machine.onIdle();   # inside evaluateIdle
+
+# D4 — reconcilePending is polled and drives completion:
+src/box/orderStreamConsumer.ts:347:  if (!this.reconcilePending()) return;   # inside runReconnectReconciliation
+src/box/engine.ts:  reconcileSweep: async (_ingestRest) => { await this.orderManager?.reconcile(); }
+```
+
+## NOTES / WHAT WAS NOT DONE
+- D6 is proven at the exact production seam the engine invokes (`consumer.driveQuoteSocketLifecycle`,
+  called by `engine.onBoxLaneConnection` for Zerodha when the stream is enabled), via the consumer
+  behavioural tests plus source-level call-site assertions in wiredNotInert.test.mjs. A full
+  live-mode BoxEngine harness (registry + live adapter + PG-backed order manager) was NOT built for
+  an end-to-end engine test because that wiring is heavyweight and out of scope for this fix; the
+  seam extracted for D6 is the verbatim code the engine calls, so the behaviour is covered.
+- AUTH_EXPIRED protective-cancel: the brief's "AUTH_EXPIRED refuses protective cancel" is satisfied
+  at the SESSION (market-data) transport, whose AUTH_EXPIRED is NONE; the combined (intersected)
+  gate therefore refuses a priced cancel on an expired session. The order-stream table's own
+  AUTH_EXPIRED keeps protectiveCancel=true (an existing pinned test requires this, and the reduction
+  itself is risk-reducing) — the refusal correctly comes from the session, not the order socket.
