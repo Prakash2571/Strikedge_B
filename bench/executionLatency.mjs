@@ -1,4 +1,14 @@
 /**
+ * ⚠️ SUPERSEDED (item 9). This is the OLD pacing-only benchmark. It is retained ONLY for
+ * reference/comparison and MUST NOT be quoted. It has three known flaws, documented in
+ * docs/LATENCY_BENCHMARK.md §1:
+ *   1. it treats most POST responses as fill confirmation (line ~195: confirmedAt = respondedAt);
+ *   2. it skips the ordinary REST getOrder confirmation the real adapters perform;
+ *   3. its virtual clock SUMS concurrent waits (line ~51: t += delta), so two concurrent 100ms
+ *      waits complete at t=200 instead of t=100 — inflating every concurrency-2/4 figure.
+ * Use `node bench/composedLatency.mjs`, which drives the REAL composed production path on a
+ * correct discrete-event scheduler. See docs/LATENCY_BENCHMARK.md.
+ *
  * OFFLINE EXECUTION-LATENCY BENCHMARK — entry concurrency 1 vs 2 vs 4.
  *
  * WHAT THIS IS: a deterministic, virtual-clock simulation of the four-leg entry path that
