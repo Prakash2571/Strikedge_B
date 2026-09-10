@@ -1,11 +1,29 @@
 # Broker rate limits — verified reference
 
-**Verification date: 2026-09-09.** Every figure below was read from the cited OFFICIAL
-source on this date. This file is the human-readable companion to `BROKER_RATE_LIMITS` in
-`src/box/brokerPacing.ts`; the constants there must match this table exactly.
+**Verification date: 2026-09-09. Re-verified 2026-09-10.** Every figure below was read from
+the cited OFFICIAL source. This file is the human-readable companion to `BROKER_RATE_LIMITS`
+in `src/box/brokerPacing.ts`; the constants there must match this table exactly.
 
 > Web access was used ONLY to read public official documentation. No trading endpoint was
 > contacted.
+
+## Re-verification 2026-09-10 (item 8 wiring)
+
+Both official sources were fetched again on 2026-09-10 while wiring `RateBudgetLedger` into the
+live adapters. **No figure changed.** Confirmed verbatim against the sources on this date:
+
+- Kite Connect v3 (`kite.trade/docs/connect/v3/exceptions/#api-rate-limit`): order placement
+  10 req/s; "There are limitations at 400 orders per minute and 10 orders per second"; a single
+  user/API key may not place more than 5,000 orders per day across all segments and varieties;
+  order modification capped at 25 per order; Quote 1 req/s, Historical candle 3 req/s, all other
+  endpoints 10 req/s. `429` is the throttle code and a rejected order still counts against the
+  daily budget.
+- DhanHQ v2 (`dhanhq.co/docs/v2/`, "Rate Limit" table): Order APIs 10/s, 250/min, 1,000/hr,
+  7,000/day; Data APIs 5/s, 100,000/day; Quote APIs 1/s; Non-Trading APIs 20/s; order
+  modifications capped at 25/order.
+
+The `BROKER_RATE_LIMITS` constant in `src/box/brokerPacing.ts` matches this table exactly; no
+constant required correction on 2026-09-10.
 
 ## Why this document exists — a corrected defect
 
