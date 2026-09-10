@@ -17,8 +17,12 @@ import {
   type BrokerRejectFamily,
 } from "./brokerAdapter.js";
 import {
+  type BrokerEndpointClass,
   type BrokerPacingClass,
   type EffectiveBrokerPacing,
+  isRateLimited,
+  parseRetryAfterMs,
+  RateBudgetLedger,
   resolveBrokerPacing,
   TransportPacer,
   type TransportPacerStats,
@@ -295,6 +299,18 @@ export interface KiteBrokerAdapterConfig {
    * broker's published order limit.
    */
   pacing?: EffectiveBrokerPacing;
+  /**
+   * The SHARED, application-owned multi-window order budget for this broker ACCOUNT (Task 8).
+   *
+   * Optional so existing tests that build a config literal keep compiling; when absent the
+   * adapter paces only per-second via {@link pacing} and enforces no longer window. When present
+   * it MUST be the ONE ledger shared across every adapter/consumer on the same account (the
+   * engine owns it), because the broker meters the account, not the adapter instance. The adapter
+   * consults it at the final pre-wire boundary: an over-budget ENTRY placement is refused with a
+   * proven no-POST {@link BrokerPreSubmitRefusedError} (no HTTP request leaves), while a
+   * protective CANCEL/MODIFY spends the recovery reserve so a placement storm cannot starve it.
+   */
+  rateBudget?: RateBudgetLedger;
   maxModifications: number;
   maxChaseTicks: number;
 }
@@ -312,6 +328,28 @@ export function kiteAdapterConfigFromBoxConfig(cfg: BoxConfig): KiteBrokerAdapte
     maxModifications: cfg.liveMaxModifications,
     maxChaseTicks: cfg.liveMaxChaseTicks,
   };
+}
+
+/** Map the broker-metered endpoint class onto the per-second pacing bucket. */
+function pacingClassFor(klass: BrokerEndpointClass): BrokerPacingClass {
+  return klass === "data_read" ? "general" : "order_mutation";
+}
+
+/**
+ * Best-effort read of a `Retry-After` value from a Kite error body.
+ *
+ * Kite does not surface response headers on {@link KiteHttpError}, so we look for a Retry-After
+ * hint the body may carry. Returns null when absent — the ledger then applies its own
+ * conservative default cooldown rather than treating a missing hint as "retry now".
+ */
+function readRetryAfterHeader(body: unknown): string | null {
+  if (body && typeof body === "object") {
+    const record = body as Record<string, unknown>;
+    const raw = record["retry_after"] ?? record["Retry-After"] ?? record["retryAfter"];
+    if (typeof raw === "string") return raw;
+    if (typeof raw === "number" && Number.isFinite(raw)) return String(raw);
+  }
+  return null;
 }
 
 /**
@@ -379,6 +417,8 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     // rather than being hidden inside the POST duration.
     this.mark(req.client_order_id, "transport_started");
     let placed: { order_id: string };
+    // The order-budget placement guard, resolved once so the SAME closure runs at the boundary.
+    const placementGuard = this.placementBudgetGuard(req.client_order_id);
     // Fires at the FINAL SYNCHRONOUS instant before the wire (Defect 3): threaded THROUGH the
     // adapter pacer AND the transport's token-resolution await down to KiteHttpTransport.request,
     // where it runs immediately before `fetch` with no further await. Previously it ran inside
@@ -386,11 +426,22 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     // window in which entry could be disarmed while the POST was still on its way to the wire.
     const beforeSend = (): void => {
       beforePost?.();
+      // ORDER BUDGET (Task 8): the FINAL pre-wire check. An over-budget placement throws
+      // BrokerPreSubmitRefusedError here — before any HTTP request — and is recorded against the
+      // shared account budget only when allowed. No-op when no ledger is wired.
+      placementGuard();
       // HTTP REQUEST START: marked here because this is the true moment the POST leaves for the
       // network — post_to_http_response_ms then measures the broker, NOT our rate limiter.
       this.mark(req.client_order_id, "http_request_started");
     };
     try {
+      // FAST REFUSAL: if the shared budget is ALREADY exhausted, refuse now — before the pacing
+      // wait — so an over-budget entry does not sit through a pacing interval only to be refused
+      // at the wire. Pure read (no record); the authoritative check+record still runs in
+      // `beforeSend` at the send boundary, so budget is consumed only for a request that leaves.
+      // A throw here is caught below and cleans up the session projection like any pre-submit
+      // refusal.
+      this.refusePlacementIfBudgetExhausted(req.client_order_id);
       placed = await this.call(() => {
         return this.transport.placeOrder({
           exchange: req.exchange,
@@ -403,7 +454,7 @@ export class KiteBrokerAdapter implements BrokerAdapter {
           price: req.pricing.limit_price,
           tag: order.tag as string,
         }, { beforeSend });
-      }, "order_mutation");
+      }, "order_place");
       this.mark(req.client_order_id, "http_response");
     } catch (error) {
       if (error instanceof BrokerPreSubmitRefusedError) {
@@ -412,6 +463,9 @@ export class KiteBrokerAdapter implements BrokerAdapter {
         this.orders.delete(req.client_order_id);
         throw error;
       }
+      // A 429 feeds the shared budget a cooldown (never a resend). Done before any classification
+      // so the cooldown is recorded even on the ambiguous path below.
+      this.penalizeIfRateLimited(error);
       // The response is an observable event whether it succeeded or failed. Recording it on the
       // failure path is what makes a timeout's duration measurable instead of invisible.
       this.mark(req.client_order_id, "http_response");
@@ -485,10 +539,11 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     // because the race starts the moment we commit to cancelling.
     this.mark(clientOrderId, "cancel_requested");
     await withDeadline(
-      this.call(() => this.transport.cancelOrder(order.broker_order_id as string), "order_mutation"),
+      this.call(() => this.transport.cancelOrder(order.broker_order_id as string), "order_cancel"),
       this.config.cancelTimeoutMs,
       "Kite cancellation timed out; reconciliation is required.",
     ).catch((error) => {
+      this.penalizeIfRateLimited(error);
       order.state = "RECONCILIATION_REQUIRED";
       throw error;
     });
@@ -526,7 +581,7 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     await this.call(() => this.transport.modifyOrder(order.broker_order_id as string, {
       price: request.limit_price,
       ...(request.quantity !== undefined ? { quantity: request.quantity } : {}),
-    }), "order_mutation");
+    }), "order_modify");
     this.modifications.set(clientOrderId, count + 1);
     order.limit_price = request.limit_price;
     order.pricing = { ...order.pricing, limit_price: request.limit_price };
@@ -880,13 +935,14 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     this.mark(order.client_order_id, "cancel_requested");
     try {
       await withDeadline(
-        this.call(() => this.transport.cancelOrder(order.broker_order_id as string), "order_mutation"),
+        this.call(() => this.transport.cancelOrder(order.broker_order_id as string), "order_cancel"),
         this.config.cancelTimeoutMs,
         "Protective cancellation timed out.",
       );
       this.mark(order.client_order_id, "cancel_acknowledged");
       return await this.confirmTerminalAfterCancel(order);
     } catch (error) {
+      this.penalizeIfRateLimited(error);
       order.state = "RECONCILIATION_REQUIRED";
       order.updated_at = this.clock.now();
       throw new BrokerAmbiguousSubmitError(
@@ -964,12 +1020,111 @@ export class KiteBrokerAdapter implements BrokerAdapter {
   /**
    * Paced transport. Every broker touch goes through here.
    *
-   * `klass` defaults to `"general"` so an unclassified call gets the SLOWER interval; only
-   * place / modify / cancel opt into the order-mutation rate. See `brokerPacing.ts` for why
-   * the two are separated and how the absolute floor still bounds total request rate.
+   * `klass` is the endpoint class the broker meters at (`order_place` / `order_modify` /
+   * `order_cancel` / `data_read`). It selects BOTH the per-second pacing bucket (order mutations
+   * are paced faster than general reads) AND — for order endpoints — the multi-window
+   * {@link RateBudgetLedger} check. See `brokerPacing.ts` for why the two are separated.
+   *
+   * The ledger check for a PLACEMENT is deliberately NOT done here: it must ride the final
+   * synchronous pre-wire boundary (`beforeSend`) so a refusal is a proven no-POST. This method
+   * gates the RECOVERY endpoints (cancel/modify), which have no `beforeSend` hook, immediately
+   * before the transport call — if refused (only possible when even the reserve is spent), it
+   * throws before any request leaves.
    */
-  private call<T>(operation: () => Promise<T>, klass: BrokerPacingClass = "general"): Promise<T> {
-    return this.pacer.run(operation, klass);
+  private call<T>(operation: () => Promise<T>, klass: BrokerEndpointClass = "data_read"): Promise<T> {
+    if (klass === "order_cancel" || klass === "order_modify") {
+      this.reserveRecoveryBudgetOrThrow(klass);
+    }
+    return this.pacer.run(operation, pacingClassFor(klass));
+  }
+
+  /**
+   * Fast pre-pacing refusal: throw immediately if the shared placement budget is ALREADY spent.
+   *
+   * A pure read — it does NOT record. Its only job is to avoid sitting through a pacing interval
+   * for a placement the budget will refuse anyway; the authoritative check+record still happens at
+   * the send boundary in {@link placementBudgetGuard}. A no-op when no ledger is wired.
+   */
+  private refusePlacementIfBudgetExhausted(clientOrderId: string): void {
+    const ledger = this.config.rateBudget;
+    if (!ledger) return;
+    const decision = ledger.check("order_place", this.clock.now());
+    if (!decision.allowed) {
+      ledger.noteRefusal("order_place");
+      throw new BrokerPreSubmitRefusedError(
+        clientOrderId,
+        "pre_post",
+        true,
+        `order budget exhausted: ${decision.reason}`,
+      );
+    }
+  }
+
+  /**
+   * Consult the shared order budget for a PLACEMENT at the pre-wire boundary.
+   *
+   * Returns a synchronous guard to run inside `beforeSend`. When the placement would breach a
+   * window it throws {@link BrokerPreSubmitRefusedError} at stage `pre_post` — the adapter's own
+   * catch and the transport both re-throw it untouched, so NO HTTP request is transmitted and the
+   * durable intent terminalises as a free REJECTED no-POST (never a broker reject, never retried).
+   * When allowed it RECORDS the placement against the budget. A no-op when no ledger is wired.
+   */
+  private placementBudgetGuard(clientOrderId: string): () => void {
+    const ledger = this.config.rateBudget;
+    if (!ledger) return () => undefined;
+    return () => {
+      const now = this.clock.now();
+      const decision = ledger.check("order_place", now);
+      if (!decision.allowed) {
+        ledger.noteRefusal("order_place");
+        throw new BrokerPreSubmitRefusedError(
+          clientOrderId,
+          "pre_post",
+          true,
+          `order budget exhausted: ${decision.reason}`,
+        );
+      }
+      ledger.record("order_place", now);
+    };
+  }
+
+  /** Gate a recovery mutation (cancel/modify) against the reserve; throw before any wire use. */
+  private reserveRecoveryBudgetOrThrow(klass: "order_cancel" | "order_modify"): void {
+    const ledger = this.config.rateBudget;
+    if (!ledger) return;
+    const now = this.clock.now();
+    const decision = ledger.check(klass, now);
+    if (!decision.allowed) {
+      ledger.noteRefusal(klass);
+      // Even the recovery reserve is spent (or a broker cooldown is active). Surface it as a
+      // proven no-POST refusal rather than sending into a budget the broker will 429.
+      throw new BrokerPreSubmitRefusedError(
+        "recovery",
+        "pre_post",
+        false,
+        `recovery budget unavailable: ${decision.reason}`,
+      );
+    }
+    ledger.record(klass, now);
+  }
+
+  /**
+   * Feed a caught error to the shared budget as a throttle signal WITHOUT ever resending.
+   *
+   * A 429 means the account is over budget in a way our own count did not predict (most likely an
+   * unobservable external consumer). {@link RateBudgetLedger.penalize} records a hard cooldown; we
+   * then let the caller's EXISTING ambiguous/reconcile-by-tag path run — a 429 tells us nothing
+   * about whether the exchange saw the order, so the order is NEVER replayed.
+   */
+  private penalizeIfRateLimited(error: unknown): void {
+    const ledger = this.config.rateBudget;
+    if (!ledger) return;
+    const status = error instanceof KiteHttpError ? error.status : null;
+    if (!isRateLimited(status)) return;
+    const retryAfterMs = error instanceof KiteHttpError
+      ? parseRetryAfterMs(readRetryAfterHeader(error.body), this.clock.now())
+      : null;
+    ledger.penalize(this.clock.now(), retryAfterMs);
   }
 }
 

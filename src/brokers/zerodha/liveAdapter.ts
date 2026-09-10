@@ -21,6 +21,7 @@ import {
 } from "../../box/kiteBrokerAdapter.js";
 import type { BoxConfig } from "../../box/config.js";
 import type { ExecutionTimingRecorder } from "../../box/executionTiming.js";
+import type { RateBudgetLedger } from "../../box/brokerPacing.js";
 
 /**
  * Build the Zerodha live adapter.
@@ -33,6 +34,7 @@ export function createZerodhaLiveAdapter(
   kite: KiteClient,
   cfg: BoxConfig,
   timing?: ExecutionTimingRecorder,
+  rateBudget?: RateBudgetLedger,
 ): BrokerAdapter {
   const apiKey = process.env.KITE_API_KEY?.trim() ?? "";
   if (!apiKey) {
@@ -52,6 +54,7 @@ export function createZerodhaLiveAdapter(
   return new KiteBrokerAdapter(transport, {
     ...kiteAdapterConfigFromBoxConfig(cfg),
     ...(timing ? { timing } : {}),
+    ...(rateBudget ? { rateBudget } : {}),
   });
 }
 

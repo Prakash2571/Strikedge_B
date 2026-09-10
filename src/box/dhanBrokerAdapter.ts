@@ -27,8 +27,11 @@
  */
 
 import {
+  type BrokerEndpointClass,
   type BrokerPacingClass,
   type EffectiveBrokerPacing,
+  isRateLimited,
+  RateBudgetLedger,
   resolveBrokerPacing,
   TransportPacer,
   type TransportPacerStats,
@@ -110,6 +113,17 @@ export interface DhanAdapterConfig {
    * keep compiling; absent, it is derived from `brokerMinIntervalMs` and Dhan's floor.
    */
   pacing?: EffectiveBrokerPacing;
+  /**
+   * The SHARED, application-owned multi-window order budget for this broker ACCOUNT (Task 8).
+   *
+   * Optional so existing config literals keep compiling. When present it MUST be the ONE ledger
+   * shared across every adapter/consumer on the same account (the engine owns it), because the
+   * broker meters the account, not the adapter instance. The adapter consults it at the pre-wire
+   * boundary: an over-budget ENTRY placement is refused with a proven no-POST
+   * {@link BrokerPreSubmitRefusedError}, while a protective CANCEL/MODIFY spends the recovery
+   * reserve so a placement storm cannot starve it.
+   */
+  rateBudget?: RateBudgetLedger;
   maxModifications: number;
   maxChaseTicks: number;
   dhanClientId: () => string;
@@ -154,6 +168,9 @@ export function dhanAdapterConfigFromBoxConfig(
     staticIpReady: () => boolean;
     dhanClientId: () => string;
     identify: (token: number) => { segment: DhanExchangeSegment; securityId: number } | null;
+    timing?: ExecutionTimingRecorder;
+    /** The shared, application-owned account order budget (Task 8). */
+    rateBudget?: RateBudgetLedger;
   },
 ): DhanAdapterConfig {
   return {
@@ -246,6 +263,11 @@ function parseDhanTime(value: string | null | undefined, fallback: number): numb
   if (Number.isFinite(direct)) return direct;
   const withZone = Date.parse(`${value.replace(" ", "T")}+05:30`);
   return Number.isFinite(withZone) ? withZone : fallback;
+}
+
+/** Map the broker-metered endpoint class onto the per-second pacing bucket. */
+function dhanPacingClassFor(klass: BrokerEndpointClass): BrokerPacingClass {
+  return klass === "data_read" ? "general" : "order_mutation";
 }
 
 export class DhanBrokerAdapter implements BrokerAdapter {
@@ -480,8 +502,87 @@ export class DhanBrokerAdapter implements BrokerAdapter {
     return Deadline.in(budget, () => this.mono());
   }
 
-  private call<T>(op: () => Promise<T>, klass: BrokerPacingClass = "general"): Promise<T> {
-    return this.pacer.run(op, klass);
+  /**
+   * Paced transport. `klass` is the broker-metered endpoint class; it selects both the pacing
+   * bucket and — for order endpoints — the shared {@link RateBudgetLedger}. The PLACEMENT check
+   * rides the pre-wire boundary (`beforeSend`), not here. RECOVERY endpoints (cancel/modify) have
+   * no such hook, so they are gated here immediately before the transport call.
+   */
+  private call<T>(op: () => Promise<T>, klass: BrokerEndpointClass = "data_read"): Promise<T> {
+    if (klass === "order_cancel" || klass === "order_modify") {
+      this.reserveRecoveryBudgetOrThrow(klass);
+    }
+    return this.pacer.run(op, dhanPacingClassFor(klass));
+  }
+
+  /** Fast pre-pacing refusal: throw immediately if the shared placement budget is already spent. */
+  private refusePlacementIfBudgetExhausted(clientOrderId: string): void {
+    const ledger = this.cfg.rateBudget;
+    if (!ledger) return;
+    const decision = ledger.check("order_place", this.mono());
+    if (!decision.allowed) {
+      ledger.noteRefusal("order_place");
+      throw new BrokerPreSubmitRefusedError(
+        clientOrderId,
+        "pre_post",
+        true,
+        `order budget exhausted: ${decision.reason}`,
+      );
+    }
+  }
+
+  /** The send-boundary placement guard: check+record, throwing a proven no-POST when refused. */
+  private placementBudgetGuard(clientOrderId: string): () => void {
+    const ledger = this.cfg.rateBudget;
+    if (!ledger) return () => undefined;
+    return () => {
+      const now = this.mono();
+      const decision = ledger.check("order_place", now);
+      if (!decision.allowed) {
+        ledger.noteRefusal("order_place");
+        throw new BrokerPreSubmitRefusedError(
+          clientOrderId,
+          "pre_post",
+          true,
+          `order budget exhausted: ${decision.reason}`,
+        );
+      }
+      ledger.record("order_place", now);
+    };
+  }
+
+  /** Gate a recovery mutation (cancel/modify) against the reserve; throw before any wire use. */
+  private reserveRecoveryBudgetOrThrow(klass: "order_cancel" | "order_modify"): void {
+    const ledger = this.cfg.rateBudget;
+    if (!ledger) return;
+    const now = this.mono();
+    const decision = ledger.check(klass, now);
+    if (!decision.allowed) {
+      ledger.noteRefusal(klass);
+      throw new BrokerPreSubmitRefusedError(
+        "recovery",
+        "pre_post",
+        false,
+        `recovery budget unavailable: ${decision.reason}`,
+      );
+    }
+    ledger.record(klass, now);
+  }
+
+  /** Feed a 429 to the shared budget as a cooldown WITHOUT ever resending. */
+  private penalizeIfRateLimited(error: unknown): void {
+    const ledger = this.cfg.rateBudget;
+    if (!ledger) return;
+    if (error instanceof DhanRateLimitError) {
+      const retryAfterMs =
+        typeof error.retryAfterSec === "number" && Number.isFinite(error.retryAfterSec) && error.retryAfterSec > 0
+          ? error.retryAfterSec * 1_000
+          : null;
+      ledger.penalize(this.mono(), retryAfterMs);
+      return;
+    }
+    const status = error instanceof DhanError ? error.status : null;
+    if (isRateLimited(status)) ledger.penalize(this.mono(), null);
   }
 
   /** Attach the deterministic correlation id. Pure — no transport. */
@@ -526,13 +627,23 @@ export class DhanBrokerAdapter implements BrokerAdapter {
     // the POST leaves for the network; a thrown BrokerPreSubmitRefusedError proves it never did.
     const beforeSend = (): void => {
       beforePost?.();
+      // ORDER BUDGET (Task 8): authoritative check+record at the FINAL pre-wire instant. An
+      // over-budget placement throws BrokerPreSubmitRefusedError here — before any HTTP request —
+      // so budget is consumed only for a request that actually leaves. No-op without a ledger.
+      placementGuard();
       this.mark(req.client_order_id, "http_request_started");
     };
     // ABSOLUTE END-TO-END BUDGET, started BEFORE the transport pacer (Defect D). The pacer wait,
     // the lower HTTP pacing queue, the network round trip and the body read share this one budget;
     // an expiry while queued releases the caller promptly and provably transmits nothing.
     const mutationDeadline = this.mutationDeadline();
+    // The send-boundary placement guard, resolved once so the SAME closure runs at the boundary.
+    const placementGuard = this.placementBudgetGuard(req.client_order_id);
     try {
+      // FAST REFUSAL: refuse an already-exhausted budget before the pacing wait, so an over-budget
+      // entry does not sit through a pacing interval only to be refused at the wire. Caught below
+      // and cleaned up like any pre-submit refusal.
+      this.refusePlacementIfBudgetExhausted(req.client_order_id);
       placed = await this.call(() => {
         return this.client.placeOrder({
           dhanClientId: this.cfg.dhanClientId(),
@@ -547,7 +658,7 @@ export class DhanBrokerAdapter implements BrokerAdapter {
           quantity: req.quantity,
           price: req.pricing.limit_price,
         }, { beforeSend, ...(mutationDeadline ? { deadline: mutationDeadline } : {}) });
-      }, "order_mutation");
+      }, "order_place");
       this.mark(req.client_order_id, "http_response");
     } catch (err) {
       if (err instanceof BrokerPreSubmitRefusedError) {
@@ -556,6 +667,9 @@ export class DhanBrokerAdapter implements BrokerAdapter {
         this.clientByCorrelation.delete(correlationId);
         throw err;
       }
+      // A 429 feeds the shared budget a cooldown (never a resend). Done before classification so
+      // the cooldown is recorded even on the ambiguous reconcile path below.
+      this.penalizeIfRateLimited(err);
       // Recorded on the failure path too: a timeout's duration is only measurable if the
       // response event is marked whether or not it succeeded.
       this.mark(req.client_order_id, "http_response");
@@ -834,13 +948,15 @@ export class DhanBrokerAdapter implements BrokerAdapter {
             // pacer wait counts against it (Defect D).
             deadline: Deadline.in(this.cfg.cancelTimeoutMs, () => this.mono()),
           }),
-          "order_mutation",
+          "order_cancel",
         );
         // Dhan accepted the cancel REQUEST. Not a cancellation: the loop below keeps confirming
         // precisely because the order may be filling right now.
         this.mark(clientOrderId, "cancel_acknowledged");
       } catch (err) {
-        // A cancel that fails does not make the order gone; keep confirming.
+        // A cancel that fails does not make the order gone; keep confirming. A 429 still feeds the
+        // shared budget a cooldown so we do not send more requests into a throttle.
+        this.penalizeIfRateLimited(err);
         console.warn(`[Dhan] protective cancel failed for ${clientOrderId}:`, err);
       }
     }
@@ -1093,7 +1209,7 @@ export class DhanBrokerAdapter implements BrokerAdapter {
         ...(request.quantity !== undefined ? { quantity: request.quantity } : {}),
         validity: "DAY",
       }),
-      "order_mutation",
+      "order_modify",
     );
     known.pricing = { ...known.pricing, limit_price: request.limit_price };
     known.limit_price = request.limit_price;

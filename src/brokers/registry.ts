@@ -41,6 +41,7 @@ import type {
 } from "../box/brokerContext.js";
 import { BROKER_IDS, type BrokerHealthState, type BrokerId, type BrokerSessionState } from "./types.js";
 import { createZerodhaLiveAdapter } from "./zerodha/liveAdapter.js";
+import { brokerRateLimits, RateBudgetLedger } from "../box/brokerPacing.js";
 import {
   DhanClient,
   describeDhanMarginPayload,
@@ -280,6 +281,15 @@ export class ActiveBrokerManager {
   private dhanCharges = new DhanChargeCalculator();
   private dhanFeed: DhanFeed | null = null;
   private dhanAccessToken: string | null = null;
+  /**
+   * ONE application-owned order-rate budget per broker ACCOUNT (Task 8).
+   *
+   * The broker meters the ACCOUNT, not the adapter instance, so this ledger is shared across
+   * every adapter/consumer built for the same broker here — never one ledger per adapter. It is
+   * created lazily on first adapter build and reused, so a rebuilt adapter (e.g. after a token
+   * refresh) inherits the same accumulated window state rather than resetting the budget to zero.
+   */
+  private readonly rateBudgets = new Map<BrokerId, RateBudgetLedger>();
   private dhanTokenExpiry: number | null = null;
   private dhanSessionMeta: {
     clientId: string;
@@ -1495,7 +1505,7 @@ export class ActiveBrokerManager {
       );
     }
     if (ctx.broker === "zerodha") {
-      return createZerodhaLiveAdapter(this.deps.kite, ctx.cfg, ctx.timing);
+      return createZerodhaLiveAdapter(this.deps.kite, ctx.cfg, ctx.timing, this.rateBudgetFor("zerodha"));
     }
     if (!this.dhanLiveTradingEnabled()) {
       throw new Error(
@@ -1509,8 +1519,26 @@ export class ActiveBrokerManager {
         dhanClientId: () => this.dhanSessionMeta?.clientId ?? process.env.DHAN_CLIENT_ID?.trim() ?? "",
         identify: (token) => this.dhanInstruments.identify(token),
         ...(ctx.timing ? { timing: ctx.timing } : {}),
+        rateBudget: this.rateBudgetFor("dhan"),
       }),
     );
+  }
+
+  /**
+   * The ONE shared order-rate budget for `broker`'s account, created on first use and reused.
+   *
+   * Shared across every adapter/consumer this manager builds for the broker so the budget tracks
+   * the ACCOUNT, not an adapter instance. Uses the published, frozen {@link brokerRateLimits} and
+   * the default budget policy (one worker, 20% recovery reserve); a multi-worker deployment must
+   * set the policy from config here (see docs/BROKER_LIMITS.md).
+   */
+  rateBudgetFor(broker: BrokerId): RateBudgetLedger {
+    let ledger = this.rateBudgets.get(broker);
+    if (!ledger) {
+      ledger = new RateBudgetLedger(brokerRateLimits(broker));
+      this.rateBudgets.set(broker, ledger);
+    }
+    return ledger;
   }
 
   /** The active broker's charge calculator (Dhan's own rate card when Dhan is active). */
