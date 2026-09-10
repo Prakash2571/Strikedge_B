@@ -1494,6 +1494,8 @@ export interface BoxScannerConfigSnapshot {
   live_working_timeout_ms?: number;
   live_partial_timeout_ms?: number;
   live_cancel_timeout_ms?: number;
+  /** Absolute end-to-end budget for one live order mutation (ms). See src/brokers/deadline.ts. */
+  live_order_mutation_deadline_ms?: number;
   live_max_modifications?: number;
   live_max_chase_ticks?: number;
   live_broker_min_interval_ms?: number;

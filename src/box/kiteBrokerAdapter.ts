@@ -17,13 +17,23 @@ import {
   type BrokerRejectFamily,
 } from "./brokerAdapter.js";
 import {
+  type BrokerEndpointClass,
   type BrokerPacingClass,
   type EffectiveBrokerPacing,
+  isRateLimited,
+  parseRetryAfterMs,
+  RateBudgetLedger,
   resolveBrokerPacing,
   TransportPacer,
   type TransportPacerStats,
 } from "./brokerPacing.js";
 import type { BoxConfig } from "./config.js";
+import {
+  evaluateExecutionEvidence,
+  readNonNegativeInteger,
+  readPositivePrice,
+} from "./brokerExecutionEvidence.js";
+import type { ExternalOrderUpdate } from "./brokerAdapter.js";
 import type { ExecutionTimingRecorder } from "./executionTiming.js";
 import type { ExecutionMode, IBoxOrderIntent, OrderSide } from "./types.js";
 
@@ -289,6 +299,18 @@ export interface KiteBrokerAdapterConfig {
    * broker's published order limit.
    */
   pacing?: EffectiveBrokerPacing;
+  /**
+   * The SHARED, application-owned multi-window order budget for this broker ACCOUNT (Task 8).
+   *
+   * Optional so existing tests that build a config literal keep compiling; when absent the
+   * adapter paces only per-second via {@link pacing} and enforces no longer window. When present
+   * it MUST be the ONE ledger shared across every adapter/consumer on the same account (the
+   * engine owns it), because the broker meters the account, not the adapter instance. The adapter
+   * consults it at the final pre-wire boundary: an over-budget ENTRY placement is refused with a
+   * proven no-POST {@link BrokerPreSubmitRefusedError} (no HTTP request leaves), while a
+   * protective CANCEL/MODIFY spends the recovery reserve so a placement storm cannot starve it.
+   */
+  rateBudget?: RateBudgetLedger;
   maxModifications: number;
   maxChaseTicks: number;
 }
@@ -306,6 +328,28 @@ export function kiteAdapterConfigFromBoxConfig(cfg: BoxConfig): KiteBrokerAdapte
     maxModifications: cfg.liveMaxModifications,
     maxChaseTicks: cfg.liveMaxChaseTicks,
   };
+}
+
+/** Map the broker-metered endpoint class onto the per-second pacing bucket. */
+function pacingClassFor(klass: BrokerEndpointClass): BrokerPacingClass {
+  return klass === "data_read" ? "general" : "order_mutation";
+}
+
+/**
+ * Best-effort read of a `Retry-After` value from a Kite error body.
+ *
+ * Kite does not surface response headers on {@link KiteHttpError}, so we look for a Retry-After
+ * hint the body may carry. Returns null when absent — the ledger then applies its own
+ * conservative default cooldown rather than treating a missing hint as "retry now".
+ */
+function readRetryAfterHeader(body: unknown): string | null {
+  if (body && typeof body === "object") {
+    const record = body as Record<string, unknown>;
+    const raw = record["retry_after"] ?? record["Retry-After"] ?? record["retryAfter"];
+    if (typeof raw === "string") return raw;
+    if (typeof raw === "number" && Number.isFinite(raw)) return String(raw);
+  }
+  return null;
 }
 
 /**
@@ -373,6 +417,8 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     // rather than being hidden inside the POST duration.
     this.mark(req.client_order_id, "transport_started");
     let placed: { order_id: string };
+    // The order-budget placement guard, resolved once so the SAME closure runs at the boundary.
+    const placementGuard = this.placementBudgetGuard(req.client_order_id);
     // Fires at the FINAL SYNCHRONOUS instant before the wire (Defect 3): threaded THROUGH the
     // adapter pacer AND the transport's token-resolution await down to KiteHttpTransport.request,
     // where it runs immediately before `fetch` with no further await. Previously it ran inside
@@ -380,11 +426,22 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     // window in which entry could be disarmed while the POST was still on its way to the wire.
     const beforeSend = (): void => {
       beforePost?.();
+      // ORDER BUDGET (Task 8): the FINAL pre-wire check. An over-budget placement throws
+      // BrokerPreSubmitRefusedError here — before any HTTP request — and is recorded against the
+      // shared account budget only when allowed. No-op when no ledger is wired.
+      placementGuard();
       // HTTP REQUEST START: marked here because this is the true moment the POST leaves for the
       // network — post_to_http_response_ms then measures the broker, NOT our rate limiter.
       this.mark(req.client_order_id, "http_request_started");
     };
     try {
+      // FAST REFUSAL: if the shared budget is ALREADY exhausted, refuse now — before the pacing
+      // wait — so an over-budget entry does not sit through a pacing interval only to be refused
+      // at the wire. Pure read (no record); the authoritative check+record still runs in
+      // `beforeSend` at the send boundary, so budget is consumed only for a request that leaves.
+      // A throw here is caught below and cleans up the session projection like any pre-submit
+      // refusal.
+      this.refusePlacementIfBudgetExhausted(req.client_order_id);
       placed = await this.call(() => {
         return this.transport.placeOrder({
           exchange: req.exchange,
@@ -397,7 +454,7 @@ export class KiteBrokerAdapter implements BrokerAdapter {
           price: req.pricing.limit_price,
           tag: order.tag as string,
         }, { beforeSend });
-      }, "order_mutation");
+      }, "order_place");
       this.mark(req.client_order_id, "http_response");
     } catch (error) {
       if (error instanceof BrokerPreSubmitRefusedError) {
@@ -406,6 +463,9 @@ export class KiteBrokerAdapter implements BrokerAdapter {
         this.orders.delete(req.client_order_id);
         throw error;
       }
+      // A 429 feeds the shared budget a cooldown (never a resend). Done before any classification
+      // so the cooldown is recorded even on the ambiguous path below.
+      this.penalizeIfRateLimited(error);
       // The response is an observable event whether it succeeded or failed. Recording it on the
       // failure path is what makes a timeout's duration measurable instead of invisible.
       this.mark(req.client_order_id, "http_response");
@@ -479,10 +539,11 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     // because the race starts the moment we commit to cancelling.
     this.mark(clientOrderId, "cancel_requested");
     await withDeadline(
-      this.call(() => this.transport.cancelOrder(order.broker_order_id as string), "order_mutation"),
+      this.call(() => this.transport.cancelOrder(order.broker_order_id as string), "order_cancel"),
       this.config.cancelTimeoutMs,
       "Kite cancellation timed out; reconciliation is required.",
     ).catch((error) => {
+      this.penalizeIfRateLimited(error);
       order.state = "RECONCILIATION_REQUIRED";
       throw error;
     });
@@ -520,7 +581,7 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     await this.call(() => this.transport.modifyOrder(order.broker_order_id as string, {
       price: request.limit_price,
       ...(request.quantity !== undefined ? { quantity: request.quantity } : {}),
-    }), "order_mutation");
+    }), "order_modify");
     this.modifications.set(clientOrderId, count + 1);
     order.limit_price = request.limit_price;
     order.pricing = { ...order.pricing, limit_price: request.limit_price };
@@ -728,6 +789,117 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     }
   }
 
+  /**
+   * Resolvers waiting for the NEXT observation of one order (see the Dhan adapter for the full
+   * argument). Zerodha delivers order updates as TEXT frames on the market-data socket; without
+   * this seam such an event could only change a status label, because an order waiter is blocked on
+   * `waitForResolution`'s poll interval, not on the socket.
+   */
+  private readonly orderWaiters = new Map<string, Set<() => void>>();
+  /** Client order ids observed while no waiter was parked; the next wait consumes the latch. */
+  private readonly pendingObservation = new Set<string>();
+  private streamObservationsApplied = 0;
+  private streamObservationsIgnored = 0;
+
+  /** Sleep up to `ms`, waking EARLY on an external observation of this order. */
+  private async waitOrObservation(ms: number, clientOrderId: string): Promise<void> {
+    // Edge-not-lost: if an observation arrived AFTER the previous poll but BEFORE we re-entered
+    // this wait, the latch is already set and we return immediately rather than sleeping a full
+    // interval on news we have technically already received.
+    if (this.pendingObservation.delete(clientOrderId)) return;
+    let waiters = this.orderWaiters.get(clientOrderId);
+    if (!waiters) {
+      waiters = new Set();
+      this.orderWaiters.set(clientOrderId, waiters);
+    }
+    let wake: () => void = () => {};
+    const woken = new Promise<void>((resolve) => { wake = resolve; });
+    waiters.add(wake);
+    try {
+      await Promise.race([this.clock.wait(ms), woken]);
+    } finally {
+      waiters.delete(wake);
+      if (waiters.size === 0) this.orderWaiters.delete(clientOrderId);
+    }
+  }
+
+  private wakeOrderWaiters(clientOrderId: string): void {
+    const waiters = this.orderWaiters.get(clientOrderId);
+    if (!waiters || waiters.size === 0) {
+      // No waiter is parked right now. Latch the edge so the NEXT waitOrObservation returns at
+      // once instead of sleeping through an interval — the observation already updated the
+      // session snapshot, so the loop must re-read it promptly.
+      this.pendingObservation.add(clientOrderId);
+      return;
+    }
+    for (const wake of [...waiters]) {
+      try { wake(); } catch { /* a waiter must never break the ingestion path */ }
+    }
+  }
+
+  /**
+   * APPLY ONE EXTERNAL ORDER OBSERVATION (a Kite order postback text frame).
+   *
+   * Same contract as the Dhan adapter's: already attributed by the projection, re-validated through
+   * the shared evidence reader, cumulative-monotonic, and it wakes the order's waiters so the fill
+   * is seen on the event rather than on the next poll.
+   */
+  applyOrderUpdate(update: ExternalOrderUpdate): BrokerOrder | undefined {
+    const known = this.orders.get(update.clientOrderId);
+    if (!known) {
+      this.streamObservationsIgnored++;
+      return undefined;
+    }
+    const observedQuantity = readNonNegativeInteger(update.cumulativeQty);
+    const observedPrice = readPositivePrice(update.averagePrice ?? null);
+    const label = String(update.rawStatus ?? "");
+    const claimedState = kiteState(label, observedQuantity.value ?? known.filled_quantity, known.quantity);
+    const verdict = evaluateExecutionEvidence({
+      statusLabel: label,
+      claimedState,
+      requestedQuantity: known.quantity,
+      priorFilled: known.filled_quantity,
+      quantity: observedQuantity,
+      price: observedPrice,
+    });
+    const regressed = observedQuantity.present && (observedQuantity.value ?? 0) < known.filled_quantity;
+    if (regressed) {
+      this.streamObservationsIgnored++;
+      return clone(known);
+    }
+
+    const merged = clone(known);
+    merged.filled_quantity = verdict.filledQuantity;
+    merged.pending_quantity = Math.max(0, known.quantity - verdict.filledQuantity);
+    if (verdict.averagePrice !== null) merged.average_price = verdict.averagePrice;
+    merged.execution_evidence = verdict.quality;
+    if (update.brokerOrderId) merged.broker_order_id = update.brokerOrderId;
+    merged.state = verdict.sufficient
+      ? kiteState(label, verdict.filledQuantity, known.quantity)
+      : known.state;
+    if (!verdict.sufficient) merged.reject_reason = verdict.detail;
+    if (isBrokerOrderTerminal(known.state) && !isBrokerOrderTerminal(merged.state)) {
+      merged.state = known.state;
+    }
+    if (verdict.filledQuantity > 0 && merged.fills.length === 0) {
+      merged.fills = [{
+        fill_id: `kite:stream:${merged.broker_order_id ?? update.clientOrderId}:${verdict.filledQuantity}:${verdict.averagePrice ?? "unpriced"}`,
+        quantity: verdict.filledQuantity,
+        price: verdict.averagePrice,
+        at: update.observedAtWall ?? this.clock.now(),
+      }];
+    }
+    merged.updated_at = update.observedAtWall ?? this.clock.now();
+    this.orders.set(update.clientOrderId, merged);
+    this.streamObservationsApplied++;
+    this.wakeOrderWaiters(update.clientOrderId);
+    return clone(merged);
+  }
+
+  streamObservationStats(): { applied: number; ignored: number } {
+    return { applied: this.streamObservationsApplied, ignored: this.streamObservationsIgnored };
+  }
+
   private async waitForResolution(order: BrokerOrder): Promise<BrokerOrder> {
     const started = this.clock.now();
     let partialAt: number | null = null;
@@ -739,7 +911,17 @@ export class KiteBrokerAdapter implements BrokerAdapter {
       if (elapsed >= deadline || (partialAt !== null && this.clock.now() - partialAt >= this.config.partialTimeoutMs)) {
         return clone(await this.protectiveCancelAndConfirm(order));
       }
-      await this.clock.wait(Math.max(1, this.config.brokerMinIntervalMs));
+      // Wake on the EVENT, fall back on the interval: REST stays a controlled fallback.
+      await this.waitOrObservation(Math.max(1, this.config.brokerMinIntervalMs), order.client_order_id);
+      // A stream observation may have ALREADY updated this order's session snapshot (and woken us)
+      // through applyOrderUpdate. That snapshot is authoritative and cumulative-monotonic, so adopt
+      // it FIRST. If it is now terminal, the fill was seen on the event and a REST re-poll would
+      // only risk overwriting a fresh terminal state with a staler open snapshot — so we skip it.
+      const observed = this.orders.get(order.client_order_id);
+      if (observed && observed !== order) {
+        order = observed;
+        if (isBrokerOrderTerminal(order.state)) break;
+      }
       order = await this.refresh(order);
       if (order.state === "PARTIALLY_FILLED" && partialAt === null) partialAt = this.clock.now();
     }
@@ -753,13 +935,14 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     this.mark(order.client_order_id, "cancel_requested");
     try {
       await withDeadline(
-        this.call(() => this.transport.cancelOrder(order.broker_order_id as string), "order_mutation"),
+        this.call(() => this.transport.cancelOrder(order.broker_order_id as string), "order_cancel"),
         this.config.cancelTimeoutMs,
         "Protective cancellation timed out.",
       );
       this.mark(order.client_order_id, "cancel_acknowledged");
       return await this.confirmTerminalAfterCancel(order);
     } catch (error) {
+      this.penalizeIfRateLimited(error);
       order.state = "RECONCILIATION_REQUIRED";
       order.updated_at = this.clock.now();
       throw new BrokerAmbiguousSubmitError(
@@ -837,12 +1020,111 @@ export class KiteBrokerAdapter implements BrokerAdapter {
   /**
    * Paced transport. Every broker touch goes through here.
    *
-   * `klass` defaults to `"general"` so an unclassified call gets the SLOWER interval; only
-   * place / modify / cancel opt into the order-mutation rate. See `brokerPacing.ts` for why
-   * the two are separated and how the absolute floor still bounds total request rate.
+   * `klass` is the endpoint class the broker meters at (`order_place` / `order_modify` /
+   * `order_cancel` / `data_read`). It selects BOTH the per-second pacing bucket (order mutations
+   * are paced faster than general reads) AND — for order endpoints — the multi-window
+   * {@link RateBudgetLedger} check. See `brokerPacing.ts` for why the two are separated.
+   *
+   * The ledger check for a PLACEMENT is deliberately NOT done here: it must ride the final
+   * synchronous pre-wire boundary (`beforeSend`) so a refusal is a proven no-POST. This method
+   * gates the RECOVERY endpoints (cancel/modify), which have no `beforeSend` hook, immediately
+   * before the transport call — if refused (only possible when even the reserve is spent), it
+   * throws before any request leaves.
    */
-  private call<T>(operation: () => Promise<T>, klass: BrokerPacingClass = "general"): Promise<T> {
-    return this.pacer.run(operation, klass);
+  private call<T>(operation: () => Promise<T>, klass: BrokerEndpointClass = "data_read"): Promise<T> {
+    if (klass === "order_cancel" || klass === "order_modify") {
+      this.reserveRecoveryBudgetOrThrow(klass);
+    }
+    return this.pacer.run(operation, pacingClassFor(klass));
+  }
+
+  /**
+   * Fast pre-pacing refusal: throw immediately if the shared placement budget is ALREADY spent.
+   *
+   * A pure read — it does NOT record. Its only job is to avoid sitting through a pacing interval
+   * for a placement the budget will refuse anyway; the authoritative check+record still happens at
+   * the send boundary in {@link placementBudgetGuard}. A no-op when no ledger is wired.
+   */
+  private refusePlacementIfBudgetExhausted(clientOrderId: string): void {
+    const ledger = this.config.rateBudget;
+    if (!ledger) return;
+    const decision = ledger.check("order_place", this.clock.now());
+    if (!decision.allowed) {
+      ledger.noteRefusal("order_place");
+      throw new BrokerPreSubmitRefusedError(
+        clientOrderId,
+        "pre_post",
+        true,
+        `order budget exhausted: ${decision.reason}`,
+      );
+    }
+  }
+
+  /**
+   * Consult the shared order budget for a PLACEMENT at the pre-wire boundary.
+   *
+   * Returns a synchronous guard to run inside `beforeSend`. When the placement would breach a
+   * window it throws {@link BrokerPreSubmitRefusedError} at stage `pre_post` — the adapter's own
+   * catch and the transport both re-throw it untouched, so NO HTTP request is transmitted and the
+   * durable intent terminalises as a free REJECTED no-POST (never a broker reject, never retried).
+   * When allowed it RECORDS the placement against the budget. A no-op when no ledger is wired.
+   */
+  private placementBudgetGuard(clientOrderId: string): () => void {
+    const ledger = this.config.rateBudget;
+    if (!ledger) return () => undefined;
+    return () => {
+      const now = this.clock.now();
+      const decision = ledger.check("order_place", now);
+      if (!decision.allowed) {
+        ledger.noteRefusal("order_place");
+        throw new BrokerPreSubmitRefusedError(
+          clientOrderId,
+          "pre_post",
+          true,
+          `order budget exhausted: ${decision.reason}`,
+        );
+      }
+      ledger.record("order_place", now);
+    };
+  }
+
+  /** Gate a recovery mutation (cancel/modify) against the reserve; throw before any wire use. */
+  private reserveRecoveryBudgetOrThrow(klass: "order_cancel" | "order_modify"): void {
+    const ledger = this.config.rateBudget;
+    if (!ledger) return;
+    const now = this.clock.now();
+    const decision = ledger.check(klass, now);
+    if (!decision.allowed) {
+      ledger.noteRefusal(klass);
+      // Even the recovery reserve is spent (or a broker cooldown is active). Surface it as a
+      // proven no-POST refusal rather than sending into a budget the broker will 429.
+      throw new BrokerPreSubmitRefusedError(
+        "recovery",
+        "pre_post",
+        false,
+        `recovery budget unavailable: ${decision.reason}`,
+      );
+    }
+    ledger.record(klass, now);
+  }
+
+  /**
+   * Feed a caught error to the shared budget as a throttle signal WITHOUT ever resending.
+   *
+   * A 429 means the account is over budget in a way our own count did not predict (most likely an
+   * unobservable external consumer). {@link RateBudgetLedger.penalize} records a hard cooldown; we
+   * then let the caller's EXISTING ambiguous/reconcile-by-tag path run — a 429 tells us nothing
+   * about whether the exchange saw the order, so the order is NEVER replayed.
+   */
+  private penalizeIfRateLimited(error: unknown): void {
+    const ledger = this.config.rateBudget;
+    if (!ledger) return;
+    const status = error instanceof KiteHttpError ? error.status : null;
+    if (!isRateLimited(status)) return;
+    const retryAfterMs = error instanceof KiteHttpError
+      ? parseRetryAfterMs(readRetryAfterHeader(error.body), this.clock.now())
+      : null;
+    ledger.penalize(this.clock.now(), retryAfterMs);
   }
 }
 
@@ -870,8 +1152,33 @@ export function classifyKiteReject(error: unknown): BrokerRejectFamily {
   return "generic";
 }
 
+/**
+ * Project one Kite order row onto the broker-neutral shape.
+ *
+ * Subject to the SAME execution-evidence rules as the Dhan projection
+ * (brokerExecutionEvidence.ts). `KiteTransportOrder` declares `filled_quantity` and
+ * `average_price` as numbers, but they are coerced from a JSON payload: a field the API omits
+ * arrives as `undefined`/`NaN` at runtime, and reading that as a confirmed zero is the same
+ * fabrication. Kite order updates also arrive over the websocket postback, which lands here too,
+ * so the validation has to live at this funnel rather than in one caller.
+ */
 function normalizeKiteOrder(raw: KiteTransportOrder, known: BrokerOrder | undefined, now: number): BrokerOrder {
-  const state = kiteState(raw.status, raw.filled_quantity, raw.quantity);
+  const observedQuantity = readNonNegativeInteger(raw.filled_quantity);
+  const observedPrice = readPositivePrice(raw.average_price);
+  const priorFilled = known?.filled_quantity ?? 0;
+  const claimedState = kiteState(raw.status, observedQuantity.value ?? priorFilled, raw.quantity);
+  const verdict = evaluateExecutionEvidence({
+    statusLabel: raw.status,
+    claimedState,
+    requestedQuantity: raw.quantity,
+    priorFilled,
+    quantity: observedQuantity,
+    price: observedPrice,
+  });
+  const filled = verdict.filledQuantity;
+  const state: BrokerOrderState = verdict.sufficient
+    ? kiteState(raw.status, filled, raw.quantity)
+    : "RECONCILIATION_REQUIRED";
   const base = known ?? {
     client_order_id: `KITE_ORPHAN:${raw.order_id}`,
     broker_order_id: raw.order_id,
@@ -912,17 +1219,19 @@ function normalizeKiteOrder(raw: KiteTransportOrder, known: BrokerOrder | undefi
     quantity: raw.quantity,
     pricing: { ...base.pricing, limit_price: raw.price },
     limit_price: raw.price,
-    filled_quantity: raw.filled_quantity,
-    pending_quantity: raw.pending_quantity,
-    average_price: raw.filled_quantity > 0 ? raw.average_price : null,
-    fills: raw.filled_quantity > 0 ? [{
-      fill_id: `kite:${raw.order_id}:${raw.filled_quantity}:${raw.average_price}`,
-      quantity: raw.filled_quantity,
-      price: raw.average_price,
+    filled_quantity: filled,
+    pending_quantity: Math.max(0, raw.quantity - filled),
+    average_price: verdict.averagePrice,
+    fills: filled > 0 ? [{
+      fill_id: `kite:${raw.order_id}:${filled}:${verdict.averagePrice ?? "unpriced"}`,
+      quantity: filled,
+      // NULL, never zero: an unpublished average price is absent data, not a free execution.
+      price: verdict.averagePrice,
       at: parseTime(raw.exchange_update_timestamp) ?? now,
     }] : [],
+    execution_evidence: verdict.quality,
     reject_family: state === "REJECTED" ? classifyKiteReject(raw.status_message ?? raw.status) : null,
-    reject_reason: state === "REJECTED" ? raw.status_message ?? raw.status : null,
+    reject_reason: state === "REJECTED" ? raw.status_message ?? raw.status : verdict.detail,
     updated_at: parseTime(raw.exchange_update_timestamp) ?? now,
   };
 }

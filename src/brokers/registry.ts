@@ -41,6 +41,7 @@ import type {
 } from "../box/brokerContext.js";
 import { BROKER_IDS, type BrokerHealthState, type BrokerId, type BrokerSessionState } from "./types.js";
 import { createZerodhaLiveAdapter } from "./zerodha/liveAdapter.js";
+import { brokerRateLimits, RateBudgetLedger } from "../box/brokerPacing.js";
 import {
   DhanClient,
   describeDhanMarginPayload,
@@ -53,6 +54,7 @@ import { QuoteProvider } from "./quoteProvider.js";
 import { computeFeedHealth, type FeedHealth } from "./feedHealth.js";
 import { DhanHttp, dhanHttpConfigFromEnv } from "./dhan/http.js";
 import { DhanFeed } from "./dhan/feed.js";
+import { DhanOrderFeed, type DhanOrderFeedOptions } from "./dhan/orderFeed.js";
 import { ZerodhaFeed } from "./zerodha/feed.js";
 import { type LaneFeedStats, type MarketDataLane } from "./marketDataLane.js";
 import { DhanInstrumentStore, dhanInternalToken, getDhanParseReport, type DhanInstrument } from "./dhan/instruments.js";
@@ -175,6 +177,22 @@ export interface ActiveBrokerManagerDeps {
    */
   onBoxLaneTicks?: (ticks: Parameters<TickerHub["seed"]>[0]) => void;
   onBoxLaneConnection?: (connected: boolean) => void;
+  /**
+   * The BOX lane's market-data socket reported a session/token rejection (a dead or expired
+   * token), as opposed to a transient disconnect. Forwarded to the engine so the driven
+   * MarketDataStateMachine reaches AUTH_EXPIRED and does not reconnect fast-forever on a
+   * known-invalid token. Distinct from a plain `onBoxLaneConnection(false)`.
+   */
+  onBoxLaneSessionLost?: (reason: string) => void;
+  /**
+   * Kite order-update TEXT frames from the BOX lane's Zerodha socket.
+   *
+   * Zerodha multiplexes order postbacks onto the SAME quote socket as the binary ticks (text =
+   * postbacks, binary = ticks), and a single API key may hold at most 3 connections — so there is
+   * no dedicated Zerodha order socket to open. When supplied, the box lane forwards every text
+   * frame here for the order-stream consumer to parse. Absent ⇒ text frames are ignored.
+   */
+  onBoxLaneOrderText?: (raw: string) => void;
 }
 
 /** A lane with no socket yet: honest zeros rather than a pretence of health. */
@@ -270,6 +288,15 @@ export class ActiveBrokerManager {
   private dhanCharges = new DhanChargeCalculator();
   private dhanFeed: DhanFeed | null = null;
   private dhanAccessToken: string | null = null;
+  /**
+   * ONE application-owned order-rate budget per broker ACCOUNT (Task 8).
+   *
+   * The broker meters the ACCOUNT, not the adapter instance, so this ledger is shared across
+   * every adapter/consumer built for the same broker here — never one ledger per adapter. It is
+   * created lazily on first adapter build and reused, so a rebuilt adapter (e.g. after a token
+   * refresh) inherits the same accumulated window state rather than resetting the budget to zero.
+   */
+  private readonly rateBudgets = new Map<BrokerId, RateBudgetLedger>();
   private dhanTokenExpiry: number | null = null;
   private dhanSessionMeta: {
     clientId: string;
@@ -458,7 +485,16 @@ export class ActiveBrokerManager {
           this.deps.onBoxLaneTicks?.(ticks);
         },
         onConnectionChange: (connected) => this.deps.onBoxLaneConnection?.(connected),
-        onDead: (message) => console.warn(`[Broker] box lane (zerodha) feed died: ${message}`),
+        onDead: (message) => {
+          console.warn(`[Broker] box lane (zerodha) feed died: ${message}`);
+          // A Kite feed death is a credential/token rejection (not a reconnectable network blip):
+          // surface it as a market-data session loss so the health machine goes AUTH_EXPIRED.
+          this.deps.onBoxLaneSessionLost?.(message);
+        },
+        // Order postbacks ride this SAME socket as text frames — no extra Zerodha socket exists.
+        ...(this.deps.onBoxLaneOrderText
+          ? { onTextFrame: (raw: string) => this.deps.onBoxLaneOrderText?.(raw) }
+          : {}),
       });
     }
     return this.boxZerodhaFeed;
@@ -475,7 +511,14 @@ export class ActiveBrokerManager {
           this.deps.onBoxLaneTicks?.(ticks);
         },
         onConnection: (connected) => this.deps.onBoxLaneConnection?.(connected),
-        onSessionLost: (reason) => void this.onDhanSessionLost(reason),
+        onSessionLost: (reason) => {
+          // Distinguish an auth/session rejection (dhan/feed classifies close codes 1008/4401 etc)
+          // from a transient drop: this path only fires for the former, so it is a market-data
+          // session loss too — the box lane's health machine must reach AUTH_EXPIRED, not merely
+          // DISCONNECTED, and must not reconnect fast-forever on a dead token.
+          this.deps.onBoxLaneSessionLost?.(reason);
+          void this.onDhanSessionLost(reason);
+        },
         resolve: (token) => this.dhanInstruments.identify(token),
         depthLevel: 5,
       });
@@ -486,6 +529,32 @@ export class ActiveBrokerManager {
   /** Replace the BOX lane's entire token set in one diff. */
   setBoxTokens(tokens: number[]): void {
     this.boxSubscriptions.setOwnerTokens("strategy", tokens);
+  }
+
+  /**
+   * Construct the Dhan DEDICATED order-update feed, bound to the CURRENT session.
+   *
+   * This is a SEPARATE socket from the Dhan market feed (wss://api-order-update.dhan.co vs
+   * wss://api-feed.dhan.co). It reads the token and client id fresh on every connect via the
+   * registry's session, so a reconnect after a token refresh authorises with the current JWT.
+   * The order-stream consumer supplies the observation/lifecycle handlers; the registry supplies
+   * only the credentials and the socket, so credential ownership never leaves this class.
+   *
+   * Returns null unless Dhan is the active broker — an order feed for the inactive broker would
+   * observe an account the system is not trading, exactly the cross-broker leak the manager forbids.
+   */
+  createDhanOrderFeed(
+    handlers: Pick<
+      DhanOrderFeedOptions,
+      "onObservation" | "onConnecting" | "onConnected" | "onDisconnected" | "onSessionLost" | "nowMono" | "nowWall"
+    >,
+  ): DhanOrderFeed | null {
+    if (this.active !== "dhan") return null;
+    return new DhanOrderFeed({
+      accessToken: () => this.usableDhanToken(),
+      clientId: () => this.dhanSessionMeta?.clientId ?? process.env.DHAN_CLIENT_ID?.trim() ?? "",
+      ...handlers,
+    });
   }
 
   /** Per-lane feed statistics for diagnostics. */
@@ -1455,7 +1524,7 @@ export class ActiveBrokerManager {
       );
     }
     if (ctx.broker === "zerodha") {
-      return createZerodhaLiveAdapter(this.deps.kite, ctx.cfg, ctx.timing);
+      return createZerodhaLiveAdapter(this.deps.kite, ctx.cfg, ctx.timing, this.rateBudgetFor("zerodha"));
     }
     if (!this.dhanLiveTradingEnabled()) {
       throw new Error(
@@ -1469,8 +1538,26 @@ export class ActiveBrokerManager {
         dhanClientId: () => this.dhanSessionMeta?.clientId ?? process.env.DHAN_CLIENT_ID?.trim() ?? "",
         identify: (token) => this.dhanInstruments.identify(token),
         ...(ctx.timing ? { timing: ctx.timing } : {}),
+        rateBudget: this.rateBudgetFor("dhan"),
       }),
     );
+  }
+
+  /**
+   * The ONE shared order-rate budget for `broker`'s account, created on first use and reused.
+   *
+   * Shared across every adapter/consumer this manager builds for the broker so the budget tracks
+   * the ACCOUNT, not an adapter instance. Uses the published, frozen {@link brokerRateLimits} and
+   * the default budget policy (one worker, 20% recovery reserve); a multi-worker deployment must
+   * set the policy from config here (see docs/BROKER_LIMITS.md).
+   */
+  rateBudgetFor(broker: BrokerId): RateBudgetLedger {
+    let ledger = this.rateBudgets.get(broker);
+    if (!ledger) {
+      ledger = new RateBudgetLedger(brokerRateLimits(broker));
+      this.rateBudgets.set(broker, ledger);
+    }
+    return ledger;
   }
 
   /** The active broker's charge calculator (Dhan's own rate card when Dhan is active). */

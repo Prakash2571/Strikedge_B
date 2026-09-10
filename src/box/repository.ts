@@ -249,6 +249,25 @@ async function establishBoxExecutionAttemptPersistence(): Promise<void> {
  * Read the crash-recovery partial unique index back from the catalog and present it in
  * the same descriptor shape `boxRecoveryPersistenceValidationError` expects, so the
  * pure validator is reused unchanged against a real SQL index.
+ *
+ * SCOPED TO **OUR** TABLE, DELIBERATELY. `pg_index`/`pg_class` are database-wide catalogs, so
+ * matching on `relname` alone would match a table of the same name in ANY schema. Two things go
+ * wrong when it does:
+ *
+ *   1. CORRECTNESS. The validator picks its descriptor by index NAME
+ *      (`boxRecoveryPersistenceValidationError` → `indexes.find`). A same-named index on a
+ *      same-named table in another schema can therefore be validated INSTEAD of ours, so the
+ *      crash-recovery uniqueness boundary would be judged against a relation we do not write to.
+ *      For a guard whose whole purpose is to prove "exactly one unresolved recovery row can
+ *      exist", reading someone else's index is the one thing it must never do.
+ *   2. ROBUSTNESS. `pg_get_indexdef(oid)` resolves the relation at call time, so a row for a
+ *      schema being dropped concurrently raises `could not open relation with OID` (XX000) and
+ *      takes down an unrelated startup check with it.
+ *
+ * `to_regclass` resolves the bare name through the CURRENT `search_path` and yields exactly one
+ * relation — the one this connection actually reads and writes — or NULL when it is absent, which
+ * degrades to zero rows and the honest `missing … index` verdict. That is both the correct scope
+ * and the fix for the concurrent-drop race.
  */
 async function describeRecoveryIndex(): Promise<BoxExecutionAttemptIndexDescription[]> {
   const { rows } = await query<{ indexname: string; indisunique: boolean; def: string }>(
@@ -256,9 +275,8 @@ async function describeRecoveryIndex(): Promise<BoxExecutionAttemptIndexDescript
             pg_get_indexdef(ix.indexrelid) AS def
      FROM pg_index ix
      JOIN pg_class i ON i.oid = ix.indexrelid
-     JOIN pg_class t ON t.oid = ix.indrelid
-     WHERE t.relname = 'box_execution_attempts' AND i.relname = $1`,
-    [BOX_RECOVERY_UNIQUE_INDEX],
+     WHERE ix.indrelid = to_regclass($1) AND i.relname = $2`,
+    ["box_execution_attempts", BOX_RECOVERY_UNIQUE_INDEX],
   );
   return rows.map((row) => {
     const def = row.def ?? "";

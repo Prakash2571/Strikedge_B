@@ -38,6 +38,15 @@ export interface ZerodhaFeedOptions {
   credentials: () => { apiKey: string; accessToken: string | null };
   onTicks: (ticks: Tick[]) => void;
   onConnectionChange?: (connected: boolean) => void;
+  /**
+   * Kite order updates ride THIS SAME quote socket as TEXT frames (binary = ticks, text =
+   * order/error/message postbacks) per the v3 docs. There is NO separate Zerodha order socket:
+   * a single API key may hold at most 3 WebSocket connections, so opening a dedicated order
+   * socket would consume the last slot and protect against nothing — a dropped connection drops
+   * both the ticks and the postbacks on it anyway. When a consumer supplies this callback the
+   * text frames are forwarded to it; absent ⇒ text frames are ignored exactly as before.
+   */
+  onTextFrame?: (raw: string) => void;
   /** Kite rejected the feed (dead or expired token). Not a reconnectable condition. */
   onDead?: (message: string) => void;
   /** The broker generation this feed belongs to, so stale ticks are identifiable. */
@@ -94,6 +103,18 @@ export class ZerodhaFeed {
         this.rate.mark(ticks.length, this.lastTickAt);
         this.opts.onTicks(ticks);
       },
+      // Kite order postbacks arrive as TEXT frames on THIS quote socket (see onTextFrame doc
+      // above). Guarded on socket identity and generation exactly like onTick, so a superseded
+      // socket's late postback can never reach the current order-stream consumer.
+      ...(this.opts.onTextFrame
+        ? {
+            onTextFrame: (raw: string) => {
+              if (this.handle !== handle || this.disposed) return;
+              if (this.socketGeneration !== this.opts.generation()) return;
+              this.opts.onTextFrame?.(raw);
+            },
+          }
+        : {}),
       onOpen: () => {
         if (this.handle !== handle || this.disposed) return;
         this.reconnectAttempts = 0;

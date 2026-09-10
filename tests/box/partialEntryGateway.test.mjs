@@ -214,10 +214,23 @@ test("an INCOMPLETE unwind carries the remainder as durable residual, labelled R
   assert.equal(result.ok, false);
   assert.equal(result.legging.outcome_class, "PARTIAL_ENTRY_RESIDUAL");
   const residual = result.legging.residual_exposure;
-  assert.equal(residual.length, 1);
-  assert.equal(residual[0].role, "k2_ce");
-  assert.equal(residual[0].quantity, h.candidate.lot_size - 30, "exactly what the unwind did not cover");
-  assert.equal(residual[0].source, "partial_entry");
+  const byRole = Object.fromEntries(residual.map((r) => [r.role, r]));
+
+  // The BUY that was buying back the k2_ce SHORT only reached 30 of 75 and is not terminal, so 45
+  // of that short is still open.
+  assert.equal(byRole.k2_ce.quantity, 75 - 30, "exactly what the unwind did not cover");
+  assert.equal(byRole.k2_ce.source, "partial_entry");
+
+  // EXPOSURE-AWARE UNWIND (exitDependencies.ts). k1_ce is the LONG CALL that hedges that still-open
+  // short. Before the fix this leg was sold in full the moment the entry fill was confirmed, which
+  // left 45 units of NAKED SHORT k2_ce with its cover gone. It is now retained and carried as
+  // residual for the flatten loop instead — a hedged long is not a risk, an uncovered short is.
+  assert.equal(byRole.k1_ce.quantity, 75, "the hedge covering the still-open short is NOT sold away");
+  assert.equal(byRole.k1_ce.side, "BUY", "the retained exposure is the long hedge, not a new short");
+
+  // k2_pe's paired short (k1_pe) never filled at all, so nothing depends on it and it unwinds fully.
+  assert.equal(byRole.k2_pe, undefined, "a long with no short beside it is released immediately");
+  assert.equal(residual.length, 2, "exactly the short remainder and the hedge that still covers it");
 });
 
 /* ── unprovable quantity ─────────────────────────────────────────────────────────────── */

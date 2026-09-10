@@ -453,6 +453,15 @@ export interface BoxConfig {
   liveWorkingTimeoutMs: number;
   livePartialTimeoutMs: number;
   liveCancelTimeoutMs: number;
+  /**
+   * ABSOLUTE end-to-end budget for ONE live order mutation (ms).
+   *
+   * Started BEFORE queue admission, so the adapter's transport pacer, the broker HTTP pacing
+   * queue, the network round trip and the response body all draw on this ONE budget rather than
+   * each layer restarting its own timer. A mutation whose budget lapses while still queued is
+   * released promptly and provably transmits nothing. See src/brokers/deadline.ts.
+   */
+  liveOrderMutationDeadlineMs: number;
   liveMaxModifications: number;
   liveMaxChaseTicks: number;
   /**
@@ -493,6 +502,32 @@ export interface BoxConfig {
    * mislead an operator by roughly an order of magnitude.
    */
   liveMaxBoxCapitalRupees: number;
+
+  // ---- Economic admission (Task 8): FRESH funds/margin evidence gate, distinct from the gross cap ----
+  /**
+   * Require proof that AVAILABLE broker funds cover the entry before any leg is sent. `false`
+   * (default) keeps the pre-existing behaviour — the gross-notional cap alone. When `true`, entry
+   * is refused unless a fresh, broker-confirmed available-funds figure covers the broker margin
+   * (if a fresh margin figure exists) or else the bounded worst-case entry cost. Funds are sourced
+   * from the adapter's own margins() facility; a missing or stale figure BLOCKS rather than admits.
+   *
+   * This is NOT the gross cap and NOT an approved-budget copy: it compares real, freshly observed
+   * funds against a computed requirement. See boxCapital.ts.
+   */
+  liveRequireFundsCover: boolean;
+  /**
+   * Require FRESH, broker-confirmed margin evidence (a basket/multi-order margin estimate) before
+   * entry. `false` (default) keeps existing behaviour. When `true`, entry is refused unless a
+   * broker-confirmed, non-stale planned-margin figure exists — refusing on an estimate or a
+   * missing figure rather than assuming the account can bear the margin. No basket-margin facility
+   * is wired on the adapter yet, so with this enabled and no margin source the gate FAILS CLOSED
+   * (documented, intentional): missing evidence blocks.
+   */
+  liveRequireMarginEvidence: boolean;
+  /** Max age (ms) for an available-funds observation to count as fresh. Default 5000. */
+  liveFundsFreshnessMaxAgeMs: number;
+  /** Max age (ms) for a planned-margin observation to count as fresh. Default 5000. */
+  liveMarginFreshnessMaxAgeMs: number;
 
   // ---- Strategy-level entry restrictions (apply to ENTRY only, never to reduction) ----
   /**
@@ -687,6 +722,16 @@ export interface BoxConfig {
    * universe. When it trips, no entry and no automatic exit happens at all.
    */
   feedMaxAgeMs: number;
+  /**
+   * ORDER-EVENT INGESTION backpressure threshold: the number of queued raw order-event frames
+   * (the never-drop backpressure queue) above which the pipeline reports OVERLOAD. Overload blocks
+   * NEW ENTRY (via the market-data backlog signal) and triggers a broker reconciliation while the
+   * queue continues to hold and deliver EVERY event — a missing order event is never a zero fill,
+   * so this is a pressure threshold, never a cap that could drop data. Sized generously: order
+   * events are low-volume relative to market data, so a sustained backlog past this is a real
+   * processing-lag incident worth pausing entry over.
+   */
+  orderEventQueuePressureThreshold: number;
   /** Maximum age (ms) of the underlying value used to place the ATM window. */
   underlyingMaxAgeMs: number;
 
@@ -1056,6 +1101,7 @@ export function loadBoxConfig(): BoxConfig {
     liveWorkingTimeoutMs: clampInt("BOX_LIVE_WORKING_TIMEOUT_MS", 30_000, 1_000, 10 * 60_000),
     livePartialTimeoutMs: clampInt("BOX_LIVE_PARTIAL_TIMEOUT_MS", 10_000, 500, 5 * 60_000),
     liveCancelTimeoutMs: clampInt("BOX_LIVE_CANCEL_TIMEOUT_MS", 5_000, 250, 60_000),
+    liveOrderMutationDeadlineMs: clampInt("BOX_LIVE_ORDER_MUTATION_DEADLINE_MS", 4_000, 250, 30_000),
     liveMaxModifications: clampInt("BOX_LIVE_MAX_MODIFICATIONS", 2, 0, 10),
     liveMaxChaseTicks: clampInt("BOX_LIVE_MAX_CHASE_TICKS", 2, 0, 20),
     liveBrokerMinIntervalMs: clampInt("BOX_LIVE_BROKER_MIN_INTERVAL_MS", 250, 50, 5_000),
@@ -1073,6 +1119,13 @@ export function loadBoxConfig(): BoxConfig {
     // bound is deliberately generous (₹100 crore): this is a per-Box notional cap, and clamping
     // it low would silently weaken an operator's intended limit.
     liveMaxBoxCapitalRupees: clampInt("BOX_LIVE_MAX_BOX_CAPITAL_RUPEES", 0, 0, 1_000_000_000),
+
+    // Economic admission (Task 8). Both controls default OFF so existing behaviour is unchanged;
+    // enabling either makes missing/stale funds or margin evidence BLOCK entry.
+    liveRequireFundsCover: bool("BOX_LIVE_REQUIRE_FUNDS_COVER", false),
+    liveRequireMarginEvidence: bool("BOX_LIVE_REQUIRE_MARGIN_EVIDENCE", false),
+    liveFundsFreshnessMaxAgeMs: clampInt("BOX_LIVE_FUNDS_FRESHNESS_MAX_AGE_MS", 5_000, 250, 600_000),
+    liveMarginFreshnessMaxAgeMs: clampInt("BOX_LIVE_MARGIN_FRESHNESS_MAX_AGE_MS", 5_000, 250, 600_000),
 
     oneActiveBoxPerUnderlying: bool("BOX_ONE_ACTIVE_BOX_PER_UNDERLYING", false),
     sessionMaxCompletedTrades: clampInt("BOX_SESSION_MAX_COMPLETED_TRADES", 0, 0, 10_000),
@@ -1135,6 +1188,11 @@ export function loadBoxConfig(): BoxConfig {
 
     quoteMaxAgeMs: num("BOX_QUOTE_MAX_AGE_MS", 15_000),
     feedMaxAgeMs: num("BOX_FEED_MAX_AGE_MS", 5_000),
+    // Order-event ingestion backpressure threshold. Order postbacks are low-volume relative to
+    // market data, so a sustained backlog past this many queued frames is a genuine processing-lag
+    // incident: overload pauses NEW ENTRY and prompts reconciliation while the never-drop queue
+    // keeps delivering every event. Not a cap — data is never dropped.
+    orderEventQueuePressureThreshold: num("BOX_ORDER_EVENT_QUEUE_PRESSURE", 512),
     underlyingMaxAgeMs: num("BOX_UNDERLYING_MAX_AGE_MS", 10_000),
 
     strikesEachSide: 3,
@@ -1241,6 +1299,7 @@ export function configSnapshot(cfg: BoxConfig): BoxScannerConfigSnapshot {
     live_working_timeout_ms: cfg.liveWorkingTimeoutMs,
     live_partial_timeout_ms: cfg.livePartialTimeoutMs,
     live_cancel_timeout_ms: cfg.liveCancelTimeoutMs,
+    live_order_mutation_deadline_ms: cfg.liveOrderMutationDeadlineMs,
     live_max_modifications: cfg.liveMaxModifications,
     live_max_chase_ticks: cfg.liveMaxChaseTicks,
     live_broker_min_interval_ms: cfg.liveBrokerMinIntervalMs,

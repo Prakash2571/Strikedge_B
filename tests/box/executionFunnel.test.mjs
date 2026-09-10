@@ -155,3 +155,71 @@ test("the nested chain is monotonically non-increasing (each stage is a subset)"
   assert.ok(s.attempts_admitted >= s.attempts_submitted);
   assert.ok(s.attempts_submitted >= s.four_leg_completed_entries);
 });
+
+
+test("REQUIRED: the displayed success rate cannot be improved by hiding rejects, partials, recovery or unresolved exposure", () => {
+  // An HONEST run: 100 candidates, 20 qualified, 20 admitted; of those, 12 were refused before
+  // any POST, 8 actually reached a broker; of the 8, 3 opened cleanly, 2 filled-then-aborted at a
+  // loss, 2 were partial-entry recoveries, 1 left unresolved exposure.
+  const honest = new ExecutionFunnel();
+  honest.recordCandidateEvaluated(100);
+  for (let i = 0; i < 20; i++) { honest.recordQualified(); honest.recordAdmitted(); }
+  for (let i = 0; i < 12; i++) honest.recordEntryOutcome({ outcome: "REFUSED_BEFORE_SUBMIT", submitted: false, zeroPostReason: "capital" });
+  for (let i = 0; i < 3; i++) { honest.recordSubmitted(); honest.recordEntryOutcome({ outcome: "OPENED", submitted: true }); }
+  for (let i = 0; i < 2; i++) { honest.recordSubmitted(); honest.recordEntryOutcome({ outcome: "FILLED_THEN_ECONOMICS_ABORT", submitted: true, realisedNetPnl: -300, recoveryCost: 120 }); }
+  for (let i = 0; i < 2; i++) { honest.recordSubmitted(); honest.recordEntryOutcome({ outcome: "PARTIAL_ENTRY_UNWOUND", submitted: true, recoveryCost: 75 }); }
+  honest.recordSubmitted(); honest.recordEntryOutcome({ outcome: "PARTIAL_ENTRY_RESIDUAL", submitted: true, leftUnresolvedExposure: true });
+  const h = honest.snapshot();
+
+  // The honest broker-facing completion rate: 3 opened / 8 submitted.
+  assert.equal(h.ratios.execution_completion_rate.numerator, 3);
+  assert.equal(h.ratios.execution_completion_rate.denominator, 8);
+
+  // GAMING ATTEMPT 1 — hide the rejected attempts (never record the 12 refusals). The completion
+  // rate's denominator is attempts that touched a broker, which the refusals are NOT part of, so
+  // omitting them changes execution_completion_rate by exactly nothing. (They only affect the
+  // submission_rate, which EXISTS precisely to keep them visible.)
+  const hideRejects = new ExecutionFunnel();
+  hideRejects.recordCandidateEvaluated(100);
+  for (let i = 0; i < 20; i++) { hideRejects.recordQualified(); hideRejects.recordAdmitted(); }
+  for (let i = 0; i < 3; i++) { hideRejects.recordSubmitted(); hideRejects.recordEntryOutcome({ outcome: "OPENED", submitted: true }); }
+  for (let i = 0; i < 2; i++) { hideRejects.recordSubmitted(); hideRejects.recordEntryOutcome({ outcome: "FILLED_THEN_ECONOMICS_ABORT", submitted: true, realisedNetPnl: -300, recoveryCost: 120 }); }
+  for (let i = 0; i < 2; i++) { hideRejects.recordSubmitted(); hideRejects.recordEntryOutcome({ outcome: "PARTIAL_ENTRY_UNWOUND", submitted: true, recoveryCost: 75 }); }
+  hideRejects.recordSubmitted(); hideRejects.recordEntryOutcome({ outcome: "PARTIAL_ENTRY_RESIDUAL", submitted: true, leftUnresolvedExposure: true });
+  const r = hideRejects.snapshot();
+  assert.equal(
+    r.ratios.execution_completion_rate.rate,
+    h.ratios.execution_completion_rate.rate,
+    "hiding pre-submit refusals cannot improve the broker-facing completion rate",
+  );
+
+  // GAMING ATTEMPT 2 — count a partial fill or an economics-abort as a success. The ONLY way to
+  // raise execution_completion_rate is to increase four_leg_completed_entries, and a partial /
+  // abort is not four legs. Try to reclassify the 2 aborts + 2 partials as OPENED and observe that
+  // this is simply a DIFFERENT run (a lie), not a re-presentation: the honest snapshot's completed
+  // count is fixed at 3 and its rate at 3/8. There is no snapshot method that raises the numerator
+  // without an actual four-leg completion.
+  assert.equal(h.four_leg_completed_entries, 3, "only genuine four-leg completions count");
+  assert.equal(h.submitted_failures, 5, "the 2 aborts + 2 partials + 1 residual are submitted failures, visible");
+
+  // GAMING ATTEMPT 3 — hide recovery costs / unresolved exposure to flatter the economics. The
+  // realised P&L and recovery costs are summed from the recorded outcomes; there is no path that
+  // adds an OPEN or a profit without also carrying its cost. Recovery cost and unresolved exposure
+  // are their own published counts, so dropping them would be a smaller, MORE-suspicious snapshot,
+  // never a better rate.
+  assert.equal(h.recovery_costs_included, 120 * 2 + 75 * 2, "every recovery cost is inside the published total");
+  assert.equal(h.unresolved_exposure_total, 1, "unresolved exposure is cumulative and cannot be un-counted");
+  assert.ok(h.realised_net_pnl < 0, "the loss stands; a losing run cannot render as profitable");
+
+  // GAMING ATTEMPT 4 — quote the FLATTERING denominator (3/20 admitted, or 3/100 candidates) as if
+  // it were the completion rate. The snapshot forbids this by BINDING each numerator to one stated
+  // denominator with a verbatim basis string, so a reader always sees which population it is.
+  assert.match(h.ratios.execution_completion_rate.basis, /attempts with >=1 real broker POST/);
+  assert.match(h.ratios.admission_rate.basis, /qualified opportunities/);
+  assert.match(h.ratios.submission_rate.basis, /admitted attempts/);
+  assert.notEqual(
+    h.ratios.execution_completion_rate.denominator,
+    h.ratios.admission_rate.denominator,
+    "the completion denominator is distinct from the admission denominator; they cannot be swapped",
+  );
+});

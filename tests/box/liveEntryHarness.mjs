@@ -239,6 +239,12 @@ export async function liveStack({
   limitOverrides = {},
   config = {},
   /**
+   * The gateway's clock. Defaults to the fixed `NOW` used by most tests; a test that needs time to
+   * MOVE (for example to let cross-leg dispersion deteriorate while a leg sits in adapter pacing)
+   * passes a mutable one.
+   */
+  clock: gatewayClock = { now: () => NOW },
+  /**
    * Durable persistence. Defaults to the in-memory CAS model for fast unit coverage; the MongoDB
    * integration suite injects the PRODUCTION `boxOrderIntentPersistence` here, so the very same
    * gateway/manager wiring runs against the real Mongoose model and the real update pipeline.
@@ -290,11 +296,11 @@ export async function liveStack({
     allocateTradeId: () => "trade-live-1",
     isTokenWarm: () => true,
     feedGeneration: () => 7,
-    now: () => NOW,
+    now: () => gatewayClock.now(),
     chargeTotal: () => 0,
   });
 
-  return { candidate, quotes, gateway, manager, adapter, persistence, violations };
+  return { candidate, quotes, gateway, manager, adapter, persistence, violations, clock: gatewayClock };
 }
 
 /** Run one live entry attempt through the real gateway. */

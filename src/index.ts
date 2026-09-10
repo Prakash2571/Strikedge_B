@@ -190,6 +190,12 @@ const brokerManager = new ActiveBrokerManager({
     boxModule.engine.ingestBoxLaneTicks(ticks);
   },
   onBoxLaneConnection: (connected) => boxModule.engine.onBoxLaneConnection(connected),
+  // A market-data session/token rejection on the box lane drives the health machine to
+  // AUTH_EXPIRED (no fast-forever reconnect on a known-invalid token), distinct from a drop.
+  onBoxLaneSessionLost: (reason) => boxModule.engine.onMarketDataSessionLost(reason),
+  // Kite order postbacks ride the box lane's quote socket as TEXT frames (no dedicated Zerodha
+  // order socket exists). Forward them to the engine's order-stream consumer.
+  onBoxLaneOrderText: (raw) => boxModule.engine.ingestBoxLaneOrderText(raw),
   onDhanTicks: (ticks) => {
     brokerManager.noteTick();
     tickerHub.ingestExternalTicks(ticks);
@@ -342,6 +348,10 @@ const boxModule: BoxModule = registerBoxModule(app, {
   // The engine never builds broker transports itself. The registry assembles the
   // ACTIVE broker's adapter and REFUSES to build one for any other broker.
   createLiveAdapter: (ctx) => brokerManager.createLiveAdapter(ctx),
+  // The Dhan DEDICATED order-update socket, constructed by the registry against the CURRENT
+  // session token. Returns null unless Dhan is active, so an order feed can never observe a broker
+  // the system is not trading. The engine's order-stream consumer supplies the handlers.
+  createDhanOrderFeed: (handlers) => brokerManager.createDhanOrderFeed(handlers),
 });
 
 onFeedSessionLost = () => boxModule.engine.onSessionLost();

@@ -12,6 +12,7 @@
  */
 
 import { DhanHttp, DHAN_API_ROOT } from "./http.js";
+import type { Deadline } from "../deadline.js";
 import type { DhanExchangeSegment } from "./segments.js";
 
 /* --------------------------------- orders --------------------------------- */
@@ -455,7 +456,10 @@ export class DhanClient {
    * must NEVER call this again with the same correlation id in the hope of a
    * cleaner answer.
    */
-  placeOrder(req: DhanPlaceOrderRequest, opts: { beforeSend?: () => void } = {}): Promise<DhanPlaceOrderResponse> {
+  placeOrder(
+    req: DhanPlaceOrderRequest,
+    opts: { beforeSend?: () => void; deadline?: Deadline } = {},
+  ): Promise<DhanPlaceOrderResponse> {
     return this.http.write<DhanPlaceOrderResponse>({
       method: "POST",
       path: "/orders",
@@ -464,6 +468,10 @@ export class DhanClient {
       // http.request(), NOT run in the adapter's pacer where two async waits still remained
       // between the guard and the wire. A throw here proves no POST was transmitted.
       ...(opts.beforeSend ? { beforeSend: opts.beforeSend } : {}),
+      // ABSOLUTE END-TO-END BUDGET (Defect D). Created by the adapter BEFORE its own transport
+      // pacer, so the pacer wait, this transport's pacing queue, the network round trip and the
+      // body read all draw on ONE budget instead of each layer starting a fresh timer.
+      ...(opts.deadline ? { deadline: opts.deadline } : {}),
     });
   }
 
@@ -475,10 +483,11 @@ export class DhanClient {
     });
   }
 
-  cancelOrder(orderId: string): Promise<DhanPlaceOrderResponse> {
+  cancelOrder(orderId: string, opts: { deadline?: Deadline } = {}): Promise<DhanPlaceOrderResponse> {
     return this.http.write<DhanPlaceOrderResponse>({
       method: "DELETE",
       path: `/orders/${encodeURIComponent(orderId)}`,
+      ...(opts.deadline ? { deadline: opts.deadline } : {}),
     });
   }
 

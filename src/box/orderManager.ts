@@ -14,6 +14,7 @@ import { CumulativeFillLedger } from "./orderLifecycle.js";
 import type { ExecutionTimingRecorder } from "./executionTiming.js";
 import { kindForPurpose } from "./executionTiming.js";
 import type { BrokerId } from "./latencyModel.js";
+import { dhanCorrelationId } from "../brokers/dhan/correlation.js";
 import {
   evaluateLiveEntryGuard,
   stillWantedSafely,
@@ -109,6 +110,18 @@ export interface LiveEntryTransportGuard {
   readonly hedge: boolean;
   /** How many BUY hedge legs this attempt has. Uncovered SELLs wait for all of them. */
   readonly hedgeCount: number;
+  /**
+   * CROSS-LEG COHERENCE, re-evaluated against the CURRENT four books at the send boundary.
+   *
+   * Supplied by the gateway, which is the only layer that can see all four books, the socket
+   * generation and the configured policy. Returns null when the snapshot is still coherent, or the
+   * reason it is not. Consulted ONLY at `pre_post`, and only while the attempt has taken no
+   * exposure — see `cross_leg_incoherent` in liveEntryGuard.ts for why.
+   *
+   * Optional so that callers which cannot observe the books (and every existing test) are unchanged;
+   * absent means "no objection from here", never "coherence is proven".
+   */
+  readonly sendBoundaryCoherence?: () => string | null;
 }
 
 /**
@@ -284,6 +297,17 @@ export interface OrderManagerStatus {
    * successful one because the guarded write returns the unchanged document either way.
    */
   durableTransitionRefusals: number;
+  /**
+   * Four-leg coherence that had degraded at the SEND BOUNDARY after the attempt already held
+   * exposure, and the most recent reason.
+   *
+   * The completion policy deliberately does not refuse in that state (a complete box is hedged;
+   * abandoning it manufactures a partial entry and a recovery cost), so this is what keeps the
+   * decision VISIBLE rather than silent. A non-zero count with real boxes is the signal that the
+   * configured dispersion limit and the actual feed timing disagree.
+   */
+  coherenceDegradedAfterExposure: number;
+  lastCoherenceDegradation: string | null;
 }
 
 export interface OrderManagerLimits {
@@ -399,19 +423,27 @@ export class BoxOrderManager {
   };
   private readonly queue: QueueAction[] = [];
   /**
-   * Per-order cumulative-fill ledgers (audit divergence D5).
+   * INDEPENDENT OVERFILL TRIPWIRE — deliberately a SECOND, redundant fill accounting (audit D3).
    *
-   * REPLACES a dead `fillIdentities` set whose `continue` skipped nothing and which nothing ever
-   * read. Every observed broker snapshot for an order is now routed through a ledger that
-   * enforces the invariants the brief requires: a duplicate broker event contributes no
-   * quantity, an out-of-order snapshot cannot rewind the cumulative total, and an overfill is
-   * surfaced rather than silently clamped.
+   * This is NOT the single projection of truth. That is {@link OrderUpdateProjection} inside the
+   * order-stream consumer (see `noteStreamBrokerSnapshot`), through which stream AND REST
+   * observations are attributed, deduplicated and woken. This second set of per-order ledgers is a
+   * separate, adversarial CROSS-CHECK fed from the SAME broker snapshot on the SAME code path: its
+   * ONLY job is to trip the circuit breaker if the broker ever reports MORE filled than we asked
+   * for. It is redundant BY DESIGN — an overfill is a "our own quantity model is wrong" signal, and
+   * a safety tripwire that shares no state with the thing it guards is worth its small cost.
    *
-   * The authoritative position arithmetic remains the Mongo-guarded path below; this ledger is
-   * the verification layer that turns a violated invariant into a tripped breaker instead of a
-   * quiet accounting error. Bounded by TTL and count, so a long session cannot leak.
+   * REPLACED a dead `fillIdentities` set whose `continue` skipped nothing and which nothing read.
+   * Every observed broker snapshot for an order is routed through a ledger that enforces the same
+   * invariants: a duplicate broker event contributes no quantity, an out-of-order snapshot cannot
+   * rewind the cumulative total, and an overfill is surfaced rather than silently clamped.
+   *
+   * The authoritative position arithmetic remains the Mongo-guarded path below. Because BOTH this
+   * tripwire and the projection are idempotent, monotonic and fed the SAME cumulative snapshot,
+   * they can NEVER disagree about attributed cumulative quantity for an order (pinned by
+   * tests/box/fillLedgerTwoStores.test.mjs). Bounded by TTL and count, so a long session cannot leak.
    */
-  private readonly fillLedgers: BoundedTtlCache<CumulativeFillLedger>;
+  private readonly overfillTripwireLedgers: BoundedTtlCache<CumulativeFillLedger>;
   private readonly activeClientIds = new Set<string>();
   private readonly knownIntents = new Map<string, IBoxOrderIntent>();
   private orphanOrders: BrokerOrder[] = [];
@@ -474,6 +506,16 @@ export class BoxOrderManager {
   private flattenChargeMutationGeneration = 0;
   private readonly flattenChargeMutationsByDay = new Map<string, FlattenChargeMutation[]>();
   private reconcileTimer: NodeJS.Timeout | null = null;
+  /**
+   * How many times four-leg coherence had degraded at the send boundary AFTER the attempt already
+   * held exposure, and the most recent reason.
+   *
+   * Counted rather than acted on: the completion policy deliberately does NOT refuse in that state
+   * (see `entryCrossLegCoherenceGap`), so this is the record that keeps the decision visible instead
+   * of silent. Fixed cardinality — a counter and one bounded string.
+   */
+  private coherenceDegradedAfterExposure = 0;
+  private lastCoherenceDegradation: string | null = null;
   private disposed = false;
   private lastReconciledAt: number | null = null;
   /** Guarded durable transitions the intent state machine refused. Bounded counter. */
@@ -486,6 +528,17 @@ export class BoxOrderManager {
   constructor(
     private readonly deps: {
       adapter: BrokerAdapter;
+      /**
+       * The order-stream consumer for this broker account, when live streams are wired.
+       *
+       * OWNERSHIP-FIRST. The manager registers each leg's durable identity here as it enters
+       * SUBMITTING — BEFORE the broker POST — so an order-update that beats the placement HTTP
+       * response has a ledger to land in and is attributable the instant it arrives. It also learns
+       * the broker order id on acknowledgement and feeds REST snapshots into the same projection, so
+       * the stream and REST are ONE deduplicated truth. Optional: absent ⇒ the manager behaves
+       * exactly as before (REST polling is the only fill observer).
+       */
+      orderStreamConsumer?: import("./orderStreamConsumer.js").OrderStreamConsumer;
       persistence: OrderIntentPersistence;
       limits: OrderManagerLimits;
       controls?: Partial<OrderManagerControls>;
@@ -533,10 +586,10 @@ export class BoxOrderManager {
     },
   ) {
     this.tradingDay = this.dayKey();
-    // Bounded: one ledger per in-flight order, expiring well after any order's lifetime. Sized
-    // generously relative to the concurrency cap so nothing in a normal session is evicted while
-    // still live, and hard-capped so nothing can leak.
-    this.fillLedgers = new BoundedTtlCache<CumulativeFillLedger>({
+    // Bounded: one tripwire ledger per in-flight order, expiring well after any order's lifetime.
+    // Sized generously relative to the concurrency cap so nothing in a normal session is evicted
+    // while still live, and hard-capped so nothing can leak.
+    this.overfillTripwireLedgers = new BoundedTtlCache<CumulativeFillLedger>({
       maxEntries: 512,
       ttlMs: 60 * 60_000,
       now: () => this.now(),
@@ -889,7 +942,15 @@ export class BoxOrderManager {
   }
 
   /**
-   * Route an observed broker snapshot through this order's cumulative-fill ledger.
+   * INDEPENDENT OVERFILL TRIPWIRE — route an observed broker snapshot through this order's
+   * SECOND, redundant fill ledger whose SOLE purpose is to trip the breaker on an overfill.
+   *
+   * This is deliberately NOT the projection of truth (that is the order-stream consumer's
+   * {@link OrderUpdateProjection}, fed by `noteStreamBrokerSnapshot` on this SAME code path). It is
+   * an adversarial cross-check: it shares no state with the projection, so a bug in either one is
+   * caught by the other. Because both are idempotent, monotonic and fed the same cumulative
+   * snapshot, they can never disagree about attributed cumulative quantity (pinned by
+   * tests/box/fillLedgerTwoStores.test.mjs).
    *
    * THE INVARIANTS THIS ENFORCES (Phase 6 / Phase 29):
    *
@@ -903,13 +964,13 @@ export class BoxOrderManager {
    * persistence of a real fill. It is emphatically NOT fail-open with respect to the overfill
    * finding, which is a safety signal.
    */
-  private rememberFillIdentities(order: BrokerOrder): void {
+  private checkOverfillTripwire(order: BrokerOrder): void {
     let overfill: { cumulative: number; requested: number } | null = null;
     try {
-      let ledger = this.fillLedgers.get(order.client_order_id);
+      let ledger = this.overfillTripwireLedgers.get(order.client_order_id);
       if (!ledger) {
         ledger = new CumulativeFillLedger(order.client_order_id, order.quantity);
-        this.fillLedgers.set(order.client_order_id, ledger);
+        this.overfillTripwireLedgers.set(order.client_order_id, ledger);
       }
       const result = ledger.apply({
         cumulativeQty: order.filled_quantity,
@@ -932,6 +993,18 @@ export class BoxOrderManager {
         `broker reported ${overfill.cumulative} filled for ${order.client_order_id}, exceeding the ${overfill.requested} requested`,
       );
     }
+  }
+
+  /**
+   * The overfill-tripwire ledger's cumulative for an order, or `undefined` if none exists.
+   *
+   * READ-ONLY DIAGNOSTIC (audit D3). Exposed only so a test can pin the invariant that the
+   * independent overfill tripwire and the order-stream consumer's projection of truth NEVER
+   * disagree about attributed cumulative quantity — both are fed the same cumulative snapshots and
+   * are idempotent+monotonic, so they must always match. It is not part of any decision path.
+   */
+  overfillTripwireCumulative(clientOrderId: string): number | undefined {
+    return this.overfillTripwireLedgers.get(clientOrderId)?.cumulative;
   }
 
   /** Report a real broker rejection for statistics. Fail-open. */
@@ -1042,6 +1115,8 @@ export class BoxOrderManager {
       orphanOrders: this.orphanOrders.map(cloneOrder),
       lastReconciledAt: this.lastReconciledAt,
       durableTransitionRefusals: this.durableTransitionRefusals,
+      coherenceDegradedAfterExposure: this.coherenceDegradedAfterExposure,
+      lastCoherenceDegradation: this.lastCoherenceDegradation,
     };
   }
 
@@ -1275,6 +1350,9 @@ export class BoxOrderManager {
       // BLOCKS the SELL. This inverts the old "no named failure ⇒ permitted" behaviour that let a
       // CANCELLED/zero-fill hedge authorise a naked SELL.
       hedgeCoverageGap: guard.hedge ? null : this.entryHedgeCoverageGap(request, gate, stage),
+      // CROSS-LEG COHERENCE at the final boundary only, and only while this attempt has taken NO
+      // exposure. See `entryCrossLegCoherenceGap`.
+      crossLegCoherenceGap: this.entryCrossLegCoherenceGap(guard, gate, stage),
     });
     if (!decision.allowed) {
       this.entryGuardRefusals.set(stage, (this.entryGuardRefusals.get(stage) ?? 0) + 1);
@@ -1329,6 +1407,59 @@ export class BoxOrderManager {
       return gate.coverage.coverageGapFor(requirements) ?? "hedge coverage could not be claimed";
     }
     return null;
+  }
+
+  /**
+   * The cross-leg coherence objection at the FINAL send boundary, or null to proceed.
+   *
+   * DEFECT C. The gateway checks four-leg coherence twice, both BEFORE the manager is called. A leg
+   * then waits — queued, persisted, parked on the hedge-first barrier, paced by the adapter — and
+   * the books can deteriorate throughout. Per-leg freshness cannot see it: four books can each be
+   * young while being young at four DIFFERENT instants. This carries the check into the one place
+   * that is actually the send boundary.
+   *
+   * TWO DELIBERATE RESTRICTIONS:
+   *
+   *  1. `pre_post` ONLY. Earlier checkpoints are already covered by the gateway's own pre-enqueue
+   *     evaluation, and re-refusing there would just duplicate a decision with a worse reason.
+   *
+   *  2. NO EXPOSURE ONLY. If any leg of this attempt has already POSTed, the attempt COMPLETES the
+   *     hedged box instead. Refusing leg 4 after legs 1-3 reached the broker manufactures a partial
+   *     entry and a real recovery cost, whereas a complete box is hedged by construction and the
+   *     post-fill economics gate already unwinds one that turned out uneconomic. The degradation is
+   *     still recorded on the attempt's diagnostics, so it is never silently discarded.
+   *
+   * A callback that THROWS has told us nothing, and nothing is not permission — but it is also not
+   * proof of incoherence, and failing an ENTRY closed on a diagnostic bug would be its own defect.
+   * A throw is therefore treated as an explicit objection, matching `stillWantedSafely`.
+   */
+  private entryCrossLegCoherenceGap(
+    guard: LiveEntryTransportGuard,
+    gate: EntryTransportGate | undefined,
+    stage: LiveEntryGuardStage,
+  ): string | null {
+    if (stage !== "pre_post") return null;
+    if (guard.sendBoundaryCoherence === undefined) return null;
+    const alreadyExposed = gate !== undefined &&
+      [...gate.decided.values()].some((outcome) => outcome === "posted");
+    if (alreadyExposed) {
+      // COMPLETION POLICY. Record it, do not refuse it.
+      try {
+        const gap = guard.sendBoundaryCoherence();
+        if (gap !== null) {
+          this.coherenceDegradedAfterExposure++;
+          this.lastCoherenceDegradation = gap;
+        }
+      } catch {
+        this.coherenceDegradedAfterExposure++;
+      }
+      return null;
+    }
+    try {
+      return guard.sendBoundaryCoherence();
+    } catch (error) {
+      return `cross-leg coherence could not be evaluated: ${error instanceof Error ? error.message : String(error)}`;
+    }
   }
 
   /** {@link evaluateEntryGuard} as a reason string, matching the `*BlockReason` convention. */
@@ -1403,6 +1534,86 @@ export class BoxOrderManager {
    */
   private brokerAccountKey(): string {
     return `broker:${this.deps.adapter.mode}`;
+  }
+
+  /**
+   * The stable strategy key the broker will ECHO on every order update for this order — the
+   * ownership key the projection attributes by.
+   *
+   *   Zerodha: the order `tag` (`request.tag` after prepareOrder = stableKiteTag), echoed as `tag`.
+   *   Dhan:    the `correlationId` derived from the client id, echoed as `CorrelationId`.
+   *
+   * Broker-aware so the registered key matches exactly what arrives on the stream; a mismatch would
+   * make our own fill look unowned. Falls back to the durable `broker_tag`/`broker_correlation_id`
+   * when present so a value written under an older algorithm still attributes.
+   */
+  private ownerTagFor(intent: IBoxOrderIntent, request: BrokerOrderRequest): string {
+    const broker = this.deps.broker?.();
+    if (broker === "dhan") {
+      return intent.broker_correlation_id ?? dhanCorrelationId(intent.client_order_id);
+    }
+    // Default (Zerodha): the tag the postback echoes.
+    return intent.broker_tag ?? request.tag ?? "";
+  }
+
+  /**
+   * Register a leg's durable identity with the order-stream consumer BEFORE the POST.
+   *
+   * Fail-open and idempotent: a registration fault must never block or delay the order. Absent
+   * consumer ⇒ no-op (REST polling remains the fill observer).
+   */
+  private registerStreamOwnership(intent: IBoxOrderIntent, request: BrokerOrderRequest): void {
+    const consumer = this.deps.orderStreamConsumer;
+    if (!consumer) return;
+    const ownerTag = this.ownerTagFor(intent, request);
+    if (!ownerTag) return;
+    try {
+      consumer.registerIntent({
+        clientOrderId: intent.client_order_id,
+        ownerTag,
+        // The intent has no first-class account field in this single-account deployment; the
+        // consumer's account() default supplies one when known, and attribution rests on the
+        // per-order ownerTag (unique per order and attempt). The observation's own account is still
+        // validated against any account a registration carries.
+        account: null,
+        requestedQty: intent.quantity,
+        brokerOrderId: intent.broker_order_id ?? null,
+      });
+    } catch {
+      // Never let stream bookkeeping affect the order path.
+    }
+  }
+
+  /**
+   * Bind a broker order id to the durable client identity once the broker reports it, and feed the
+   * broker snapshot's cumulative quantity into the SAME projection as a REST observation — so the
+   * stream and REST are one deduplicated truth. Fail-open.
+   */
+  private noteStreamBrokerSnapshot(intent: IBoxOrderIntent, order: BrokerOrder): void {
+    const consumer = this.deps.orderStreamConsumer;
+    if (!consumer) return;
+    try {
+      if (order.broker_order_id) {
+        consumer.learnBrokerOrderId(intent.client_order_id, order.broker_order_id);
+      }
+      const ownerTag = this.ownerTagFor(intent, requestFromIntent(intent));
+      // A REST/adapter snapshot's cumulative quantity, deduplicated against the stream in the one
+      // projection. `quantityPresent` mirrors the adapter's evidence marker so a snapshot that
+      // could not prove a quantity is not read as a confirmed zero.
+      const quantityPresent = order.execution_evidence?.quantity !== "missing";
+      consumer.ingestRestObservation({
+        ownerTag,
+        brokerOrderId: order.broker_order_id ?? null,
+        account: null,
+        cumulativeQty: order.filled_quantity,
+        quantityPresent,
+        averagePrice: order.average_price ?? null,
+        rawStatus: order.state,
+        eventId: `rest:${order.client_order_id}:${order.filled_quantity}:${order.state}`,
+      });
+    } catch {
+      // Never let stream bookkeeping affect reconciliation or persistence.
+    }
   }
 
   /**
@@ -1697,6 +1908,10 @@ export class BoxOrderManager {
       if (intent.state !== "SUBMITTING") {
         throw new Error(`Order intent ${intent.client_order_id} did not durably enter SUBMITTING; broker POST blocked.`);
       }
+      // OWNERSHIP-FIRST, BEFORE THE POST. The identity is durably SUBMITTING and CAS-owned by this
+      // process; register it with the order-stream consumer NOW so an order-update that beats the
+      // placement HTTP response has a ledger to land in and is attributable the instant it arrives.
+      this.registerStreamOwnership(intent, persistedRequest);
       // DURABLE PERSISTENCE COMPLETE. Both Mongo writes are done and the order may now be
       // transmitted, so this closes `persistence_wait_ms` and opens `transport_wait_ms`. Recorded
       // here rather than being left inside the pacing span, because a database round trip reported
@@ -2155,6 +2370,13 @@ export class BoxOrderManager {
     order: BrokerOrder,
     message: string,
   ): Promise<IBoxOrderIntent> {
+    // ONE PROJECTION OF TRUTH. Feed this authoritative broker snapshot into the SAME order-stream
+    // projection the stream feeds (the OrderUpdateProjection in the consumer), deduplicated and
+    // monotonic — so a REST/adapter snapshot and a stream event of the same fill are never
+    // double-counted, and the broker order id is bound to our client id. That projection is the
+    // single truth for attribution and waking waiters. Fail-open; it runs off the existing guarded
+    // durable write below, not a second persistence path.
+    this.noteStreamBrokerSnapshot(intent, order);
     // TIMING: record the broker's CUMULATIVE quantity for this snapshot, and — if the order has
     // reached a terminal state — close and publish the trace. Both are fail-open no-ops when
     // instrumentation is off, and neither can throw into the persistence path below.
@@ -2166,7 +2388,7 @@ export class BoxOrderManager {
     } catch {
       /* telemetry must never affect execution */
     }
-    this.rememberFillIdentities(order);
+    this.checkOverfillTripwire(order);
     try {
       const result = await this.deps.persistence.update(
         intent.client_order_id,

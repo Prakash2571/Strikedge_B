@@ -65,8 +65,17 @@ to start if the schema is behind (surfaced clearly in logs).
 npm ci
 npm run build          # tsc -b → dist/
 npm run migrate        # (or rely on PG_MIGRATE_ON_BOOT)
+node dist/box/effectiveConfig.js   # confirm the EFFECTIVE resolved config + provenance
 npm start              # node dist/index.js
 ```
+
+> Run `node dist/box/effectiveConfig.js` after the same `.env` is loaded but
+> BEFORE starting the process. It prints every Box knob's resolved value and where
+> it came from (`default` / `env` / `env_clamped` / `env_invalid_fallback`) and
+> refuses (non-zero exit) to report a configuration that would not boot. A clamped
+> or fallen-back value is flagged so you can see, for example, that
+> `BOX_LIVE_MAX_OPEN_BOXES=99` is actually running as `20`. See
+> `docs/CONFIGURATION.md` for precedence.
 
 ## 4. PM2
 

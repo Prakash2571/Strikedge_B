@@ -1,4 +1,5 @@
 import type { LegExecutor } from "./legExecutor.js";
+import type { ExecutionEvidenceQuality } from "./brokerExecutionEvidence.js";
 import type {
   BoxLegRole,
   BoxOptionInstrument,
@@ -43,7 +44,15 @@ export interface BrokerFill {
   /** Stable broker trade id, or a deterministic synthetic identity for paper. */
   fill_id: string;
   quantity: number;
-  price: number;
+  /**
+   * Executed price, or NULL when the broker confirmed the quantity but has not published a price.
+   *
+   * Nullable deliberately. The Dhan projection used to synthesize `price: 0` for a confirmed fill
+   * whose `averageTradedPrice` was absent, which is fabricated P&L rather than absent data — a
+   * listed option cannot trade at zero. Consumers must skip a null price rather than arithmetic it.
+   * See brokerExecutionEvidence.ts.
+   */
+  price: number | null;
   at: number;
 }
 
@@ -104,6 +113,14 @@ export interface BrokerOrder {
   pending_quantity: number;
   average_price: number | null;
   fills: BrokerFill[];
+  /**
+   * WHICH execution fields the broker actually supplied for this snapshot.
+   *
+   * Optional because paper and locally-constructed orders have nothing to disclaim. When a live
+   * adapter sets it, it is the nameable reason an order's accounting is or is not final; see
+   * brokerExecutionEvidence.ts and `executionAccountingComplete`.
+   */
+  execution_evidence?: ExecutionEvidenceQuality;
   reject_family: BrokerRejectFamily | null;
   reject_reason: string | null;
   created_at: number;
@@ -174,6 +191,29 @@ export class BrokerPreSubmitRefusedError extends Error {
   }
 }
 
+/**
+ * ONE authoritative order observation arriving from OUTSIDE the adapter's own REST calls.
+ *
+ * In practice: a broker order-update websocket event (Zerodha postback text frame on the quote
+ * socket, Dhan `order_alert` on its dedicated order socket). The shape is deliberately the same
+ * broker-neutral triple every observation path already produces — CUMULATIVE quantity, average
+ * price, verbatim status — because a second SHAPE would become a second TRUTH.
+ *
+ * `clientOrderId` is resolved by the projection BEFORE this reaches an adapter, so an adapter never
+ * has to decide ownership: by the time it is called, the event has already been attributed to a
+ * registered box leg on the right account.
+ */
+export interface ExternalOrderUpdate {
+  readonly clientOrderId: string;
+  readonly brokerOrderId?: string | null;
+  /** Broker CUMULATIVE filled quantity after this event. Never a delta. */
+  readonly cumulativeQty: number;
+  readonly averagePrice?: number | null;
+  /** The broker's own status string, verbatim. Mapped by the adapter that owns that vocabulary. */
+  readonly rawStatus?: string | null;
+  readonly observedAtWall?: number | null;
+}
+
 /** Async broker boundary: all remote-capable reads are promises. */
 export interface BrokerAdapter {
   readonly mode: BrokerAdapterMode;
@@ -192,6 +232,25 @@ export interface BrokerAdapter {
   ): Promise<BrokerOrder>;
   margins?(): Promise<BrokerMargin | null>;
   health?(): Promise<BrokerHealth>;
+  /**
+   * Apply ONE already-attributed external order observation to this adapter's session state.
+   *
+   * THE POINT OF THIS SEAM. Without it a broker order-update stream can only ever change a status
+   * label: the adapter's own `waitForResolution` poll loop is what an order waiter is actually
+   * blocked on, so an event that never reaches the adapter cannot make a fill arrive sooner. With
+   * it, a stream event updates the same session snapshot the poll loop reads AND wakes that loop,
+   * so the waiter resolves on the stream rather than on the next REST interval.
+   *
+   * CONTRACT:
+   *   - the observation has ALREADY been attributed (ownership, account) by the projection;
+   *   - the adapter re-validates the EVIDENCE exactly as it does for a REST snapshot
+   *     (brokerExecutionEvidence.ts) — a stream is a faster source, never a more trusted one;
+   *   - cumulative quantity is MONOTONIC: a lower figure is discarded, never applied;
+   *   - it returns the merged snapshot, or undefined when the order is unknown to this session.
+   *
+   * Optional so the paper adapter and every existing test are unchanged.
+   */
+  applyOrderUpdate?(update: ExternalOrderUpdate): BrokerOrder | undefined;
 }
 
 export class BrokerAmbiguousSubmitError extends Error {
@@ -400,11 +459,17 @@ export class PaperBrokerAdapter implements BrokerAdapter {
         average_price: 0,
       };
       const prior = current.net_quantity;
+      // An UNPRICED fill still moves the net quantity — exposure is exposure — but it cannot
+      // contribute to a cost basis. Folding a null in as zero would understate the basis, which is
+      // exactly the fabricated-accounting failure brokerExecutionEvidence.ts exists to prevent.
+      const fillPrice = fill.price;
       if (prior === 0 || Math.sign(prior) === Math.sign(delta)) {
         const total = Math.abs(prior) + Math.abs(delta);
-        current.average_price = total === 0
-          ? 0
-          : ((Math.abs(prior) * current.average_price) + (Math.abs(delta) * fill.price)) / total;
+        current.average_price = fillPrice === null
+          ? current.average_price
+          : total === 0
+            ? 0
+            : ((Math.abs(prior) * current.average_price) + (Math.abs(delta) * fillPrice)) / total;
         current.net_quantity = prior + delta;
       } else if (Math.abs(delta) < Math.abs(prior)) {
         // A partial close realises P&L but does not rewrite the remaining lot's basis.
@@ -415,7 +480,7 @@ export class PaperBrokerAdapter implements BrokerAdapter {
       } else {
         // The close crossed through flat and opened exposure in the opposite direction.
         current.net_quantity = prior + delta;
-        current.average_price = fill.price;
+        if (fillPrice !== null) current.average_price = fillPrice;
       }
       positions.set(key, current);
     }

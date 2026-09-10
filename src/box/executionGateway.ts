@@ -4,6 +4,7 @@ import {
   BrokerOrderRejectedError,
   BrokerPreSubmitRefusedError,
   boxClientOrderId,
+  isBrokerOrderTerminal,
 } from "./brokerAdapter.js";
 import {
   planPartialEntryRecovery,
@@ -13,11 +14,19 @@ import {
 } from "./partialEntryRecovery.js";
 import {
   boxCapitalSummary,
+  buildEconomicPicture,
   evaluateBoxCapitalAdmission,
+  evaluateEconomicAdmission,
   grossEntryOrderNotional,
   type BoxCapitalReport,
+  type EconomicAdmissionReport,
 } from "./boxCapital.js";
 import { entrySubmissionOrder } from "./entrySubmissionOrder.js";
+import {
+  planExitDependencies,
+  releasableHedgeQuantity,
+  verticalPartner,
+} from "./exitDependencies.js";
 import { evaluateLiveEntryGuard, stillWantedSafely } from "./liveEntryGuard.js";
 import {
   evaluateBookCoherence,
@@ -75,8 +84,25 @@ import {
   type ResidualLegExposure,
 } from "./types.js";
 
-/** Narrow strategy-facing execution seam shared by scanner, monitor and recovery. */
-export interface BoxExecutionGateway {
+/**
+ * One exit leg's authoritative outcome within a wave.
+ *
+ * `certain` is the safety question: may the paired hedge be released on the strength of this?
+ * Only a TERMINAL broker snapshot ({@link isBrokerOrderTerminal}), or a proven local refusal that
+ * never reached the broker, answers yes. A PARTIALLY_FILLED snapshot is deliberately NOT certain —
+ * it can still fill more, and sizing a hedge release from it is exactly the "guess a quantity while
+ * an order can still fill" that the contract forbids. See exitDependencies.ts.
+ *
+ * This is a STRICTER notion than the `uncertain` flag that drives the invariant/recovery path,
+ * which keeps its original meaning (an unprovable broker outcome). Holding a hedge on a live
+ * partial is the safe side and must not, by itself, trip the breaker.
+ */
+interface ExitWaveOutcome {
+  readonly filled: number;
+  readonly certain: boolean;
+}
+
+/** Narrow strategy-facing execution seam shared by scanner, monitor and recovery. */export interface BoxExecutionGateway {
   readonly mode: BoxConfig["executionMode"];
   hasCapacity(): boolean;
   simulateEntry(args: Parameters<BoxExecutionSimulator["simulateEntry"]>[0]): Promise<BoxEntryExecutionResult>;
@@ -142,6 +168,8 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
   readonly mode: BoxConfig["executionMode"];
   /** The most recent per-Box capital decision, for status. Never a correctness input. */
   private lastCapitalReport: BoxCapitalReport | null = null;
+  /** The most recent economic-admission decision (five distinct quantities), for status. */
+  private lastEconomicReport: EconomicAdmissionReport | null = null;
 
   constructor(private readonly deps: {
     cfg: BoxConfig;
@@ -155,6 +183,15 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     isTokenWarm?: (token: number) => boolean;
     /** Current socket generation, captured with each checked executable book. */
     feedGeneration?: () => number;
+    /**
+     * MARKET-DATA READINESS gate for NEW ENTRY (GAP 1). When supplied and it reports NOT permitted,
+     * a live entry is refused at the cheapest checkpoint (before any request is built or any
+     * exposure is created). The driven MarketDataStateMachine gates entry on READY: a socket that
+     * has merely opened, a partly-restored subscription set, a heartbeat gap, a stale book or an
+     * ingestion backlog all report NOT permitted with the state as the reason. Absent (paper, and
+     * older single-broker wiring) ⇒ no additional gate, preserving prior behaviour exactly.
+     */
+    marketDataEntryPermitted?: () => { permitted: boolean; state: string };
     now?: () => number;
     /**
      * Total charges (₹) for a set of orders, from the LOCAL fee calculator.
@@ -164,6 +201,26 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
      * were never even estimated — a genuine cost silently absent from the trade's accounting.
      */
     chargeTotal?: (orders: { side: OrderSide; tradingsymbol: string; quantity: number; price: number }[]) => number;
+    /**
+     * FRESH available-funds evidence for the active broker account (Task 8, economic admission).
+     *
+     * Sourced from a SUPPORTED broker facility (the adapter's own margins()), returning the
+     * available balance and the wall-clock time it was observed. Returning null — or a stale
+     * observedAt — makes the economic gate treat funds as unavailable and REFUSE rather than
+     * assume the account can fund the entry. Only consulted when a control needs it.
+     */
+    funds?: () => Promise<{ availableRupees: number | null; observedAt: number } | null>;
+    /**
+     * FRESH broker-confirmed planned-margin evidence for the four-leg entry (Task 8).
+     *
+     * A basket/multi-order margin estimate from a supported broker facility, with its observed-at
+     * time. No such facility is wired on the adapter yet, so this is usually absent; when the
+     * margin-evidence control is enabled and this is absent/stale the gate FAILS CLOSED. Never
+     * fabricated from the gross cap or the net debit.
+     */
+    plannedMargin?: (
+      requests: readonly BrokerOrderRequest[],
+    ) => Promise<{ marginRupees: number | null; observedAt: number } | null>;
   }) {
     this.mode = deps.cfg.executionMode;
   }
@@ -216,6 +273,29 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     const submittedAt = this.now();
     const wantedAtBuild = this.entryGuardRefusal(args.stillWanted, "pre_build");
     if (wantedAtBuild) return this.refusedBeforeSubmit(args, submittedAt, tradeId, wantedAtBuild);
+
+    // ── MARKET-DATA READINESS: gate NEW ENTRY on READY (GAP 1) ─────────────────────────────
+    //
+    // The driven MarketDataStateMachine only reports permitted when the feed is authenticated AND
+    // every traded instrument has fresh usable depth in the CURRENT generation. A socket that has
+    // merely opened, a partly-restored subscription set after a reconnect, a heartbeat gap, a
+    // stale book, or an ingestion backlog all refuse here — at the cheapest checkpoint, before any
+    // request is built or any exposure is created. This is ENTRY-ONLY: protective cancel, exit and
+    // attributed reduction are never routed through here and are never blocked by it.
+    const mdGate = this.deps.marketDataEntryPermitted?.();
+    if (mdGate && !mdGate.permitted) {
+      return liveEntryFailure(
+        args.candidate,
+        args.detection.at,
+        submittedAt,
+        [],
+        "feed_unhealthy",
+        `market-data not READY for new entry (state ${mdGate.state}); ` +
+          `entry requires fresh usable depth per leg in the current connection generation`,
+        this.deps.cfg,
+        tradeId,
+      );
+    }
 
     const requests: BrokerOrderRequest[] = [];
     let checkedFeed = new Map<string, CheckedFeedStamp>();
@@ -302,6 +382,30 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
       );
     }
 
+    // ── ECONOMIC ADMISSION: FRESH funds / broker-margin evidence (Task 8) ──────────────────
+    //
+    // A DISTINCT gate from the gross-notional cap above. Where the cap bounds gross option-order
+    // notional, this proves the account can actually FUND the entry, using freshly observed broker
+    // evidence — never the cap as a stand-in for a budget, never the net debit as a stand-in for
+    // the requirement. Enabled only when the operator asks for it (funds-cover or margin-evidence);
+    // when enabled, MISSING or STALE evidence REFUSES rather than assumes. Runs on the SAME four
+    // immutable requests, still before any leg is sent, so a refusal is a free pre-submit refusal.
+    const economic = await this.evaluateEntryEconomics(requests);
+    if (economic && !economic.allowed) {
+      const rejected = liveEntryFailure(
+        args.candidate,
+        args.detection.at,
+        submittedAt,
+        [],
+        "box_capital_limit",
+        `economic admission refused entry [${economic.reasons.join(",")}]: ${economic.detail ?? "insufficient economic evidence"}`,
+        this.deps.cfg,
+        tradeId,
+      );
+      rejected.legging.outcome_class = "REFUSED_BEFORE_SUBMIT";
+      return rejected;
+    }
+
     // The Box-level decision is stamped onto every leg so the manager can RE-VERIFY it at
     // dequeue, the last safe moment before a broker mutation. A per-leg check could not: the
     // cap is a property of the whole four-leg set, which no single leg can see.
@@ -354,6 +458,17 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
           transportRank: slot?.rank ?? 0,
           hedge: slot?.hedge ?? false,
           hedgeCount,
+          // DEFECT C. The SAME four-leg decision, re-run against the CURRENT books at the real send
+          // boundary — after queueing, durable persistence, the hedge-first barrier and adapter
+          // pacing. The gateway supplies it because it is the only layer that can see all four
+          // books, the socket generation and the configured policy. The manager decides WHEN to
+          // honour it (no exposure ⇒ refuse; exposure taken ⇒ complete and record).
+          sendBoundaryCoherence: () => {
+            const verdict = this.recheckEntryCoherence(args.candidate, this.now());
+            return verdict.admit
+              ? null
+              : `[${verdict.reason}] ${verdict.detail}`;
+          },
         });
       }),
     );
@@ -484,6 +599,11 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
       // and is asserted only at the manager's post-barrier pre_post checkpoint. Passing `null`
       // means "no coverage objection at this stage", NOT "coverage is proven".
       hedgeCoverageGap: null,
+      // The gateway runs its OWN coherence admission and re-check around these stages
+      // (see the `evaluateEntryCoherence`/`recheckEntryCoherence` calls in the entry path), so
+      // there is no objection to add here. `null` means "nothing to report from this stage",
+      // not "coherence is proven"; the send boundary supplies the real verdict.
+      crossLegCoherenceGap: null,
     });
     return decision.allowed ? null : decision.reason;
   }
@@ -593,49 +713,158 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     const manager = this.requireManager();
     const attemptId = stableAttemptId(args.position.id, args.detectedAt, "EXIT");
     const detByRole = new Map(args.detectionLegs.map((leg) => [leg.role, leg]));
-    const requests = outstandingRoles(args.position).map(({ role, quantity }) => this.request({
+    const direction = args.position.direction ?? "LONG_BOX";
+    const outstanding = outstandingRoles(args.position);
+    if (outstanding.length === 0) {
+      const record = liveRecord(args.detectedAt, this.now(), [], false, this.deps.cfg, undefined, args.position.id);
+      return { ok: false, record, reason: "legging_incomplete", detail: "position already flat" };
+    }
+
+    // ── EXPOSURE-AWARE EXIT DEPENDENCIES (see exitDependencies.ts) ──────────────────────────
+    //
+    // WAVE 0 transmits everything that can only reduce risk: every BUY that closes a short leg,
+    // plus every long leg with no short standing beside it (a long-only residual has nothing to
+    // wait for, and must never be made to wait for a nonexistent short).
+    //
+    // WAVE 1 transmits hedge releases, each bounded by PROVEN cover release. A hedge whose paired
+    // short is still outstanding — because the close cancelled, partially filled, or is simply not
+    // decided yet — keeps exactly the quantity that short still needs.
+    const outstandingByRole: Partial<Record<BoxLegRole, number>> = {};
+    for (const { role, quantity } of outstanding) outstandingByRole[role] = quantity;
+    const plan = planExitDependencies(direction, outstandingByRole);
+
+    const build = (role: BoxLegRole, quantity: number): BrokerOrderRequest => this.request({
       role,
       inst: args.position.legs[role],
-      side: exitSideFor(role, args.position.direction ?? "LONG_BOX"),
+      side: exitSideFor(role, direction),
       quantity,
       referencePrice: detByRole.get(role)?.price ?? 0,
       tradeId: args.position.id,
       attemptId,
       purpose: "EXIT",
       phase: "exit",
-    }));
-    if (requests.length === 0) {
-      const record = liveRecord(args.detectedAt, this.now(), [], false, this.deps.cfg, undefined, args.position.id);
-      return { ok: false, record, reason: "legging_incomplete", detail: "position already flat" };
-    }
-    let checkedFeed: Map<string, CheckedFeedStamp>;
+    });
+
+    const orders: BrokerOrder[] = [];
+    let uncertain = false;
+    let attempted = 0;
+    const withheld: string[] = [];
+
+    /** Submit one wave, recording orders and whether any outcome is unprovable. */
+    const runWave = async (
+      legs: readonly { role: BoxLegRole; quantity: number }[],
+    ): Promise<Map<BoxLegRole, ExitWaveOutcome>> => {
+      const byRole = new Map<BoxLegRole, ExitWaveOutcome>();
+      if (legs.length === 0) return byRole;
+      const requests = legs.map((leg) => build(leg.role, leg.quantity));
+      attempted += requests.length;
+      // Freshness is re-established per wave: wave 1 is transmitted after wave 0's broker round
+      // trip, so reusing wave 0's stamps would authorise a SELL against a book that has since aged.
+      const checkedFeed = this.precheck(requests);
+      const settled = await Promise.allSettled(
+        requests.map((request) => manager.submit(request, checkedFeed.get(request.client_order_id))),
+      );
+      settled.forEach((item, index) => {
+        const role = requests[index]!.role;
+        if (item.status === "fulfilled") {
+          orders.push(item.value);
+          // `uncertain` keeps its ORIGINAL meaning — an unprovable broker terminal quantity — so a
+          // confirmed partial still does not trip the invariant. Hedge-release certainty is the
+          // stricter test beside it.
+          if (item.value.state === "UNKNOWN" || item.value.state === "RECONCILIATION_REQUIRED") {
+            uncertain = true;
+          }
+          byRole.set(role, {
+            filled: item.value.filled_quantity,
+            certain: isBrokerOrderTerminal(item.value.state),
+          });
+          return;
+        }
+        if (item.reason instanceof BrokerPreSubmitRefusedError) {
+          // A LOCAL pre-submit refusal never reached the broker, so nothing filled. That is
+          // CERTAIN knowledge of zero — not an unknown — and it is exactly why the original code
+          // excluded it from `uncertain`. It still releases no hedge, because the short is intact.
+          byRole.set(role, { filled: 0, certain: true });
+          return;
+        }
+        if (item.reason instanceof OrderPersistenceAfterFillError) {
+          orders.push(item.reason.order);
+          uncertain = true;
+          byRole.set(role, { filled: item.reason.order.filled_quantity, certain: false });
+          return;
+        }
+        uncertain = true;
+        byRole.set(role, { filled: 0, certain: false });
+      });
+      return byRole;
+    };
+
+    let wave0: Map<BoxLegRole, ExitWaveOutcome>;
     try {
-      checkedFeed = this.precheck(requests);
+      wave0 = await runWave(plan.wave0.map((slot) => ({ role: slot.role, quantity: slot.outstanding })));
     } catch (error) {
-      const record = liveRecord(args.detectedAt, this.now(), [], false, this.deps.cfg, requests.length, args.position.id);
+      const record = liveRecord(args.detectedAt, this.now(), [], false, this.deps.cfg, plan.wave0.length, args.position.id);
       return { ok: false, record, reason: "insufficient_quantity", detail: errorMessage(error) };
     }
-    const settled = await Promise.allSettled(
-      requests.map((request) => manager.submit(request, checkedFeed.get(request.client_order_id))),
-    );
-    const orders = ordersFromSettled(settled);
-    const uncertain = settled.some((item) => item.status === "rejected" &&
-      !(item.reason instanceof BrokerPreSubmitRefusedError)) ||
-      orders.some((order) => order.state === "UNKNOWN" || order.state === "RECONCILIATION_REQUIRED");
+
+    // Hedge releases, sized from AUTHORITATIVE fill quantity only.
+    const releases: { role: BoxLegRole; quantity: number }[] = [];
+    for (const slot of plan.wave1) {
+      const short = slot.covers!;
+      const evidence = wave0.get(short);
+      const releasable = releasableHedgeQuantity({
+        hedgeOutstanding: slot.outstanding,
+        short: {
+          shortOutstanding: outstandingByRole[short] ?? 0,
+          confirmedClosed: evidence?.filled ?? 0,
+          // No evidence at all (the short was never planned, or the wave threw) is UNCERTAIN.
+          certain: evidence?.certain ?? false,
+        },
+      });
+      if (releasable <= 0) {
+        withheld.push(`${slot.role} held back ${slot.outstanding} covering ${short}`);
+        continue;
+      }
+      if (releasable < slot.outstanding) {
+        withheld.push(`${slot.role} held back ${slot.outstanding - releasable} covering ${short}`);
+      }
+      releases.push({ role: slot.role, quantity: releasable });
+    }
+
+    if (releases.length > 0) {
+      try {
+        await runWave(releases);
+      } catch (error) {
+        // A hedge release refused for want of an executable book is NOT an exposure failure: the
+        // hedge simply stays on, which is the safe side. Recorded, never escalated to a naked sell.
+        withheld.push(`hedge release blocked: ${errorMessage(error)}`);
+      }
+    }
+
     if (uncertain) manager.invariantViolation(`live exit ${attemptId} has uncertain broker terminal quantity`);
-    const record = liveRecord(args.detectedAt, this.now(), orders, false, this.deps.cfg, requests.length, args.position.id);
+    const record = liveRecord(args.detectedAt, this.now(), orders, false, this.deps.cfg, attempted, args.position.id);
     const legs = legsFromOrders(orders, args.position.legs, this.deps.quotes, this.now());
-    // `>=` for the same reason as the entry path: the requested exit quantity is covered, so the
-    // close is complete. Reading an overfilled exit as incomplete would leave the monitor believing
-    // roles are still outstanding and re-submitting closes against already-flat legs.
-    const clean =
-      !uncertain && orders.length === requests.length && orders.every((order) => order.filled_quantity >= order.quantity);
+
+    // CLEAN means every outstanding unit of every outstanding role is confirmed closed. Measured
+    // per ROLE against the position's outstanding quantity — not per REQUEST — because a hedge
+    // release is deliberately sized below its outstanding quantity when cover is still required,
+    // and "the requests I chose to send all filled" would then read a half-exited box as flat.
+    const closedByRole = new Map<BoxLegRole, number>();
+    for (const order of orders) {
+      closedByRole.set(order.role, (closedByRole.get(order.role) ?? 0) + order.filled_quantity);
+    }
+    const clean = !uncertain && withheld.length === 0 &&
+      outstanding.every(({ role, quantity }) => (closedByRole.get(role) ?? 0) >= quantity);
     if (clean) return { ok: true, legs, record, booksAtFill: new Map() };
     return {
       ok: false,
       record,
       reason: "legging_incomplete",
-      detail: uncertain ? "exit terminal quantity uncertain; position moved to recovery" : "live exit partially filled",
+      detail: uncertain
+        ? "exit terminal quantity uncertain; position moved to recovery"
+        : withheld.length > 0
+          ? `live exit preserved required hedge cover: ${withheld.join("; ")}`
+          : "live exit partially filled",
       legs,
       booksAtFill: new Map(),
     };
@@ -1037,6 +1266,85 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
   }
 
   /**
+   * Evaluate the economic-admission controls for a built entry request set.
+   *
+   * Returns null when NO economic control is enabled (the gross-cap-only behaviour is unchanged).
+   * When a control is enabled, it sources FRESH funds/margin evidence from the injected broker
+   * facilities and judges the five-quantity picture. Funds/margin are exposed as
+   * missing/stale (unusable) rather than assumed; the gate then fails closed.
+   *
+   * NOT applied to reduction/exit — only `simulateLeggingEntry` calls it, so protective reduction
+   * once partially exposed is never subject to new-entry economics (explicit recovery policy).
+   */
+  private async evaluateEntryEconomics(
+    requests: readonly BrokerOrderRequest[],
+  ): Promise<EconomicAdmissionReport | null> {
+    if (this.mode !== "live") return null;
+    const requireFundsCover = this.deps.cfg.liveRequireFundsCover === true;
+    const requireMarginEvidence = this.deps.cfg.liveRequireMarginEvidence === true;
+    if (!requireFundsCover && !requireMarginEvidence) return null;
+
+    const now = this.now();
+    // FRESH evidence via supported broker facilities. A throwing/absent source yields null, which
+    // the picture treats as unavailable — never a fabricated figure.
+    const fundsEvidence = this.deps.funds ? await this.deps.funds().catch(() => null) : null;
+    const marginEvidence = this.deps.plannedMargin
+      ? await this.deps.plannedMargin(requests).catch(() => null)
+      : null;
+
+    const picture = buildEconomicPicture({
+      requests,
+      now,
+      marginFreshnessMaxAgeMs: this.deps.cfg.liveMarginFreshnessMaxAgeMs,
+      fundsFreshnessMaxAgeMs: this.deps.cfg.liveFundsFreshnessMaxAgeMs,
+      availableFundsRupees: fundsEvidence?.availableRupees ?? null,
+      availableFundsObservedAt: fundsEvidence?.observedAt ?? null,
+      plannedMarginRupees: marginEvidence?.marginRupees ?? null,
+      plannedMarginObservedAt: marginEvidence?.observedAt ?? null,
+      estimatedChargesRupees: this.chargesForRequests(requests),
+      expectedLegCount: BOX_LEG_ROLES.length,
+    });
+
+    const report = evaluateEconomicAdmission({
+      picture,
+      // Reuse the SAME gross cap as the notional gate for the gross-notional check inside the
+      // economic evaluator; the funds/margin controls are independent of it.
+      grossCapRupees: this.capitalLimitRupees(),
+      requireFundsCover,
+      requireMarginEvidence,
+    });
+    this.lastEconomicReport = report;
+    return report;
+  }
+
+  /** Estimated charges (₹) for a request set, from the local fee calculator when available. */
+  private chargesForRequests(requests: readonly BrokerOrderRequest[]): number | null {
+    if (!this.deps.chargeTotal) return null;
+    try {
+      return this.deps.chargeTotal(
+        requests.map((r) => ({
+          side: r.side,
+          tradingsymbol: r.tradingsymbol,
+          quantity: r.quantity,
+          price: r.pricing.limit_price,
+        })),
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The last economic-admission decision, for status/diagnostics.
+   *
+   * Returns null until an economic control has run at least once. The picture carries all five
+   * quantities with their provenance so an operator can see, e.g., ample funds but stale margin.
+   */
+  economicDiagnostics(): EconomicAdmissionReport | null {
+    return this.lastEconomicReport;
+  }
+
+  /**
    * Observe the four legs' CURRENT books as coherence evidence.
    *
    * The socket generation is captured per leg (a cold/unwarm token is treated as belonging to no
@@ -1121,24 +1429,56 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     return checked;
   }
 
+  /**
+   * PROTECTIVE UNWIND of CONFIRMED entry exposure — exposure-aware, hedge-preserving.
+   *
+   * THE DEFECT THIS CLOSES. This used to walk `orders` in arbitrary array order and reverse each
+   * confirmed fill, so on a partial entry it could SELL a filled long hedge before (or instead of)
+   * buying back the short leg beside it. An accepted-but-unfilled buy-back then left a naked short
+   * with its cover gone — the same failure as the exit path, reached from recovery instead.
+   *
+   * THE ORDER IS NOW DERIVED FROM EXPOSURE, not from array position (see exitDependencies.ts):
+   *
+   *   wave 0  reverse every SHORT the entry created (an unwind BUY; only ever reduces risk)
+   *   wave 1  reverse the LONG hedges, each capped at the quantity PROVEN no longer needed as
+   *           cover for the short beside it
+   *
+   * Anything held back is not lost: it stays as durable residual exposure for the flatten loop,
+   * which is strictly safer than selling cover away and strictly better than doing nothing.
+   */
   private async unwindConfirmed(orders: BrokerOrder[], instruments: Record<BoxLegRole, BoxOptionInstrument>, tradeId: string, attemptId: string): Promise<BrokerOrder[]> {
     const manager = this.requireManager();
     const unwinds: BrokerOrder[] = [];
+
+    /** Confirmed exposure this entry actually created, by role. */
+    const exposure = new Map<BoxLegRole, { order: BrokerOrder; quantity: number }>();
     for (const order of orders) {
       if (order.filled_quantity <= 0) continue;
+      const prior = exposure.get(order.role);
+      exposure.set(order.role, {
+        order,
+        quantity: (prior?.quantity ?? 0) + order.filled_quantity,
+      });
+    }
+
+    /** Reverse `quantity` of one confirmed leg. Returns what the reversal proved. */
+    const reverse = async (
+      order: BrokerOrder,
+      quantity: number,
+    ): Promise<ExitWaveOutcome> => {
       const quote = this.deps.quotes.get(order.token);
       const side: OrderSide = order.side === "BUY" ? "SELL" : "BUY";
       const reference = quote ? touchPrice(side, quote.bids, quote.asks) : null;
       if (!reference) {
         manager.invariantViolation(`cannot price protective unwind for ${order.client_order_id}`);
-        continue;
+        return { filled: 0, certain: false };
       }
       try {
         const request = this.request({
           role: order.role,
           inst: instruments[order.role],
           side,
-          quantity: order.filled_quantity,
+          quantity,
           referencePrice: reference,
           tradeId,
           attemptId,
@@ -1146,13 +1486,57 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
           phase: "unwind",
         });
         const checkedFeed = this.precheck([request]);
-        unwinds.push(await manager.submit(request, checkedFeed.get(request.client_order_id)));
+        const result = await manager.submit(request, checkedFeed.get(request.client_order_id));
+        unwinds.push(result);
+        return { filled: result.filled_quantity, certain: isBrokerOrderTerminal(result.state) };
       } catch (error) {
         if (error instanceof OrderPersistenceAfterFillError) {
           unwinds.push(error.order);
+          manager.invariantViolation(`protective unwind failed for ${order.client_order_id}: ${errorMessage(error)}`);
+          return { filled: error.order.filled_quantity, certain: false };
         }
         manager.invariantViolation(`protective unwind failed for ${order.client_order_id}: ${errorMessage(error)}`);
+        // A LOCAL pre-submit refusal proves no POST, so the exposure is intact and known; anything
+        // else may leave a fill with the broker and must be treated as unprovable.
+        return { filled: 0, certain: error instanceof BrokerPreSubmitRefusedError };
       }
+    };
+
+    // ── wave 0: buy back every short the entry created ──────────────────────────────────────
+    const reduced = new Map<BoxLegRole, ExitWaveOutcome>();
+    for (const role of BOX_LEG_ROLES) {
+      const item = exposure.get(role);
+      if (!item || item.order.side !== "SELL") continue;
+      reduced.set(role, await reverse(item.order, item.quantity));
+    }
+
+    // ── wave 1: release long hedges only up to proven-free quantity ─────────────────────────
+    for (const role of BOX_LEG_ROLES) {
+      const item = exposure.get(role);
+      if (!item || item.order.side !== "BUY") continue;
+      const partner = verticalPartner(role);
+      const partnerExposure = exposure.get(partner);
+      const shortOutstanding = partnerExposure && partnerExposure.order.side === "SELL"
+        ? partnerExposure.quantity
+        : 0;
+      const evidence = reduced.get(partner);
+      const releasable = releasableHedgeQuantity({
+        hedgeOutstanding: item.quantity,
+        short: {
+          shortOutstanding,
+          confirmedClosed: evidence?.filled ?? 0,
+          certain: evidence?.certain ?? false,
+        },
+      });
+      if (releasable <= 0) {
+        manager.invariantViolation(
+          `protective unwind ${attemptId} preserved hedge ${role} (${item.quantity}) because short ${partner} ` +
+            `still has ${shortOutstanding - Math.min(evidence?.certain ? evidence.filled : 0, shortOutstanding)} ` +
+            `outstanding; the exposure is carried as residual instead of sold`,
+        );
+        continue;
+      }
+      await reverse(item.order, releasable);
     }
     return unwinds;
   }
@@ -1363,7 +1747,13 @@ function paperLeg(order: BrokerOrder): PaperLegExecution {
     requested_qty: order.quantity,
     fill_qty: filled,
     remaining_qty: order.quantity - filled,
-    fills: order.fills.map((fill) => ({ price: fill.price, qty: fill.quantity, displayed_qty: fill.quantity, effective_qty: fill.quantity, at: fill.at, quote_version: null })),
+    // PRICED SLICES ONLY. `PaperFillSlice.price` is a number by contract, so a fill whose price the
+    // broker has not published is deliberately absent from this list rather than rendered at zero.
+    // The exposure is not lost: `fill_qty` above is the broker's cumulative quantity, and
+    // `average_fill_price` is null, which is how a reader knows the pricing is still pending.
+    fills: order.fills
+      .filter((fill): fill is typeof fill & { price: number } => fill.price !== null)
+      .map((fill) => ({ price: fill.price, qty: fill.quantity, displayed_qty: fill.quantity, effective_qty: fill.quantity, at: fill.at, quote_version: null })),
     quote_version: null,
     book_at: order.updated_at,
     book_exchange_at: null,

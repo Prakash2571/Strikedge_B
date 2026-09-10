@@ -193,3 +193,51 @@ test("nothing that IS wired is still labelled unwired", () => {
     "the parity report is wired now, so the doc must not still say it is not",
   );
 });
+
+/* ─────────── order-stream health governance is WIRED, not inert (D1/D4/D5/D6) ─────────── */
+
+test("D1: the combined entry gate consults the order stream, not market data alone", () => {
+  const engine = code("engine.ts");
+  // The entry gate intersects both transports via the shared table wrapper.
+  assert.ok(engine.includes("entryPermittedFromStreams("), "the entry gate must intersect the order stream");
+  assert.ok(engine.includes("this.orderStreamState()"), "the gate must read the driven order-stream state");
+  // And it still derives market-data admission from the permission table (unchanged intent).
+  assert.ok(engine.includes("marketDataPermissions(state).newEntry"));
+});
+
+test("D6: the Zerodha order-stream lifecycle is DRIVEN from the quote-socket connection", () => {
+  const engine = code("engine.ts");
+  // onBoxLaneConnection drives the order-stream lifecycle, not just the market-data machine.
+  assert.ok(engine.includes("this.driveZerodhaOrderStreamConnection("), "box-lane connection must drive the order stream");
+  assert.ok(engine.includes("consumer.driveQuoteSocketLifecycle("), "the multiplexed-socket seam must be invoked");
+});
+
+test("D4: the reconnect gap-repair sweep and reconcile completion are wired", () => {
+  const engine = code("engine.ts");
+  assert.ok(engine.includes("reconcileSweep:"), "the consumer must be given a reconnect sweep");
+  const consumer = readFileSync(new URL("../../src/box/orderStreamConsumer.ts", import.meta.url), "utf8")
+    .replace(/\/\*[\s\S]*?\*\//g, "");
+  assert.ok(consumer.includes("runReconnectReconciliation"), "the sweep driver must exist");
+  assert.ok(consumer.includes("this.markSynchronized()"), "the sweep must clear RECONCILING only on consistency");
+});
+
+test("D5: idleness is DRIVEN from a real clock against working-order expectation", () => {
+  const engine = code("engine.ts");
+  assert.ok(engine.includes("consumer.evaluateIdle("), "the engine must drive the idle detector");
+  assert.ok(engine.includes("expectedIdleMs:"), "the consumer must be given an expected-idle bound");
+});
+
+test("D2: the Zerodha text-frame OBSERVATION path is gated by the flag, not just the status label", () => {
+  const engine = code("engine.ts");
+  // ingestBoxLaneOrderText must drop frames unless the flag arms the observation path.
+  assert.ok(engine.includes("zerodhaTextFramesConsumed()"), "the text-frame ingest must consult the observation gate");
+  // The gate must appear in the ingest method, guarding BEFORE the enqueue.
+  const ingest = engine.slice(engine.indexOf("ingestBoxLaneOrderText(raw: string)"));
+  const gateIdx = ingest.indexOf("zerodhaTextFramesConsumed()");
+  const enqueueIdx = ingest.indexOf('enqueue("order_events"');
+  assert.ok(gateIdx >= 0 && gateIdx < enqueueIdx, "the flag gate must precede the enqueue, so an unarmed frame is never consumed");
+  // And the honest predicate is a real export, not a comment.
+  const upd = readFileSync(new URL("../../src/brokers/zerodha/orderUpdates.ts", import.meta.url), "utf8")
+    .replace(/\/\*[\s\S]*?\*\//g, "");
+  assert.ok(upd.includes("export function zerodhaTextFramesConsumed"), "the observation-path gate must be a real export");
+});

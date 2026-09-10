@@ -27,8 +27,11 @@
  */
 
 import {
+  type BrokerEndpointClass,
   type BrokerPacingClass,
   type EffectiveBrokerPacing,
+  isRateLimited,
+  RateBudgetLedger,
   resolveBrokerPacing,
   TransportPacer,
   type TransportPacerStats,
@@ -50,8 +53,17 @@ import {
   type BrokerOrderState,
   type BrokerPosition,
   type BrokerRejectFamily,
+  type ExternalOrderUpdate,
 } from "./brokerAdapter.js";
 import type { BoxConfig } from "./config.js";
+import { Deadline, monotonicNow, type MonotonicClock } from "../brokers/deadline.js";
+import {
+  evaluateExecutionEvidence,
+  readCumulativeQuantity,
+  readNonNegativeInteger,
+  readPositivePrice,
+  readTradedPrice,
+} from "./brokerExecutionEvidence.js";
 import type { ExecutionTimingRecorder } from "./executionTiming.js";
 import type { IBoxOrderIntent } from "./types.js";
 import {
@@ -101,6 +113,17 @@ export interface DhanAdapterConfig {
    * keep compiling; absent, it is derived from `brokerMinIntervalMs` and Dhan's floor.
    */
   pacing?: EffectiveBrokerPacing;
+  /**
+   * The SHARED, application-owned multi-window order budget for this broker ACCOUNT (Task 8).
+   *
+   * Optional so existing config literals keep compiling. When present it MUST be the ONE ledger
+   * shared across every adapter/consumer on the same account (the engine owns it), because the
+   * broker meters the account, not the adapter instance. The adapter consults it at the pre-wire
+   * boundary: an over-budget ENTRY placement is refused with a proven no-POST
+   * {@link BrokerPreSubmitRefusedError}, while a protective CANCEL/MODIFY spends the recovery
+   * reserve so a placement storm cannot starve it.
+   */
+  rateBudget?: RateBudgetLedger;
   maxModifications: number;
   maxChaseTicks: number;
   dhanClientId: () => string;
@@ -117,6 +140,26 @@ export interface DhanAdapterConfig {
    * different networks and different gateways, so a pooled distribution would describe neither.
    */
   timing?: ExecutionTimingRecorder;
+  /**
+   * MONOTONIC clock for elapsed/deadline measurement (Defect D).
+   *
+   * The poll and protective-cancel loops used `Date.now()`, so a wall-clock step (NTP correction,
+   * VM time sync) could shorten or lengthen a deadline the safety argument depends on. Wall-clock
+   * time is still used for `created_at`/`updated_at`, which are AUDIT stamps and must stay
+   * comparable with broker timestamps; only DURATIONS move to the monotonic clock.
+   *
+   * Optional so existing config literals keep compiling; defaults to `performance.now()`.
+   */
+  monotonic?: MonotonicClock;
+  /**
+   * ABSOLUTE end-to-end budget for ONE order mutation, in ms (Defect D).
+   *
+   * Started BEFORE the adapter's own transport pacer, so the pacer wait, the lower Dhan HTTP
+   * pacing queue, the network round trip and the response body all draw on the SAME budget instead
+   * of each layer restarting its own timer. Absent, the transport's own `timeoutMs` applies as
+   * before and the adapter imposes nothing extra.
+   */
+  orderMutationDeadlineMs?: number;
 }
 
 export function dhanAdapterConfigFromBoxConfig(
@@ -125,6 +168,9 @@ export function dhanAdapterConfigFromBoxConfig(
     staticIpReady: () => boolean;
     dhanClientId: () => string;
     identify: (token: number) => { segment: DhanExchangeSegment; securityId: number } | null;
+    timing?: ExecutionTimingRecorder;
+    /** The shared, application-owned account order budget (Task 8). */
+    rateBudget?: RateBudgetLedger;
   },
 ): DhanAdapterConfig {
   return {
@@ -134,6 +180,7 @@ export function dhanAdapterConfigFromBoxConfig(
     workingTimeoutMs: cfg.liveWorkingTimeoutMs,
     partialTimeoutMs: cfg.livePartialTimeoutMs,
     cancelTimeoutMs: cfg.liveCancelTimeoutMs,
+    orderMutationDeadlineMs: cfg.liveOrderMutationDeadlineMs,
     brokerMinIntervalMs: cfg.liveBrokerMinIntervalMs,
     pacing: resolveBrokerPacing("dhan", cfg.liveBrokerMinIntervalMs, cfg.liveBrokerOrderMinIntervalMs),
     maxModifications: cfg.liveMaxModifications,
@@ -218,6 +265,11 @@ function parseDhanTime(value: string | null | undefined, fallback: number): numb
   return Number.isFinite(withZone) ? withZone : fallback;
 }
 
+/** Map the broker-metered endpoint class onto the per-second pacing bucket. */
+function dhanPacingClassFor(klass: BrokerEndpointClass): BrokerPacingClass {
+  return klass === "data_read" ? "general" : "order_mutation";
+}
+
 export class DhanBrokerAdapter implements BrokerAdapter {
   readonly mode = "live" as const;
   /** Session-local identity maps, exactly as the Kite adapter keeps. */
@@ -294,8 +346,243 @@ export class DhanBrokerAdapter implements BrokerAdapter {
    * paces every HTTP call at `DHAN_MIN_INTERVAL_MS` inside src/brokers/dhan/http.ts, which is
    * why the Dhan order floor in brokerPacing.ts matches that value rather than going lower.
    */
-  private call<T>(op: () => Promise<T>, klass: BrokerPacingClass = "general"): Promise<T> {
-    return this.pacer.run(op, klass);
+  /**
+   * Resolvers waiting for the NEXT observation of one order, keyed by client order id.
+   *
+   * This is what makes an order-update stream more than a status label. `waitForResolution` used to
+   * sleep a fixed `brokerMinIntervalMs` between REST polls, so a fill was seen at best one poll
+   * interval after it happened, no matter how promptly the broker told us. A stream event now
+   * resolves the pending sleep immediately, so the waiter wakes on the EVENT.
+   *
+   * Bounded by construction: one entry per in-flight order, deleted the moment it is woken.
+   */
+  private readonly orderWaiters = new Map<string, Set<() => void>>();
+  /** Client order ids observed while no waiter was parked; the next wait consumes the latch. */
+  private readonly pendingObservation = new Set<string>();
+  /** Stream observations applied to this session, for status/diagnostics. */
+  private streamObservationsApplied = 0;
+  private streamObservationsIgnored = 0;
+
+  /**
+   * Sleep up to `ms`, but wake EARLY if an external observation of this order arrives.
+   *
+   * Never longer than the poll interval, so REST remains a controlled fallback: if the stream is
+   * dead, silent, or lying by omission, the loop still polls on its own cadence. The stream can
+   * only ever make the answer arrive sooner.
+   */
+  private async sleepOrObservation(ms: number, clientOrderId: string): Promise<void> {
+    // Edge-not-lost: consume a latched observation that arrived before this wait was entered.
+    if (this.pendingObservation.delete(clientOrderId)) return;
+    let waiters = this.orderWaiters.get(clientOrderId);
+    if (!waiters) {
+      waiters = new Set();
+      this.orderWaiters.set(clientOrderId, waiters);
+    }
+    let wake: () => void = () => {};
+    const woken = new Promise<void>((resolve) => { wake = resolve; });
+    waiters.add(wake);
+    try {
+      await Promise.race([sleep(ms), woken]);
+    } finally {
+      waiters.delete(wake);
+      if (waiters.size === 0) this.orderWaiters.delete(clientOrderId);
+    }
+  }
+
+  /** Wake every waiter on one order. Called after an external observation is merged. */
+  private wakeOrderWaiters(clientOrderId: string): void {
+    const waiters = this.orderWaiters.get(clientOrderId);
+    if (!waiters || waiters.size === 0) {
+      // Latch the edge for the next wait: the observation already updated the session snapshot.
+      this.pendingObservation.add(clientOrderId);
+      return;
+    }
+    for (const wake of [...waiters]) {
+      try { wake(); } catch { /* a waiter must never break the ingestion path */ }
+    }
+  }
+
+  /**
+   * APPLY ONE EXTERNAL ORDER OBSERVATION (a websocket order update).
+   *
+   * Routed through the SAME evidence validation as a REST snapshot
+   * (brokerExecutionEvidence.ts): a stream is a FASTER source, never a more trusted one. So a
+   * stream event with a terminal-looking status but no cumulative quantity cannot terminalise an
+   * order, and an unpriced fill is recorded as unpriced rather than as free.
+   *
+   * MONOTONIC. A cumulative quantity below what is already proven is discarded outright — out-of-
+   * order stream delivery and overlapping REST reads are normal, and neither may rewind exposure.
+   *
+   * PROMPT. The merged snapshot is stored and every waiter on this order is woken, so
+   * `waitForResolution` returns on the event instead of on the next poll interval.
+   */
+  applyOrderUpdate(update: ExternalOrderUpdate): BrokerOrder | undefined {
+    const known = this.orders.get(update.clientOrderId);
+    if (!known) {
+      this.streamObservationsIgnored++;
+      return undefined;
+    }
+    const observedQuantity = readNonNegativeInteger(update.cumulativeQty);
+    const observedPrice = readPositivePrice(update.averagePrice ?? null);
+    const label = String(update.rawStatus ?? "");
+    const claimedState = dhanOrderState(label, observedQuantity.value ?? known.filled_quantity, known.quantity);
+    const verdict = evaluateExecutionEvidence({
+      statusLabel: label,
+      claimedState,
+      requestedQuantity: known.quantity,
+      priorFilled: known.filled_quantity,
+      quantity: observedQuantity,
+      price: observedPrice,
+    });
+
+    // A regression carries no new information. Ignoring it (rather than merging it) is what keeps
+    // a delayed lower cumulative quantity from touching either the snapshot or the waiters.
+    const regressed = observedQuantity.present && (observedQuantity.value ?? 0) < known.filled_quantity;
+
+    const merged: BrokerOrder = cloneOrder(known);
+    merged.filled_quantity = verdict.filledQuantity;
+    merged.pending_quantity = Math.max(0, known.quantity - verdict.filledQuantity);
+    if (verdict.averagePrice !== null) merged.average_price = verdict.averagePrice;
+    merged.execution_evidence = verdict.quality;
+    if (update.brokerOrderId) {
+      merged.broker_order_id = update.brokerOrderId;
+      this.clientByBroker.set(update.brokerOrderId, update.clientOrderId);
+    }
+    // The state is re-derived from the ACCEPTED quantity, exactly as `project()` does, so a
+    // contradictory label (TRADED with a short fill, CANCELLED with a fill) resolves the same way
+    // whichever source reported it.
+    merged.state = verdict.sufficient
+      ? dhanOrderState(label, verdict.filledQuantity, known.quantity)
+      : known.state;
+    if (!verdict.sufficient) merged.reject_reason = verdict.detail;
+    // NEVER regress a terminal state to a working one on a late event.
+    if (isBrokerOrderTerminal(known.state) && !isBrokerOrderTerminal(merged.state)) {
+      merged.state = known.state;
+    }
+    if (verdict.filledQuantity > 0 && merged.fills.length === 0) {
+      merged.fills = [{
+        fill_id: `dhan:stream:${merged.broker_order_id ?? update.clientOrderId}:${verdict.filledQuantity}:${verdict.averagePrice ?? "unpriced"}`,
+        quantity: verdict.filledQuantity,
+        price: verdict.averagePrice,
+        at: update.observedAtWall ?? Date.now(),
+      }];
+    }
+    merged.updated_at = update.observedAtWall ?? Date.now();
+
+    if (regressed) {
+      this.streamObservationsIgnored++;
+      return cloneOrder(known);
+    }
+    this.orders.set(update.clientOrderId, merged);
+    this.streamObservationsApplied++;
+    this.markFill(update.clientOrderId, merged.filled_quantity);
+    this.wakeOrderWaiters(update.clientOrderId);
+    return cloneOrder(merged);
+  }
+
+  /** How many external (stream) observations this session applied vs ignored. */
+  streamObservationStats(): { applied: number; ignored: number } {
+    return { applied: this.streamObservationsApplied, ignored: this.streamObservationsIgnored };
+  }
+
+  /** The MONOTONIC clock in force for elapsed/deadline measurement (Defect D). */
+  private mono(): number {
+    return (this.cfg.monotonic ?? monotonicNow)();
+  }
+
+  /**
+   * An absolute end-to-end budget for one order mutation, or undefined when none is configured.
+   *
+   * Created by the CALLER before `this.call(...)`, so the adapter's own transport-pacer wait is
+   * inside the budget rather than beside it.
+   */
+  private mutationDeadline(): Deadline | undefined {
+    const budget = this.cfg.orderMutationDeadlineMs;
+    if (budget === undefined || !Number.isFinite(budget) || budget <= 0) return undefined;
+    return Deadline.in(budget, () => this.mono());
+  }
+
+  /**
+   * Paced transport. `klass` is the broker-metered endpoint class; it selects both the pacing
+   * bucket and — for order endpoints — the shared {@link RateBudgetLedger}. The PLACEMENT check
+   * rides the pre-wire boundary (`beforeSend`), not here. RECOVERY endpoints (cancel/modify) have
+   * no such hook, so they are gated here immediately before the transport call.
+   */
+  private call<T>(op: () => Promise<T>, klass: BrokerEndpointClass = "data_read"): Promise<T> {
+    if (klass === "order_cancel" || klass === "order_modify") {
+      this.reserveRecoveryBudgetOrThrow(klass);
+    }
+    return this.pacer.run(op, dhanPacingClassFor(klass));
+  }
+
+  /** Fast pre-pacing refusal: throw immediately if the shared placement budget is already spent. */
+  private refusePlacementIfBudgetExhausted(clientOrderId: string): void {
+    const ledger = this.cfg.rateBudget;
+    if (!ledger) return;
+    const decision = ledger.check("order_place", this.mono());
+    if (!decision.allowed) {
+      ledger.noteRefusal("order_place");
+      throw new BrokerPreSubmitRefusedError(
+        clientOrderId,
+        "pre_post",
+        true,
+        `order budget exhausted: ${decision.reason}`,
+      );
+    }
+  }
+
+  /** The send-boundary placement guard: check+record, throwing a proven no-POST when refused. */
+  private placementBudgetGuard(clientOrderId: string): () => void {
+    const ledger = this.cfg.rateBudget;
+    if (!ledger) return () => undefined;
+    return () => {
+      const now = this.mono();
+      const decision = ledger.check("order_place", now);
+      if (!decision.allowed) {
+        ledger.noteRefusal("order_place");
+        throw new BrokerPreSubmitRefusedError(
+          clientOrderId,
+          "pre_post",
+          true,
+          `order budget exhausted: ${decision.reason}`,
+        );
+      }
+      ledger.record("order_place", now);
+    };
+  }
+
+  /** Gate a recovery mutation (cancel/modify) against the reserve; throw before any wire use. */
+  private reserveRecoveryBudgetOrThrow(klass: "order_cancel" | "order_modify"): void {
+    const ledger = this.cfg.rateBudget;
+    if (!ledger) return;
+    const now = this.mono();
+    const decision = ledger.check(klass, now);
+    if (!decision.allowed) {
+      ledger.noteRefusal(klass);
+      throw new BrokerPreSubmitRefusedError(
+        "recovery",
+        "pre_post",
+        false,
+        `recovery budget unavailable: ${decision.reason}`,
+      );
+    }
+    ledger.record(klass, now);
+  }
+
+  /** Feed a 429 to the shared budget as a cooldown WITHOUT ever resending. */
+  private penalizeIfRateLimited(error: unknown): void {
+    const ledger = this.cfg.rateBudget;
+    if (!ledger) return;
+    if (error instanceof DhanRateLimitError) {
+      const retryAfterMs =
+        typeof error.retryAfterSec === "number" && Number.isFinite(error.retryAfterSec) && error.retryAfterSec > 0
+          ? error.retryAfterSec * 1_000
+          : null;
+      ledger.penalize(this.mono(), retryAfterMs);
+      return;
+    }
+    const status = error instanceof DhanError ? error.status : null;
+    if (isRateLimited(status)) ledger.penalize(this.mono(), null);
   }
 
   /** Attach the deterministic correlation id. Pure — no transport. */
@@ -340,9 +627,23 @@ export class DhanBrokerAdapter implements BrokerAdapter {
     // the POST leaves for the network; a thrown BrokerPreSubmitRefusedError proves it never did.
     const beforeSend = (): void => {
       beforePost?.();
+      // ORDER BUDGET (Task 8): authoritative check+record at the FINAL pre-wire instant. An
+      // over-budget placement throws BrokerPreSubmitRefusedError here — before any HTTP request —
+      // so budget is consumed only for a request that actually leaves. No-op without a ledger.
+      placementGuard();
       this.mark(req.client_order_id, "http_request_started");
     };
+    // ABSOLUTE END-TO-END BUDGET, started BEFORE the transport pacer (Defect D). The pacer wait,
+    // the lower HTTP pacing queue, the network round trip and the body read share this one budget;
+    // an expiry while queued releases the caller promptly and provably transmits nothing.
+    const mutationDeadline = this.mutationDeadline();
+    // The send-boundary placement guard, resolved once so the SAME closure runs at the boundary.
+    const placementGuard = this.placementBudgetGuard(req.client_order_id);
     try {
+      // FAST REFUSAL: refuse an already-exhausted budget before the pacing wait, so an over-budget
+      // entry does not sit through a pacing interval only to be refused at the wire. Caught below
+      // and cleaned up like any pre-submit refusal.
+      this.refusePlacementIfBudgetExhausted(req.client_order_id);
       placed = await this.call(() => {
         return this.client.placeOrder({
           dhanClientId: this.cfg.dhanClientId(),
@@ -356,8 +657,8 @@ export class DhanBrokerAdapter implements BrokerAdapter {
           securityId: String(identity.securityId),
           quantity: req.quantity,
           price: req.pricing.limit_price,
-        }, { beforeSend });
-      }, "order_mutation");
+        }, { beforeSend, ...(mutationDeadline ? { deadline: mutationDeadline } : {}) });
+      }, "order_place");
       this.mark(req.client_order_id, "http_response");
     } catch (err) {
       if (err instanceof BrokerPreSubmitRefusedError) {
@@ -366,9 +667,24 @@ export class DhanBrokerAdapter implements BrokerAdapter {
         this.clientByCorrelation.delete(correlationId);
         throw err;
       }
+      // A 429 feeds the shared budget a cooldown (never a resend). Done before classification so
+      // the cooldown is recorded even on the ambiguous reconcile path below.
+      this.penalizeIfRateLimited(err);
       // Recorded on the failure path too: a timeout's duration is only measurable if the
       // response event is marked whether or not it succeeded.
       this.mark(req.client_order_id, "http_response");
+
+      // PROVEN NO-POST vs AMBIGUITY (Defect D). A deadline that expired while the write sat in a
+      // queue was abandoned INSIDE this process before `fetch` was ever called, so there is
+      // categorically nothing at the broker to reconcile. Treating it as ambiguous would spend a
+      // broker read and a rate-budget slot to discover something already known, and would leave the
+      // attempt quarantined as RECONCILIATION_REQUIRED when it is simply a refusal. The transport
+      // only sets `transmitted: false` when it can prove the wire was never used.
+      if (err instanceof DhanNetworkError && err.transmitted === false) {
+        this.orders.delete(req.client_order_id);
+        this.clientByCorrelation.delete(correlationId);
+        throw new BrokerPreSubmitRefusedError(req.client_order_id, "pre_post", true, err.message);
+      }
       // A DEFINITIVE 4xx (not 429) means Dhan understood and refused.
       if (err instanceof DhanError && err.isDefinitive && !(err instanceof DhanRateLimitError)) {
         order.state = "REJECTED";
@@ -556,7 +872,9 @@ export class DhanBrokerAdapter implements BrokerAdapter {
   /** Poll until terminal, then protectively cancel if the deadline passes. */
   private async waitForResolution(clientOrderId: string, initial: BrokerOrder): Promise<BrokerOrder> {
     let current = initial;
-    const startedAt = Date.now();
+    // MONOTONIC (Defect D): these are DURATIONS, and a wall-clock step must never shorten or
+    // lengthen a deadline that decides whether an order is protectively cancelled.
+    const startedAt = this.mono();
     let firstPartialAt: number | null = current.filled_quantity > 0 ? startedAt : null;
 
     // Hard iteration cap in addition to the wall-clock deadlines. A broker that keeps
@@ -573,20 +891,32 @@ export class DhanBrokerAdapter implements BrokerAdapter {
         // Out of budget without a terminal answer: quarantine rather than guess.
         return this.protectiveCancelAndConfirm(clientOrderId, current);
       }
-      const elapsed = Date.now() - startedAt;
+      const elapsed = this.mono() - startedAt;
       const ackDeadlineHit = current.state === "ACKNOWLEDGED" && elapsed > this.cfg.ackTimeoutMs;
       const workingDeadlineHit = elapsed > this.cfg.workingTimeoutMs;
       const partialDeadlineHit =
-        firstPartialAt !== null && Date.now() - firstPartialAt > this.cfg.partialTimeoutMs;
+        firstPartialAt !== null && this.mono() - firstPartialAt > this.cfg.partialTimeoutMs;
 
       if (ackDeadlineHit || workingDeadlineHit || partialDeadlineHit) {
         return this.protectiveCancelAndConfirm(clientOrderId, current);
       }
-      await sleep(this.cfg.brokerMinIntervalMs);
+      // WAKE ON THE EVENT, fall back on the interval. A stream observation resolves this sleep
+      // immediately; with no stream (or a silent one) the poll cadence is exactly as before, so
+      // REST stays a controlled fallback rather than being replaced.
+      await this.sleepOrObservation(this.cfg.brokerMinIntervalMs, clientOrderId);
+      // A stream observation may have already updated this order's session snapshot (and woken us)
+      // through applyOrderUpdate. That snapshot is authoritative and cumulative-monotonic, so adopt
+      // it FIRST; if it is now terminal the fill was seen on the event, and a REST re-poll would
+      // only risk overwriting a fresh terminal state with a staler snapshot — so skip it.
+      const observed = this.orders.get(clientOrderId);
+      if (observed && observed !== current) {
+        current = observed;
+        if (isBrokerOrderTerminal(current.state)) break;
+      }
       const refreshed = await this.refresh(clientOrderId);
       if (!refreshed) break;
       current = refreshed;
-      if (current.filled_quantity > 0 && firstPartialAt === null) firstPartialAt = Date.now();
+      if (current.filled_quantity > 0 && firstPartialAt === null) firstPartialAt = this.mono();
     }
     return cloneOrder(current);
   }
@@ -612,24 +942,35 @@ export class DhanBrokerAdapter implements BrokerAdapter {
       // moment we commit to cancelling.
       this.mark(clientOrderId, "cancel_requested");
       try {
-        await this.call(() => this.client.cancelOrder(order.broker_order_id!), "order_mutation");
+        await this.call(
+          () => this.client.cancelOrder(order.broker_order_id!, {
+            // A protective cancel is bounded by its OWN confirmation window, started here so the
+            // pacer wait counts against it (Defect D).
+            deadline: Deadline.in(this.cfg.cancelTimeoutMs, () => this.mono()),
+          }),
+          "order_cancel",
+        );
         // Dhan accepted the cancel REQUEST. Not a cancellation: the loop below keeps confirming
         // precisely because the order may be filling right now.
         this.mark(clientOrderId, "cancel_acknowledged");
       } catch (err) {
-        // A cancel that fails does not make the order gone; keep confirming.
+        // A cancel that fails does not make the order gone; keep confirming. A 429 still feeds the
+        // shared budget a cooldown so we do not send more requests into a throttle.
+        this.penalizeIfRateLimited(err);
         console.warn(`[Dhan] protective cancel failed for ${clientOrderId}:`, err);
       }
     }
-    const deadline = Date.now() + this.cfg.cancelTimeoutMs;
+    // MONOTONIC (Defect D). A protective cancel's confirmation window is a safety deadline.
+    const cancelDeadlineAt = this.mono() + this.cfg.cancelTimeoutMs;
     const maxConfirmPolls = Math.max(
       5,
       Math.ceil(this.cfg.cancelTimeoutMs / Math.max(1, this.cfg.brokerMinIntervalMs)) + 5,
     );
     let confirmPolls = 0;
-    while (Date.now() < deadline && confirmPolls < maxConfirmPolls) {
+    while (this.mono() < cancelDeadlineAt && confirmPolls < maxConfirmPolls) {
       confirmPolls++;
-      await sleep(this.cfg.brokerMinIntervalMs);
+      // A cancel races a fill; a stream event telling us which won must not wait out a poll.
+      await this.sleepOrObservation(this.cfg.brokerMinIntervalMs, clientOrderId);
       const refreshed = await this.refresh(clientOrderId);
       if (refreshed && isBrokerOrderTerminal(refreshed.state)) return cloneOrder(refreshed);
     }
@@ -717,7 +1058,18 @@ export class DhanBrokerAdapter implements BrokerAdapter {
     }
   }
 
-  /** Project a Dhan order (+ fills) onto the broker-neutral shape. */
+  /**
+   * Project a Dhan order (+ fills) onto the broker-neutral shape.
+   *
+   * THE SINGLE FUNNEL for EVERY observation path — placement verification, REST polling,
+   * correlation lookup, `listOrders`, restart adoption and (once consumed) websocket updates all
+   * arrive here. So this is where execution evidence is validated, exactly once, for all of them.
+   *
+   * A MISSING cumulative quantity is not a zero (see brokerExecutionEvidence.ts). A terminal-looking
+   * label that carries none cannot freeze accounting: it is projected as RECONCILIATION_REQUIRED
+   * with the reason named, carrying forward the highest quantity already proven, so the durable
+   * reconciler resolves it instead of a hardcoded zero doing so silently.
+   */
   private project(
     template: Pick<
       BrokerOrder | BrokerOrderRequest,
@@ -729,11 +1081,34 @@ export class DhanBrokerAdapter implements BrokerAdapter {
   ): BrokerOrder {
     const now = Date.now();
     const quantity = template.quantity;
-    const filled = numberOr(remote.filledQty, 0);
+    const priorFilled = "filled_quantity" in template && typeof template.filled_quantity === "number"
+      ? template.filled_quantity
+      : 0;
+
+    const observedQuantity = readCumulativeQuantity(remote);
+    const observedPrice = readTradedPrice(remote);
+    // The label is mapped using the OBSERVED quantity when there is one, and the prior proven
+    // quantity otherwise — never a fabricated zero, which is what turned TRADED into COMPLETE.
+    const claimedState = dhanOrderState(remote.orderStatus, observedQuantity.value ?? priorFilled, quantity);
+    const verdict = evaluateExecutionEvidence({
+      statusLabel: String(remote.orderStatus ?? ""),
+      claimedState,
+      requestedQuantity: quantity,
+      priorFilled,
+      quantity: observedQuantity,
+      price: observedPrice,
+    });
+
+    const filled = verdict.filledQuantity;
+    // An insufficiently-evidenced terminal claim stays UNCERTAIN. Re-deriving the state from the
+    // accepted quantity also reconciles contradictions (a "CANCELLED with a nonzero fill" surfaces
+    // as a real partial; a "TRADED with a short fill" as PARTIALLY_FILLED, never COMPLETE).
+    const state: BrokerOrderState = verdict.sufficient
+      ? dhanOrderState(remote.orderStatus, filled, quantity)
+      : "RECONCILIATION_REQUIRED";
     const remaining = remote.remainingQuantity !== undefined
       ? numberOr(remote.remainingQuantity, Math.max(0, quantity - filled))
       : Math.max(0, quantity - filled);
-    const state = dhanOrderState(remote.orderStatus, filled, quantity);
     const rejected = state === "REJECTED";
 
     return {
@@ -755,32 +1130,38 @@ export class DhanBrokerAdapter implements BrokerAdapter {
       state,
       filled_quantity: filled,
       pending_quantity: remaining,
-      average_price: numberOrNull(remote.averageTradedPrice),
+      average_price: verdict.averagePrice,
       fills: fills.length > 0
-        ? fills.map((t, index) => ({
-            fill_id: t.exchangeTradeId
-              ? `dhan:${t.exchangeTradeId}`
-              : `dhan:${remote.orderId}:${index}:${t.tradedQuantity}:${t.tradedPrice}`,
-            quantity: numberOr(t.tradedQuantity, 0),
-            price: numberOr(t.tradedPrice, 0),
-            at: parseDhanTime(t.exchangeTime ?? t.updateTime ?? t.createTime, now),
-          }))
-        // No trade-book detail: synthesize ONE aggregate fill so exposure is still
-        // exact, matching how the Kite adapter behaves.
+        ? fills.map((t, index) => {
+            const tradePrice = readPositivePrice(t.tradedPrice);
+            return {
+              fill_id: t.exchangeTradeId
+                ? `dhan:${t.exchangeTradeId}`
+                : `dhan:${remote.orderId}:${index}:${t.tradedQuantity}:${t.tradedPrice}`,
+              quantity: numberOr(t.tradedQuantity, 0),
+              // An unpublished trade price is NULL, never zero. Zero would be fabricated P&L.
+              price: tradePrice.value,
+              at: parseDhanTime(t.exchangeTime ?? t.updateTime ?? t.createTime, now),
+            };
+          })
+        // No trade-book detail: synthesize ONE aggregate fill so exposure is still exact, matching
+        // how the Kite adapter behaves. Its price is the OBSERVED average or null — the old code
+        // used `numberOr(..., 0)` here, inventing a zero-cost execution.
         : filled > 0
           ? [{
-              fill_id: `dhan:${remote.orderId}:${filled}:${numberOr(remote.averageTradedPrice, 0)}`,
+              fill_id: `dhan:${remote.orderId}:${filled}:${verdict.averagePrice ?? "unpriced"}`,
               quantity: filled,
-              price: numberOr(remote.averageTradedPrice, 0),
+              price: verdict.averagePrice,
               at: parseDhanTime(remote.exchangeTime ?? remote.updateTime, now),
             }]
           : [],
+      execution_evidence: verdict.quality,
       reject_family: rejected
         ? classifyDhanReject(remote.omsErrorCode ?? null, remote.omsErrorDescription ?? null)
         : null,
       reject_reason: rejected
         ? remote.omsErrorDescription ?? remote.omsErrorCode ?? "Dhan rejected the order."
-        : null,
+        : verdict.detail,
       created_at: parseDhanTime(remote.createTime, now),
       updated_at: parseDhanTime(remote.updateTime ?? remote.exchangeTime, now),
     };
@@ -828,7 +1209,7 @@ export class DhanBrokerAdapter implements BrokerAdapter {
         ...(request.quantity !== undefined ? { quantity: request.quantity } : {}),
         validity: "DAY",
       }),
-      "order_mutation",
+      "order_modify",
     );
     known.pricing = { ...known.pricing, limit_price: request.limit_price };
     known.limit_price = request.limit_price;
@@ -1022,10 +1403,29 @@ function fromRequest(req: BrokerOrderRequest, now: number, correlationId: string
   };
 }
 
+/**
+ * An order this session did not create, surfaced with an explicit ORPHAN identity.
+ *
+ * Subject to the SAME evidence rules as `project()`: an orphan whose terminal-looking label carries
+ * no cumulative quantity is surfaced as RECONCILIATION_REQUIRED, not as a fully-executed or flat
+ * order. Reconciliation after a restart is exactly when a fabricated zero does the most damage,
+ * because there is no prior session state to contradict it.
+ */
 function orphanOrder(order: DhanOrder): BrokerOrder {
   const now = Date.now();
   const quantity = numberOr(order.quantity, 0);
-  const filled = numberOr(order.filledQty, 0);
+  const observedQuantity = readCumulativeQuantity(order);
+  const observedPrice = readTradedPrice(order);
+  const claimedState = dhanOrderState(order.orderStatus, observedQuantity.value ?? 0, quantity);
+  const verdict = evaluateExecutionEvidence({
+    statusLabel: String(order.orderStatus ?? ""),
+    claimedState,
+    requestedQuantity: quantity,
+    priorFilled: 0,
+    quantity: observedQuantity,
+    price: observedPrice,
+  });
+  const filled = verdict.filledQuantity;
   return {
     client_order_id: `DHAN_ORPHAN:${order.orderId}`,
     broker_order_id: order.orderId,
@@ -1048,13 +1448,16 @@ function orphanOrder(order: DhanOrder): BrokerOrder {
       limit_price: numberOr(order.price, 0) || 0.05,
     },
     limit_price: numberOr(order.price, 0),
-    state: dhanOrderState(order.orderStatus, filled, quantity),
+    state: verdict.sufficient
+      ? dhanOrderState(order.orderStatus, filled, quantity)
+      : "RECONCILIATION_REQUIRED",
     filled_quantity: filled,
     pending_quantity: Math.max(0, quantity - filled),
-    average_price: numberOrNull(order.averageTradedPrice),
+    average_price: verdict.averagePrice,
     fills: [],
+    execution_evidence: verdict.quality,
     reject_family: null,
-    reject_reason: null,
+    reject_reason: verdict.detail,
     created_at: parseDhanTime(order.createTime, now),
     updated_at: parseDhanTime(order.updateTime, now),
   };

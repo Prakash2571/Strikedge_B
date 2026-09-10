@@ -36,6 +36,7 @@ const allow = {
   entryAdmissible: true,
   attemptAborted: null,
   hedgeCoverageGap: null,
+  crossLegCoherenceGap: null,
 };
 
 /* ── the pure decision ────────────────────────────────────────────────────────────────── */
@@ -56,6 +57,10 @@ test("each condition refuses with its own distinct cause", () => {
     // reason (here: a hedge that came back CANCELLED with zero fills — the exact case the old
     // failure-signal contract let through as a naked SELL).
     [{ hedgeCoverageGap: "hedge k2_ce not proven covered: confirmed 0 of required 75" }, "hedge_coverage_unproven"],
+    // DEFECT C: the four books stopped being a usable simultaneous snapshot while the leg waited in
+    // the queue and adapter pacing. Per-leg freshness cannot see this — each book is young, they are
+    // young at four different instants.
+    [{ crossLegCoherenceGap: "[receive_dispersion] receive-time dispersion 1000ms exceeds 500ms" }, "cross_leg_incoherent"],
     [{ entryAdmissible: false }, "entry_not_admissible"],
   ];
   for (const [override, refusal] of cases) {

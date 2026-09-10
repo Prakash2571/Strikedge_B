@@ -66,6 +66,7 @@ import { ExecutionTimingRecorder } from "./executionTiming.js";
 import { CalibrationPersistenceBuffer } from "./calibrationPersistence.js";
 import { BrokerTimingStore } from "./brokerTimingStore.js";
 import { ExecutionOutcomeStore } from "./executionOutcomes.js";
+import { ExecutionFunnel, type ZeroPostRefusalReason } from "./executionFunnel.js";
 import { ExecutionFaultLog } from "./executionFaults.js";
 import { QueueCalibrationEstimator } from "./queueCalibration.js";
 import { computeExecutionShortfall, type ExecutionShortfall } from "./executionShortfall.js";
@@ -122,8 +123,11 @@ import { BoxPositionMonitor } from "./positionMonitor.js";
 import { BoxQuoteStore, SpotStore } from "./quotes.js";
 import { orderStreamStatus } from "./orderStreamStatus.js";
 import type { OrderStreamHealth } from "./orderUpdateProjection.js";
-import { zerodhaOrderStreamEnabledFromEnv } from "../brokers/zerodha/orderUpdates.js";
-import { dhanOrderStreamEnabledFromEnv } from "../brokers/dhan/orderFeed.js";
+import { OrderStreamConsumer } from "./orderStreamConsumer.js";
+import { MarketDataStateMachine, marketDataPermissions, entryPermittedFromStreams, type MarketDataState, type OrderStreamLifecycleState } from "./streamHealthPolicy.js";
+import { StagePipeline } from "./boundedQueue.js";
+import { parseKiteOrderFrame, zerodhaOrderStreamEnabledFromEnv, zerodhaTextFramesConsumed } from "../brokers/zerodha/orderUpdates.js";
+import { dhanOrderStreamEnabledFromEnv, type DhanOrderFeed } from "../brokers/dhan/orderFeed.js";
 import { ensureBoxPersistenceReady } from "./repository.js";
 import {
   appendBoxEvent,
@@ -211,6 +215,7 @@ import {
   type ResidualLegExposure,
 } from "./types.js";
 import type { BoxExecutionFailureReason } from "./types.js";
+import type { BoxEntryOutcomeClass } from "./types.js";
 import { entrySideFor } from "./math.js";
 import { brokerOf } from "../brokers/types.js";
 import { peakConcurrentMargin, usableMarginIntervals } from "./marginReplay.js";
@@ -272,6 +277,22 @@ export interface BoxEngineDeps {
    * is the correct default: no injected adapter means no way to place an order.
    */
   createLiveAdapter?: BoxLiveAdapterFactory;
+  /**
+   * Construct the Dhan DEDICATED order-update feed (wss://api-order-update.dhan.co), bound to the
+   * registry's CURRENT session token/client id. Absent ⇒ no Dhan order stream is available and the
+   * consumer honestly reports the stream disabled while REST polling remains the fill authority.
+   * The registry returns null when Dhan is not the active broker, so an order feed can never
+   * observe a broker the system is not trading.
+   */
+  createDhanOrderFeed?: (handlers: {
+    onObservation: (observation: import("./orderUpdateProjection.js").NormalizedOrderObservation) => void;
+    onConnecting?: () => void;
+    onConnected?: (args: { authorised: boolean; reconnect: boolean }) => void;
+    onDisconnected?: () => void;
+    onSessionLost?: (reason: string) => void;
+    nowMono?: () => number;
+    nowWall?: () => number;
+  }) => DhanOrderFeed | null;
 }
 
 /** Minutes past IST midnight, right now. */
@@ -282,6 +303,36 @@ function istMinutesOfDay(at: number = Date.now()): number {
 
 interface SseClient {
   res: Response;
+}
+
+/**
+ * Map a terminal entry {@link BoxExecutionFailureReason} onto the funnel's low-cardinality
+ * zero-POST refusal vocabulary. Only meaningful for a refusal (submitted === false).
+ */
+function zeroPostReasonFor(reason: BoxExecutionFailureReason | null | undefined): ZeroPostRefusalReason {
+  switch (reason) {
+    case "cross_leg_time_skew":
+      return "coherence";
+    case "box_capital_limit":
+      return "capital";
+    case "missing_book":
+    case "feed_unhealthy":
+      return "depth";
+    case "legging_incomplete":
+      return "deadline";
+    case "underlying_already_active":
+    case "duplicate":
+      return "ownership";
+    case "insufficient_quantity":
+    case "price_moved":
+    case "edge_disappeared":
+    case "below_expected_net_profit":
+    case "market_closed":
+    case "discovery_stopped":
+    case "session_limit_reached":
+    default:
+      return "entry_guard";
+  }
 }
 
 export class BoxEngine {
@@ -334,6 +385,13 @@ export class BoxEngine {
   private readonly calibrationPersistence: CalibrationPersistenceBuffer;
   /** Measured outcome and reject-family rates (Phases 9, 19). */
   private readonly outcomeStore = new ExecutionOutcomeStore();
+  /**
+   * THE EXECUTION FUNNEL (Task 8): outcome counts with EXPLICIT denominators, incremented from
+   * REAL execution events — candidates at the scanner, qualified at the economic gate, the
+   * terminal entry outcome at {@link observeAttempt}, and completed exits at
+   * {@link closePaperTrade}. Pure accounting; it never decides anything. Read-only via getStatus.
+   */
+  private readonly funnel = new ExecutionFunnel();
   /**
    * Bounded store of TECHNICAL entry-pipeline faults, classified into a fixed taxonomy.
    *
@@ -452,6 +510,8 @@ export class BoxEngine {
   /** Cached exchange-hours state, refreshed on the market timer. */
   private marketOpen = false;
   private feedHealthy = false;
+  /** Monotonic reference for the market-watch loop-stall check that feeds the backlog signal. */
+  private marketWatchStallRef: number | null = null;
   /** Raw current-socket arrival clock; intentionally independent of depth books. */
   private lastRawTickAt: number | null = null;
   private feedGeneration = 0;
@@ -518,6 +578,40 @@ export class BoxEngine {
    */
   private liveAdapter: BrokerAdapter | null = null;
   /**
+   * The order-stream consumer for the active broker — the running component that consumes the
+   * order-update stream, owns the single projection of truth, and drives the health state machine.
+   * Null in paper and until live construction. When present it is registered in
+   * {@link orderStreamConsumers} so `orderStreamStatus` reports the REAL wiring, never `not_wired`.
+   */
+  private orderStreamConsumer: OrderStreamConsumer | null = null;
+  /** The Dhan dedicated order-update socket, when Dhan is active and the stream is armed. */
+  private dhanOrderFeed: DhanOrderFeed | null = null;
+  /**
+   * THE DRIVEN MARKET-DATA HEALTH MACHINE (GAP 1).
+   *
+   * Turns the box market-data feed lifecycle into a {@link MarketDataState}. `READY` is
+   * unreachable by socket-open: it requires authentication AND fresh usable depth for EVERY
+   * traded (desired) instrument in the CURRENT generation. Driven from `onTicks` (frame + per-leg
+   * depth), the feed connection listener / `onBoxLaneConnection` (connect/disconnect →
+   * authenticated/disconnected), a feed session loss (`onMarketDataSessionLost` → AUTH_EXPIRED),
+   * and the market-watch timer (`evaluate()` for heartbeat-gap / stale-book / backlog demotion).
+   * Constructed on the monotonic clock so age comparisons never step with an NTP correction.
+   */
+  private readonly marketDataMachine: MarketDataStateMachine;
+  /**
+   * THE BACKPRESSURE PIPELINE (GAP 2).
+   *
+   * Decouples ingestion from processing so a slow stage cannot block order-state processing on the
+   * single event loop. The `order_events` stage is NEVER-DROP: a WebSocket callback ENQUEUES the
+   * raw frame and returns (staying lightweight), and a bounded microtask pump drains it into the
+   * order-stream consumer; under overload it signals the market-data machine's backlog (blocking
+   * NEW ENTRY and prompting reconciliation) while still delivering every event — a missing order
+   * event is never a zero fill. Constructed on the monotonic clock.
+   */
+  private readonly ingestPipeline: StagePipeline;
+  /** True while a pipeline drain is scheduled, so overlapping frames coalesce into one pump. */
+  private ingestPumpScheduled = false;
+  /**
    * The inner (uncoordinated) gateway.
    *
    * Retained only so read-only diagnostics can reach the per-Box capital report, which is computed
@@ -557,6 +651,36 @@ export class BoxEngine {
 
     // ── Calibration infrastructure, built before the simulator so it can consume it ──
     this.executionClock = createExecutionClock();
+    // The market-data health machine reads the MONOTONIC clock so a heartbeat-gap / stale-book
+    // comparison is never corrupted by an NTP step. heartbeatMaxAgeMs mirrors the feed-liveness
+    // bound; bookMaxAgeMs mirrors the per-leg usable-book age the coherence gate already enforces.
+    this.marketDataMachine = new MarketDataStateMachine({
+      enabled: this.cfg.executionMode === "live",
+      now: () => this.executionClock.mono(),
+      heartbeatMaxAgeMs: this.cfg.feedMaxAgeMs,
+      bookMaxAgeMs: this.cfg.quoteMaxAgeMs,
+    });
+    // The backpressure pipeline. The order-event stage is NEVER-DROP: a raw postback frame is
+    // enqueued by the (lightweight) WS callback and drained by a bounded microtask pump into the
+    // order-stream consumer. Capacity is a pressure THRESHOLD, not a cap — the queue holds and
+    // delivers every event, and an overload only raises the backlog signal that blocks new entry.
+    this.ingestPipeline = new StagePipeline({ now: () => this.executionClock.mono() });
+    this.ingestPipeline.addStage<string>({
+      name: "order_events",
+      capacity: this.cfg.orderEventQueuePressureThreshold,
+      overflow: "never-drop",
+      handler: (raw) => this.processOrderEventFrame(raw),
+      onOverload: (info) => {
+        // Record the degraded condition and BLOCK new entry via the market-data backlog signal.
+        // Exposure management (exit/cancel) is unaffected: it does not route through this queue.
+        this.lastError =
+          `order-event ingestion backlog (${info.depth} queued) — new entry paused, reconciling`;
+        this.marketDataMachine.onProcessingBacklog(true);
+        // A backlog means events may be arriving faster than we apply them: reconcile against the
+        // broker so the durable truth is re-established, never inferred from the gap.
+        void this.orderManager?.reconcile().catch(() => undefined);
+      },
+    });
     this.environmentMonitor = new ExecutionEnvironmentMonitor({
       enabled: this.cfg.executionEventLoopMetricsEnabled,
       clock: this.executionClock,
@@ -653,8 +777,60 @@ export class BoxEngine {
       // Re-deriving it from config would usually agree, but "usually" is not a diagnostic: if the
       // adapter ever clamps differently the operator must see the adapter's number, not ours.
       this.liveAdapter = adapter;
+
+      // ── ORDER-STREAM CONSUMER: the running component that consumes the order-update stream ──
+      // Constructed HERE, in production, bound to the live adapter and the active account, so the
+      // stream is not a disconnected helper: a stream event routes through the single projection
+      // and then the adapter's applyOrderUpdate, which wakes the order's waiters. The env gate only
+      // decides whether the transports are STARTED — the consumer always exists so REST
+      // reconciliation and honest health reporting work even when the stream is off.
+      const activeBroker = this.deps.activeBroker();
+      const streamEnabled =
+        activeBroker === "zerodha" ? zerodhaOrderStreamEnabledFromEnv() : dhanOrderStreamEnabledFromEnv();
+      const consumer = new OrderStreamConsumer({
+        broker: activeBroker,
+        account: () => this.liveBrokerAccount(),
+        adapter,
+        streamEnabled,
+        // Targeted REST reconciliation when a stream event is owned but its quantity is absent, and
+        // for the reconnect gap repair. Delegated to the order manager's REST reconcile, which owns
+        // the adapter's transport and the EXISTING guarded durable writes — no second persistence
+        // path is invented here.
+        restReconcile: async (_clientOrderId) => {
+          try {
+            await this.orderManager?.reconcile();
+            consumer.markSynchronized();
+          } catch {
+            // Fail-open: a reconciliation failure leaves the stream DEGRADED/RECONCILING and REST
+            // polling continues; it must never throw into the ingestion path.
+          }
+        },
+        // POST-RECONNECT GAP-REPAIR SWEEP (D4). Driven by runReconnectReconciliation whenever the
+        // machine is RECONCILING (first connect and every reconnect). It delegates to the SAME
+        // order-manager REST reconcile — the existing guarded durable path — so no second
+        // persistence path is invented. The consumer clears RECONCILING (→ READY) only after this
+        // resolves consistently; a throw leaves it RECONCILING and REST polling continues. The
+        // `_ingestRest` funnel is available for recovered observations that must also land in the
+        // consumer's own projection; the manager's reconcile is the durable authority.
+        reconcileSweep: async (_ingestRest) => {
+          await this.orderManager?.reconcile();
+        },
+        // EXPECTED-IDLE BOUND (D5). A connected order stream that delivers nothing for longer than
+        // this WHILE a working order is outstanding is demoted to DEGRADED. Silence on an account
+        // with nothing working is normal and never demotes. Derived from the live reconcile
+        // interval (the cadence at which REST would otherwise catch a missed fill): if the stream
+        // has said nothing for a working order across a whole reconcile cycle, it is not delivering.
+        expectedIdleMs: Math.max(5_000, this.cfg.liveReconcileIntervalMs),
+        now: () => this.executionClock.wall(),
+      });
+      this.orderStreamConsumer = consumer;
+      // Populate the map READ by orderStreamStatus so the status reflects reality instead of
+      // reporting `not_wired`. The health object is refreshed on every status read below.
+      this.orderStreamConsumers.set(activeBroker, consumer.health());
+
       this.orderManager = new BoxOrderManager({
         adapter,
+        orderStreamConsumer: consumer,
         persistence: boxOrderIntentPersistence,
         limits: orderManagerLimitsFromConfig(this.cfg),
         controls: { entryEnabled: false, liveOrderEnabled: false, emergencyFlatten: false },
@@ -731,8 +907,72 @@ export class BoxEngine {
       broker: () => this.deps.activeBroker(),
       isTokenWarm: (token) => this.tokenFeedGeneration.get(token) === this.feedGeneration,
       feedGeneration: () => this.feedGeneration,
+      // COMBINED READINESS gate for NEW ENTRY (GAP 1 + D1). Live only: the market-data machine is
+      // armed only in live mode (in paper it is DISABLED and this gate would otherwise refuse
+      // everything), so the gate is supplied only when executing live.
+      //
+      // D1 FIX: the entry gate is the INTERSECTION of BOTH transports' NEW-ENTRY permission, via
+      // the shared combinedPermissions table (entryPermittedFromStreams), NOT market data alone.
+      // An enabled-but-unhealthy order stream (CONNECTING/AUTHENTICATING/RECONCILING/DEGRADED/
+      // DISCONNECTED/AUTH_EXPIRED) therefore refuses new entry, because taking fresh exposure on
+      // top of an unreconciled or undelivered fill gap is how one unknown becomes two. A DISABLED
+      // order stream never blocks — REST polling is the documented baseline and the stream is OFF
+      // by default. This is ENTRY-ONLY: protective cancel, exit and attributed reduction are never
+      // routed through here and are never blocked by it, so a degraded stream cannot strand a
+      // live position. The refusal reason names whichever transport blocked.
+      ...(this.cfg.executionMode === "live"
+        ? {
+            marketDataEntryPermitted: () => {
+              const state = this.marketDataState();
+              const orderStream = this.orderStreamState();
+              // Both transports must license NEW ENTRY (intersection). Market data is scored from
+              // its own permission table; the order stream is intersected via the SAME shared
+              // combinedPermissions table (entryPermittedFromStreams), never an ad-hoc boolean.
+              const marketDataOk = marketDataPermissions(state).newEntry;
+              const permitted = entryPermittedFromStreams({ marketData: state, orderStream }).permitted;
+              // Name whichever transport blocked, so the operator sees an actionable reason.
+              const reason = permitted
+                ? state
+                : marketDataOk
+                  ? `order-stream ${orderStream}`
+                  : state;
+              return { permitted, state: reason };
+            },
+          }
+        : {}),
       // So LIVE residual flattening bills its own fees, exactly as the paper path already did.
       chargeTotal: (orders) => this.localCharges.legs(orders).total,
+      // ECONOMIC ADMISSION (Task 8): FRESH funds/margin evidence via SUPPORTED broker facilities.
+      // Both are exposed as missing/stale rather than assumed — a throwing or "unavailable" source
+      // yields null, which the economic gate treats as unusable and (when the control is enabled)
+      // refuses on. Only consulted when a control is enabled, so paper/parity paths are untouched.
+      funds: async () => {
+        const adapter = this.liveAdapter;
+        if (!adapter?.margins) return null;
+        const m = await adapter.margins().catch(() => null);
+        if (!m || typeof m.available !== "number" || !Number.isFinite(m.available)) return null;
+        return { availableRupees: m.available, observedAt: Date.now() };
+      },
+      plannedMargin: async (requests) => {
+        const orders = requests.map((r) => ({
+          exchange: r.exchange,
+          tradingsymbol: r.tradingsymbol,
+          transaction_type: r.side,
+          variety: "regular",
+          product: "NRML",
+          order_type: "LIMIT",
+          quantity: r.quantity,
+          price: r.pricing.limit_price,
+          reference_price: r.pricing.limit_price,
+        }));
+        const basket = await this.deps.margins.basketMargin(orders).catch(() => null);
+        // "unavailable" is an HONEST no-figure, not a zero: surface it as missing so the gate
+        // fails closed rather than admitting on a fabricated ₹0 margin.
+        if (!basket || basket.source === "unavailable" || !Number.isFinite(basket.total)) {
+          return { marginRupees: null, observedAt: Date.now() };
+        }
+        return { marginRupees: basket.total, observedAt: Date.now() };
+      },
     });
     // Contract-level exclusion wraps the gateway rather than living inside it, so it
     // sits ABOVE the paper/live branch: paper gets no shortcut around coordination,
@@ -830,6 +1070,9 @@ export class BoxEngine {
       openPaperTrade: (args) => this.openPaperTrade(args),
       onExecutionAttempt: (candidate, legging, reason, detail, detectedGrossEdge) =>
         void this.persistExecutionAttempt(candidate, legging, reason, detail, detectedGrossEdge),
+      // EXECUTION FUNNEL (Task 8): candidate + qualified stages, from the scanner hot path.
+      onCandidateEvaluated: () => this.funnel.recordCandidateEvaluated(),
+      onQualified: () => this.funnel.recordQualified(),
       onEvent: (event, candidate, evaluation, detail) => {
         void appendBoxEvent({
           event,
@@ -1104,6 +1347,11 @@ export class BoxEngine {
         }
         try {
           const report = await this.orderManager.start();
+          // The order manager's initial reconcile has completed, so the durable nonterminal orders
+          // are known: NOW open the order-stream transports. Starting after reconcile means a
+          // pre-arrival stream event lands in a ledger that was already registered from durable
+          // intent, and the reconnect gap-repair path has a consistent baseline to merge against.
+          this.startOrderStreamTransports();
           if (report.positionMismatches.length > 0 || report.missingAtBroker.length > 0) {
             const mismatchSymbols = new Set(report.positionMismatches.map((item) => item.symbol));
             const affectedIds = new Set(report.affectedTradeIds);
@@ -1722,6 +1970,17 @@ export class BoxEngine {
           );
         }
       }
+      // MARKET-DATA HEALTH: keep the machine's DESIRED set aligned with the real subscription
+      // intent, and force an evaluation so a heartbeat gap or a book that quietly aged past its
+      // bound demotes READY → DEGRADED even though no discrete event would fire. A significant
+      // event-loop stall is a processing backlog: the loop was blocked long enough that queued
+      // market data could not be drained, which must block NEW ENTRY without touching exposure
+      // management.
+      this.marketDataMachine.setDesiredInstruments(this.subscribedOptionTokens);
+      const loopStall = this.environmentMonitor.annotate(this.marketWatchStallRef);
+      this.marketWatchStallRef = this.executionClock.mono();
+      this.marketDataMachine.onProcessingBacklog(loopStall.stalled);
+      this.marketDataMachine.evaluate();
       // Enrich any open position still missing its margin (adopted-on-restart
       // trades, or entries whose margin call had failed).
       this.backfillMissingMargins();
@@ -1878,9 +2137,10 @@ export class BoxEngine {
       );
     }
     if (!this.removeConnectionListener) {
-      this.removeConnectionListener = this.deps.feed.addConnectionListener(() =>
-        this.invalidateFeedGeneration(),
-      );
+      this.removeConnectionListener = this.deps.feed.addConnectionListener((connected) => {
+        this.invalidateFeedGeneration();
+        this.driveMarketDataConnection(connected);
+      });
     }
     if (!this.releaseRetainer) {
       this.releaseRetainer = this.deps.feed.retain();
@@ -1953,9 +2213,18 @@ export class BoxEngine {
     }
     this.metrics.ticks.mark(ticks.length, now);
     const changed = this.quotes.applyTicks(ticks, now);
+    // MARKET-DATA HEALTH: any packet on the current socket is a received frame (transport
+    // liveness); a token that now carries a usable book is FRESH DEPTH for that instrument this
+    // generation. These are fed as DISTINCT facts — a frame never counts as depth — so the machine
+    // cannot read READY off a socket that is alive but publishing no usable book.
+    this.marketDataMachine.onFrame();
     for (const token of changed) {
-      if (this.quotes.get(token)) this.tokenFeedGeneration.set(token, this.feedGeneration);
-      else this.tokenFeedGeneration.delete(token);
+      if (this.quotes.get(token)) {
+        this.tokenFeedGeneration.set(token, this.feedGeneration);
+        this.marketDataMachine.onUsableDepth(token);
+      } else {
+        this.tokenFeedGeneration.delete(token);
+      }
     }
     if (changed.length > 0) {
       this.metrics.wsUpdates.mark(changed.length, now);
@@ -2727,6 +2996,18 @@ export class BoxEngine {
     // rate was permanently zero.
     if (args.legging) this.observeAttempt(args.legging, true, evaluation.gross_edge);
 
+    // EXECUTION FUNNEL (Task 8): a four-leg box opened. Recorded here — not only inside
+    // observeAttempt — because an ATOMIC paper open carries no legging record yet is still a
+    // genuine completed four-leg entry. observeAttempt's funnel recorder deliberately skips the
+    // OPENED class (filledAllFour===true) so this is the SOLE place an open is counted, never twice.
+    try {
+      this.funnel.recordAdmitted();
+      this.funnel.recordSubmitted();
+      this.funnel.recordEntryOutcome({ outcome: "OPENED", submitted: true });
+    } catch (err) {
+      console.warn("[Box] funnel open recording failed (diagnostics only):", err);
+    }
+
     // Margin is captured AFTER the fill is recorded, off the hot path.
     void this.captureMargin(id, candidate.legs, candidate.lot_size, candidate.key, direction);
 
@@ -2932,6 +3213,16 @@ export class BoxEngine {
 
     const closed = await closeBoxTrade(position.id, setFields as never, closeIdempotencyKey);
     if (!closed) return false;
+
+    // EXECUTION FUNNEL (Task 8): a box closed cleanly and is durably FLAT. Its realised net P&L
+    // (after all charges) is booked here so the funnel's economics reflect completed round trips.
+    // A residual left behind means the exposure this trade opened is now resolved.
+    try {
+      this.funnel.recordCompletedExit(netPnl);
+      if (args.residual && args.residual.length > 0) this.funnel.recordUnresolvedExposureResolved();
+    } catch (err) {
+      console.warn("[Box] funnel exit recording failed (diagnostics only):", err);
+    }
 
     if (this.orderManager && this.cfg.executionMode === "live") {
       this.orderManager.recordRealisedPnl(netPnl ?? 0);
@@ -3937,6 +4228,14 @@ export class BoxEngine {
         legs.some((leg) => leg.pricing?.order_type === "PASSIVE_LIMIT") ? "PASSIVE_LIMIT" : "MARKETABLE_LIMIT";
       this.outcomeStore.recordOutcome(broker, profile, outcome);
 
+      // ── EXECUTION FUNNEL (Task 8): the SAME terminal event, counted with explicit denominators.
+      // `submitted` is derived from the outcome CLASS the execution path itself stamped: only a
+      // REFUSED_BEFORE_SUBMIT (or an equivalent no-POST classification) had zero broker POSTs, so
+      // it is the only class that must NOT dilute the broker-facing completion rate. Costs and
+      // residual come straight off the record, so recovery losses and unresolved exposure can
+      // never be hidden from the published rate.
+      this.recordEntryFunnelOutcome(legging, filledAllFour);
+
       // ── queue evidence, per leg ────────────────────────────────────────────────────
       for (const leg of legs) {
         const visible = leg.executable_within_limit_at_arrival;
@@ -4046,6 +4345,55 @@ export class BoxEngine {
     } catch (err) {
       // Observability only; never allow it to disturb a completed execution.
       console.warn("[Box] attempt observation failed (diagnostics only):", err);
+    }
+  }
+
+  /**
+   * Feed the terminal entry outcome to the {@link ExecutionFunnel} (Task 8).
+   *
+   * Pure accounting, wrapped so a counting error can never disturb an execution. `submitted` is
+   * whether ANY real broker POST occurred, derived from the outcome CLASS the execution path
+   * stamped: a REFUSED_BEFORE_SUBMIT (or a fallback classification with zero submitted legs)
+   * reached no broker. Recovery costs and unresolved exposure come straight off the record, so the
+   * displayed success rate is computed from the SAME facts and cannot be improved by hiding them.
+   */
+  private recordEntryFunnelOutcome(legging: PaperLeggingExecutionRecord, filledAllFour: boolean): void {
+    try {
+      // A clean four-leg open is counted by openPaperTrade (the only path that also handles atomic
+      // opens with no legging record). Skipping it here is what keeps a completed entry counted
+      // exactly once across the two callers of observeAttempt.
+      if (filledAllFour) return;
+      const outcomeClass: BoxEntryOutcomeClass =
+        legging.outcome_class ??
+        ((legging.submitted_leg_count ?? 0) > 0
+          ? legging.filled_leg_count > 0
+            ? "PARTIAL_ENTRY_UNWOUND"
+            : "NO_FILL"
+          : "REFUSED_BEFORE_SUBMIT");
+      // A real broker POST happened unless this was a proven pre-submit refusal. The outcome CLASS
+      // is authoritative (the execution path stamps REFUSED_BEFORE_SUBMIT only when nothing
+      // reached the broker); submitted_leg_count is the corroborating fact.
+      const submitted =
+        outcomeClass !== "REFUSED_BEFORE_SUBMIT" || (legging.submitted_leg_count ?? 0) > 0;
+      const recoveryCost =
+        (legging.partial_entry_charges ?? 0) + (legging.unwind_charges ?? 0);
+      const leftUnresolvedExposure = (legging.residual_exposure ?? []).length > 0;
+      // Every admitted attempt is counted; recordEntryOutcome files it into the right denominator.
+      this.funnel.recordAdmitted();
+      if (submitted) this.funnel.recordSubmitted();
+      this.funnel.recordEntryOutcome({
+        outcome: outcomeClass,
+        submitted,
+        // On an abort/partial the realised economics are the (negative) legging net loss; on a
+        // clean OPEN there is no realised entry P&L yet (the exit books it), so leave it null.
+        realisedNetPnl:
+          outcomeClass === "OPENED" ? null : legging.legging_net_loss ?? null,
+        recoveryCost: recoveryCost > 0 ? recoveryCost : null,
+        leftUnresolvedExposure,
+        ...(submitted ? {} : { zeroPostReason: zeroPostReasonFor(legging.failure_reason) }),
+      });
+    } catch (err) {
+      console.warn("[Box] funnel outcome recording failed (diagnostics only):", err);
     }
   }
 
@@ -4870,12 +5218,22 @@ export class BoxEngine {
         brokers: ["zerodha", "dhan"],
         gateEnabled: (broker) =>
           broker === "zerodha" ? zerodhaOrderStreamEnabledFromEnv() : dhanOrderStreamEnabledFromEnv(),
-        // No consumer is registered yet: the parsing/projection layer is implemented and
-        // unit-tested but nothing in the running engine consumes it, so every broker reports
-        // `not_wired` and `rest_polling_only`. Passing a populated map here is the ONLY thing
-        // that will flip that, which keeps the status honest by construction.
-        consumers: this.orderStreamConsumers,
+        // The running consumer's CURRENT health is refreshed into the map on every read (see
+        // refreshOrderStreamConsumerHealth), so this reflects reality: a broker with a live
+        // consumer reports `armed` + its real projection health; a broker with no consumer
+        // (paper, or the inactive broker) honestly reports `not_wired` / `rest_polling_only`.
+        consumers: this.refreshOrderStreamConsumerHealth(),
       }),
+      /**
+       * THE EXECUTION FUNNEL (Task 8) — outcome counts with EXPLICIT denominators, from real
+       * execution events (candidates at the scanner, qualified at the economic gate, terminal
+       * entry outcomes at observeAttempt, completed exits at closePaperTrade). Every ratio carries
+       * its denominator's basis; economic success is reported SEPARATELY from execution
+       * completion; recovery costs and unresolved exposure are counted, never hidden.
+       */
+      execution_funnel: this.funnel.snapshot(),
+      /** The economic-admission decision (five distinct quantities), when a control is enabled. */
+      economic_admission: this.centralGateway?.economicDiagnostics() ?? null,
       database_healthy: isBoxDbEnabled() && (!live || live.health.persistence === "healthy"),
       daily_risk_seed_healthy: live ? live.health.daily_risk_seed === "healthy" : null,
       reconciliation_complete: live?.health.reconciliation_complete ?? true,
@@ -4905,6 +5263,13 @@ export class BoxEngine {
       executable_books: this.quotes.size,
       executable_book_diagnostics: this.quotes.diagnostics(),
       feed_healthy: this.isFeedHealthy(),
+      /**
+       * The DRIVEN market-data health state (GAP 1). Distinct from `feed_healthy` (a raw-tick
+       * liveness boolean): this reports the state machine that gates NEW ENTRY on READY and only
+       * reaches READY with fresh usable depth per traded instrument in the current generation.
+       */
+      market_data_state: this.marketDataState(),
+      market_data_health: this.marketDataMachine.diagnostics(),
       /**
        * APPROXIMATE lag behind the exchange, from Kite's second-resolution
        * exchange_timestamp. Distinct from feed_age_ms (a liveness heartbeat):
@@ -5044,7 +5409,235 @@ export class BoxEngine {
    */
   onBoxLaneConnection(connected: boolean): void {
     this.invalidateFeedGeneration();
+    this.driveMarketDataConnection(connected);
+    this.driveZerodhaOrderStreamConnection(connected);
     if (!connected) this.lastError = "box market-data lane disconnected";
+  }
+
+  /**
+   * Drive the ZERODHA ORDER-STREAM lifecycle from the SAME quote-socket connection (D6).
+   *
+   * Per the verified broker docs (docs/BROKER_STREAM_DOCS.md), Zerodha multiplexes order postbacks
+   * as TEXT frames onto the very quote socket that carries the ticks — there is no separate order
+   * socket to open. So the order-stream health machine must be driven by the quote socket's
+   * lifecycle, exactly as the market-data machine is. Before this the Zerodha consumer only ever
+   * received `onConnecting()` and was stuck at CONNECTING, causing orderStreamStatus to under-claim
+   * the account as rest_polling_only even while postbacks were resolving waiters.
+   *
+   * A `connected=true` edge stands for "socket open AND authorised" (the box lane only opens once
+   * it holds credentials). We therefore walk CONNECTING → socket-open → authenticated, which puts
+   * the machine in RECONCILING, and then DRIVE the post-(re)connect gap-repair sweep (D4) to
+   * completion — only after which the machine reaches READY. A `connected=false` edge is a
+   * disconnect: exposure management and protective cancel continue, new entry stops, and a missing
+   * postback is never read as a zero fill. Inert unless a Zerodha consumer exists and its stream is
+   * armed; Dhan drives its own DEDICATED order socket via createDhanOrderFeed and is untouched here.
+   */
+  private driveZerodhaOrderStreamConnection(connected: boolean): void {
+    const consumer = this.orderStreamConsumer;
+    if (!consumer) return;
+    if (this.deps.activeBroker() !== "zerodha") return;
+    if (!zerodhaOrderStreamEnabledFromEnv()) return;
+    // Delegate the multiplexed-socket semantics to the consumer. In production we do not block the
+    // socket callback on the reconciliation promise; the consumer fails open internally.
+    void consumer.driveQuoteSocketLifecycle(connected);
+  }
+
+  /**
+   * Drive the MARKET-DATA health machine from a coarse feed connection change.
+   *
+   * The feed provider only surfaces a connected boolean (the socket lifecycle lives inside the
+   * lane feed / TickerHub), so a `connected=true` edge stands for "socket open AND authorised" —
+   * the feed only opens once it holds credentials, and both broker feeds guard their handlers on
+   * generation so a superseded socket can never emit. We therefore walk the machine through
+   * CONNECTING → socket-open → authenticated (which advances the generation and drops prior
+   * readiness), leaving it SYNCHRONIZING until fresh depth per instrument arrives via `onTicks`.
+   * A `connected=false` edge is a disconnect: exposure management and protective cancel continue,
+   * new entry stops, and a missing book is never read as a zero. AUTH_EXPIRED is reached only via
+   * {@link onMarketDataSessionLost}, never inferred from a plain disconnect.
+   */
+  private driveMarketDataConnection(connected: boolean): void {
+    if (connected) {
+      this.marketDataMachine.onConnecting();
+      this.marketDataMachine.onSocketOpen();
+      this.marketDataMachine.onAuthenticated();
+      // Publish the CURRENT desired traded instruments so readiness is measured against the real
+      // subscription intent, not a stale set from the previous generation.
+      this.marketDataMachine.setDesiredInstruments(this.subscribedOptionTokens);
+    } else {
+      this.marketDataMachine.onDisconnected();
+    }
+  }
+
+  /**
+   * The market-data feed reported a session/token rejection (a dead or expired token).
+   *
+   * Distinct from a transient disconnect: reconnecting with a rejected token is pointless and the
+   * broker will refuse everything but a cancel, so the machine goes AUTH_EXPIRED and NO data event
+   * can revive it. Wired to the lane feed's `onDead`/`onSessionLost` callback by the registry.
+   */
+  onMarketDataSessionLost(reason: string): void {
+    this.marketDataMachine.onSessionLost();
+    this.lastError = reason;
+  }
+
+  /** The current driven market-data health state (GAP 1). For status and the entry gate. */
+  marketDataState(): MarketDataState {
+    // Force the age-based demotions no discrete event would trigger (a heartbeat gap or a book
+    // that quietly aged past its bound), then report.
+    return this.marketDataMachine.evaluate();
+  }
+
+  /**
+   * The current driven ORDER-STREAM lifecycle state (D1). For status and the combined entry gate.
+   *
+   * When no consumer exists (paper deployments) the order stream is DISABLED, which the
+   * combinedPermissions table treats as "does not block" — REST polling is the baseline. When a
+   * consumer exists, this first drives the idleness clock (D5) so a connected-but-not-delivering
+   * stream is demoted to DEGRADED before the gate reads it, then reports the machine's state.
+   */
+  orderStreamState(): OrderStreamLifecycleState {
+    const consumer = this.orderStreamConsumer;
+    if (!consumer) return "DISABLED";
+    consumer.evaluateIdle(this.executionClock.wall());
+    return consumer.lifecycleState();
+  }
+
+  /**
+   * Refresh the running consumer's CURRENT health into the status map and return it.
+   *
+   * The map is what `orderStreamStatus` reads. Snapshotting the live health here — rather than at
+   * construction — is what makes the status track reality: a stream that has gone DOWN, or a
+   * reconnect that is still RECONCILING, is reported as it actually is, not as it was when the
+   * consumer was built.
+   */
+  private refreshOrderStreamConsumerHealth(): ReadonlyMap<BrokerId, OrderStreamHealth> {
+    const consumer = this.orderStreamConsumer;
+    if (consumer) this.orderStreamConsumers.set(this.deps.activeBroker(), consumer.health());
+    return this.orderStreamConsumers;
+  }
+
+  /**
+   * A Kite order-update TEXT frame arrived on the box lane's quote socket.
+   *
+   * PRODUCTION WIRING for the Zerodha fast fill path. The frame is parsed by `parseKiteOrderFrame`
+   * and, when it is an order postback, routed into the order-stream consumer's single projection
+   * and thence the live adapter's `applyOrderUpdate` (which wakes the order's waiter). Error/message
+   * frames and unparseable input are ignored — a bad postback must never disturb the market-data
+   * socket that carries the ticks the whole strategy depends on.
+   *
+   * D2 — THE FLAG GATES THE OBSERVATION PATH, NOT A LABEL. When `ZERODHA_ORDER_STREAM_ENABLED` is
+   * unset (the safe default), the frame is DROPPED HERE, before it is parsed or enqueued: no
+   * postback is consumed, no order waiter is ever resolved by the stream, and fills are observed by
+   * REST polling only — exactly what `orderStreamStatus` reports as the mechanism in force. Arming
+   * the flag turns the observation path on; disarming it turns the path off, not just the label.
+   * Inert unless a consumer exists AND the Zerodha stream is armed.
+   */
+  ingestBoxLaneOrderText(raw: string): void {
+    if (!this.orderStreamConsumer) return;
+    // OBSERVATION-PATH GATE (D2): unless the flag is armed, Zerodha postbacks are NOT consumed —
+    // they are discarded here (as ticker.ts did before this path existed) and REST polling remains
+    // the sole fill-observation mechanism. This is what makes the flag control the capability, not
+    // merely relabel it.
+    if (!zerodhaTextFramesConsumed()) return;
+    // KEEP THE WS CALLBACK LIGHTWEIGHT: enqueue the raw frame and return. Parsing and ingestion
+    // happen off the socket callback in a bounded microtask pump, so a slow projection/analytics
+    // stage can never block the socket that also carries the market-data ticks. The order-event
+    // queue is NEVER-DROP, so a burst is retained and delivered, never silently discarded.
+    this.ingestPipeline.enqueue("order_events", raw, "order_events");
+    this.scheduleIngestPump();
+  }
+
+  /** Parse + ingest ONE order-event frame. Runs in the drain pump, never inside the WS callback. */
+  private processOrderEventFrame(raw: string): void {
+    const consumer = this.orderStreamConsumer;
+    if (!consumer) return;
+    const frame = parseKiteOrderFrame(raw);
+    if (frame.type === "order" && frame.observation) {
+      consumer.ingestStreamObservation(frame.observation);
+    }
+    // A `message`/`error`/`unknown` frame carries no fill evidence; it is intentionally dropped —
+    // this is dropping a NON-order informational frame, NOT an order event.
+  }
+
+  /**
+   * Schedule ONE bounded drain of the ingestion pipeline on a microtask.
+   *
+   * Coalesced: overlapping enqueues share a single scheduled pump, so a burst of frames does not
+   * spawn a pump each. The drain is bounded (drains the queued snapshot and returns), never leaves
+   * a dangling timer, and clears the backlog signal once the order-event queue is no longer
+   * overloaded so new entry can resume.
+   */
+  private scheduleIngestPump(): void {
+    if (this.ingestPumpScheduled) return;
+    this.ingestPumpScheduled = true;
+    queueMicrotask(() => {
+      void this.ingestPipeline
+        .pumpUntilIdle({ stages: ["order_events"] })
+        .catch(() => undefined)
+        .finally(() => {
+          this.ingestPumpScheduled = false;
+          // Once the order-event queue has drained back within its threshold, lift the backlog
+          // signal so NEW ENTRY can resume (exposure management was never blocked).
+          if (!this.ingestPipeline.stage("order_events").isOverloaded()) {
+            this.marketDataMachine.onProcessingBacklog(false);
+          }
+        });
+    });
+  }
+
+  /**
+   * Best-effort active broker account (Kite user_id / Dhan client id), used as the default account
+   * on ownership registration for foreign-account rejection. Returns null when the process cannot
+   * name its own account without extra session plumbing — in which case attribution rests on the
+   * per-order tag/correlationId (unique per order and attempt) and the observation's own account is
+   * still checked against any account a registration DID carry.
+   */
+  private liveBrokerAccount(): string | null {
+    return this.deps.marketData.isAuthenticated() ? null : null;
+  }
+
+  /**
+   * START the order-stream transports for the active broker, if the stream is armed.
+   *
+   * Zerodha needs nothing started here — its postbacks ride the existing box quote socket via
+   * `ingestBoxLaneOrderText`, forwarded by the registry's `onBoxLaneOrderText`. Dhan needs its
+   * DEDICATED order socket opened (`wss://api-order-update.dhan.co`), constructed by the registry
+   * against the CURRENT token. Idempotent and safe to call after live construction.
+   */
+  private startOrderStreamTransports(): void {
+    const consumer = this.orderStreamConsumer;
+    if (!consumer) return;
+    const broker = this.deps.activeBroker();
+    if (broker === "zerodha") {
+      // Nothing to open: the box quote socket already carries the postbacks. If armed, the
+      // consumer's health machine advances as the box lane connects; on connect the box lane
+      // reports through onBoxLaneConnection and the postback path is live automatically.
+      if (zerodhaOrderStreamEnabledFromEnv()) {
+        consumer.onConnecting();
+      }
+      return;
+    }
+    // Dhan: open the dedicated order-update socket via the registry-provided factory.
+    if (broker === "dhan" && dhanOrderStreamEnabledFromEnv() && this.deps.createDhanOrderFeed && !this.dhanOrderFeed) {
+      const feed = this.deps.createDhanOrderFeed({
+        onObservation: (obs) => consumer.ingestStreamObservation(obs),
+        onConnecting: () => consumer.onConnecting(),
+        onConnected: (args) => {
+          // The transport signals socket-open + optimistic auth in one event (Dhan sends no
+          // auth-ack). Drive the machine through both steps so it never reads READY on open.
+          consumer.onSocketOpen();
+          if (args.authorised) consumer.onAuthenticated();
+        },
+        onDisconnected: () => consumer.onDisconnected(),
+        onSessionLost: (reason) => consumer.onSessionLost(reason),
+        nowMono: () => this.executionClock.mono(),
+        nowWall: () => this.executionClock.wall(),
+      });
+      if (feed) {
+        this.dhanOrderFeed = feed;
+        feed.start();
+      }
+    }
   }
 
   invalidateBooks(): void {

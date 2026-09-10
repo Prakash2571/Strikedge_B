@@ -290,9 +290,14 @@ export function parseDhanOrderAlert(raw: string): NormalizedOrderObservation | n
     ownerTag: correlationId ?? "",
     brokerOrderId: orderNo,
     account,
-    // A status-only alert (e.g. TRANSIT/PENDING before any fill) reports TradedQty 0, which the
-    // monotonic ledger treats as carrying no new quantity — it can never rewind a prior fill.
+    // MISSING-VS-CONFIRMED-ZERO (item 1B). Per the DhanHQ v2 docs, `Status: "TRADED"` is a LABEL
+    // and `TradedQty` is the only quantity evidence. A TRADED alert whose `TradedQty` is absent —
+    // and a CANCELLED alert with no quantity — is INSUFFICIENT EVIDENCE, not a zero fill and not a
+    // complete fill. Mapping absence to 0 (as before) fabricates a confirmed zero. So the
+    // placeholder is 0 but `quantityPresent` is false; the projection/adapter never apply it and a
+    // targeted REST reconciliation resolves the true quantity.
     cumulativeQty: traded ?? 0,
+    quantityPresent: traded !== null,
     averagePrice: avg,
     rawStatus: status,
     eventId,
