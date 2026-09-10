@@ -24,6 +24,7 @@ import type { Instrument, KiteClient } from "../kite.js";
 import type { TickerHub } from "../hub.js";
 import type { BrokerId } from "../brokers/types.js";
 import { BoxEngine } from "./engine.js";
+import type { BoxEngineDeps } from "./engine.js";
 import type { PriceChargeGroupsFn } from "./charges.js";
 import type {
   BoxChargeCalculatorLike,
@@ -120,6 +121,8 @@ export interface BoxModuleDeps {
    * construct one, and refuses to start live without it.
    */
   createLiveAdapter?: BoxLiveAdapterFactory;
+  /** Builds the Dhan dedicated order-update feed for the active broker (registry-owned socket). */
+  createDhanOrderFeed?: BoxEngineDeps["createDhanOrderFeed"];
 }
 
 export interface BoxModule {
@@ -172,6 +175,7 @@ export function registerBoxModule(app: Express, deps: BoxModuleDeps): BoxModule 
       }),
     },
     ...(deps.createLiveAdapter ? { createLiveAdapter: deps.createLiveAdapter } : {}),
+    ...(deps.createDhanOrderFeed ? { createDhanOrderFeed: deps.createDhanOrderFeed } : {}),
   });
 
   registerBoxRoutes(app, {

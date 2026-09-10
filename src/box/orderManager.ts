@@ -14,6 +14,7 @@ import { CumulativeFillLedger } from "./orderLifecycle.js";
 import type { ExecutionTimingRecorder } from "./executionTiming.js";
 import { kindForPurpose } from "./executionTiming.js";
 import type { BrokerId } from "./latencyModel.js";
+import { dhanCorrelationId } from "../brokers/dhan/correlation.js";
 import {
   evaluateLiveEntryGuard,
   stillWantedSafely,
@@ -519,6 +520,17 @@ export class BoxOrderManager {
   constructor(
     private readonly deps: {
       adapter: BrokerAdapter;
+      /**
+       * The order-stream consumer for this broker account, when live streams are wired.
+       *
+       * OWNERSHIP-FIRST. The manager registers each leg's durable identity here as it enters
+       * SUBMITTING — BEFORE the broker POST — so an order-update that beats the placement HTTP
+       * response has a ledger to land in and is attributable the instant it arrives. It also learns
+       * the broker order id on acknowledgement and feeds REST snapshots into the same projection, so
+       * the stream and REST are ONE deduplicated truth. Optional: absent ⇒ the manager behaves
+       * exactly as before (REST polling is the only fill observer).
+       */
+      orderStreamConsumer?: import("./orderStreamConsumer.js").OrderStreamConsumer;
       persistence: OrderIntentPersistence;
       limits: OrderManagerLimits;
       controls?: Partial<OrderManagerControls>;
@@ -1497,6 +1509,86 @@ export class BoxOrderManager {
   }
 
   /**
+   * The stable strategy key the broker will ECHO on every order update for this order — the
+   * ownership key the projection attributes by.
+   *
+   *   Zerodha: the order `tag` (`request.tag` after prepareOrder = stableKiteTag), echoed as `tag`.
+   *   Dhan:    the `correlationId` derived from the client id, echoed as `CorrelationId`.
+   *
+   * Broker-aware so the registered key matches exactly what arrives on the stream; a mismatch would
+   * make our own fill look unowned. Falls back to the durable `broker_tag`/`broker_correlation_id`
+   * when present so a value written under an older algorithm still attributes.
+   */
+  private ownerTagFor(intent: IBoxOrderIntent, request: BrokerOrderRequest): string {
+    const broker = this.deps.broker?.();
+    if (broker === "dhan") {
+      return intent.broker_correlation_id ?? dhanCorrelationId(intent.client_order_id);
+    }
+    // Default (Zerodha): the tag the postback echoes.
+    return intent.broker_tag ?? request.tag ?? "";
+  }
+
+  /**
+   * Register a leg's durable identity with the order-stream consumer BEFORE the POST.
+   *
+   * Fail-open and idempotent: a registration fault must never block or delay the order. Absent
+   * consumer ⇒ no-op (REST polling remains the fill observer).
+   */
+  private registerStreamOwnership(intent: IBoxOrderIntent, request: BrokerOrderRequest): void {
+    const consumer = this.deps.orderStreamConsumer;
+    if (!consumer) return;
+    const ownerTag = this.ownerTagFor(intent, request);
+    if (!ownerTag) return;
+    try {
+      consumer.registerIntent({
+        clientOrderId: intent.client_order_id,
+        ownerTag,
+        // The intent has no first-class account field in this single-account deployment; the
+        // consumer's account() default supplies one when known, and attribution rests on the
+        // per-order ownerTag (unique per order and attempt). The observation's own account is still
+        // validated against any account a registration carries.
+        account: null,
+        requestedQty: intent.quantity,
+        brokerOrderId: intent.broker_order_id ?? null,
+      });
+    } catch {
+      // Never let stream bookkeeping affect the order path.
+    }
+  }
+
+  /**
+   * Bind a broker order id to the durable client identity once the broker reports it, and feed the
+   * broker snapshot's cumulative quantity into the SAME projection as a REST observation — so the
+   * stream and REST are one deduplicated truth. Fail-open.
+   */
+  private noteStreamBrokerSnapshot(intent: IBoxOrderIntent, order: BrokerOrder): void {
+    const consumer = this.deps.orderStreamConsumer;
+    if (!consumer) return;
+    try {
+      if (order.broker_order_id) {
+        consumer.learnBrokerOrderId(intent.client_order_id, order.broker_order_id);
+      }
+      const ownerTag = this.ownerTagFor(intent, requestFromIntent(intent));
+      // A REST/adapter snapshot's cumulative quantity, deduplicated against the stream in the one
+      // projection. `quantityPresent` mirrors the adapter's evidence marker so a snapshot that
+      // could not prove a quantity is not read as a confirmed zero.
+      const quantityPresent = order.execution_evidence?.quantity !== "missing";
+      consumer.ingestRestObservation({
+        ownerTag,
+        brokerOrderId: order.broker_order_id ?? null,
+        account: null,
+        cumulativeQty: order.filled_quantity,
+        quantityPresent,
+        averagePrice: order.average_price ?? null,
+        rawStatus: order.state,
+        eventId: `rest:${order.client_order_id}:${order.filled_quantity}:${order.state}`,
+      });
+    } catch {
+      // Never let stream bookkeeping affect reconciliation or persistence.
+    }
+  }
+
+  /**
    * Record that one rank has decided, wake anything now unblocked, and remember a hedge failure.
    *
    * "DECIDED" for a hedge leg means its POST ROUND TRIP IS OVER — the adapter call returned or
@@ -1788,6 +1880,10 @@ export class BoxOrderManager {
       if (intent.state !== "SUBMITTING") {
         throw new Error(`Order intent ${intent.client_order_id} did not durably enter SUBMITTING; broker POST blocked.`);
       }
+      // OWNERSHIP-FIRST, BEFORE THE POST. The identity is durably SUBMITTING and CAS-owned by this
+      // process; register it with the order-stream consumer NOW so an order-update that beats the
+      // placement HTTP response has a ledger to land in and is attributable the instant it arrives.
+      this.registerStreamOwnership(intent, persistedRequest);
       // DURABLE PERSISTENCE COMPLETE. Both Mongo writes are done and the order may now be
       // transmitted, so this closes `persistence_wait_ms` and opens `transport_wait_ms`. Recorded
       // here rather than being left inside the pacing span, because a database round trip reported
@@ -2246,6 +2342,11 @@ export class BoxOrderManager {
     order: BrokerOrder,
     message: string,
   ): Promise<IBoxOrderIntent> {
+    // ONE TRUTH. Feed this authoritative broker snapshot into the SAME order-stream projection the
+    // stream feeds, deduplicated and monotonic — so a REST/adapter snapshot and a stream event of
+    // the same fill are never double-counted, and the broker order id is bound to our client id.
+    // Fail-open; it runs off the existing guarded durable write below, not a second persistence path.
+    this.noteStreamBrokerSnapshot(intent, order);
     // TIMING: record the broker's CUMULATIVE quantity for this snapshot, and — if the order has
     // reached a terminal state — close and publish the trace. Both are fail-open no-ops when
     // instrumentation is off, and neither can throw into the persistence path below.

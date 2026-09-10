@@ -741,11 +741,17 @@ export class KiteBrokerAdapter implements BrokerAdapter {
    * `waitForResolution`'s poll interval, not on the socket.
    */
   private readonly orderWaiters = new Map<string, Set<() => void>>();
+  /** Client order ids observed while no waiter was parked; the next wait consumes the latch. */
+  private readonly pendingObservation = new Set<string>();
   private streamObservationsApplied = 0;
   private streamObservationsIgnored = 0;
 
   /** Sleep up to `ms`, waking EARLY on an external observation of this order. */
   private async waitOrObservation(ms: number, clientOrderId: string): Promise<void> {
+    // Edge-not-lost: if an observation arrived AFTER the previous poll but BEFORE we re-entered
+    // this wait, the latch is already set and we return immediately rather than sleeping a full
+    // interval on news we have technically already received.
+    if (this.pendingObservation.delete(clientOrderId)) return;
     let waiters = this.orderWaiters.get(clientOrderId);
     if (!waiters) {
       waiters = new Set();
@@ -764,7 +770,13 @@ export class KiteBrokerAdapter implements BrokerAdapter {
 
   private wakeOrderWaiters(clientOrderId: string): void {
     const waiters = this.orderWaiters.get(clientOrderId);
-    if (!waiters) return;
+    if (!waiters || waiters.size === 0) {
+      // No waiter is parked right now. Latch the edge so the NEXT waitOrObservation returns at
+      // once instead of sleeping through an interval — the observation already updated the
+      // session snapshot, so the loop must re-read it promptly.
+      this.pendingObservation.add(clientOrderId);
+      return;
+    }
     for (const wake of [...waiters]) {
       try { wake(); } catch { /* a waiter must never break the ingestion path */ }
     }
@@ -846,6 +858,15 @@ export class KiteBrokerAdapter implements BrokerAdapter {
       }
       // Wake on the EVENT, fall back on the interval: REST stays a controlled fallback.
       await this.waitOrObservation(Math.max(1, this.config.brokerMinIntervalMs), order.client_order_id);
+      // A stream observation may have ALREADY updated this order's session snapshot (and woken us)
+      // through applyOrderUpdate. That snapshot is authoritative and cumulative-monotonic, so adopt
+      // it FIRST. If it is now terminal, the fill was seen on the event and a REST re-poll would
+      // only risk overwriting a fresh terminal state with a staler open snapshot — so we skip it.
+      const observed = this.orders.get(order.client_order_id);
+      if (observed && observed !== order) {
+        order = observed;
+        if (isBrokerOrderTerminal(order.state)) break;
+      }
       order = await this.refresh(order);
       if (order.state === "PARTIALLY_FILLED" && partialAt === null) partialAt = this.clock.now();
     }

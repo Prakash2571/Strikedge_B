@@ -335,6 +335,8 @@ export class DhanBrokerAdapter implements BrokerAdapter {
    * Bounded by construction: one entry per in-flight order, deleted the moment it is woken.
    */
   private readonly orderWaiters = new Map<string, Set<() => void>>();
+  /** Client order ids observed while no waiter was parked; the next wait consumes the latch. */
+  private readonly pendingObservation = new Set<string>();
   /** Stream observations applied to this session, for status/diagnostics. */
   private streamObservationsApplied = 0;
   private streamObservationsIgnored = 0;
@@ -347,6 +349,8 @@ export class DhanBrokerAdapter implements BrokerAdapter {
    * only ever make the answer arrive sooner.
    */
   private async sleepOrObservation(ms: number, clientOrderId: string): Promise<void> {
+    // Edge-not-lost: consume a latched observation that arrived before this wait was entered.
+    if (this.pendingObservation.delete(clientOrderId)) return;
     let waiters = this.orderWaiters.get(clientOrderId);
     if (!waiters) {
       waiters = new Set();
@@ -366,7 +370,11 @@ export class DhanBrokerAdapter implements BrokerAdapter {
   /** Wake every waiter on one order. Called after an external observation is merged. */
   private wakeOrderWaiters(clientOrderId: string): void {
     const waiters = this.orderWaiters.get(clientOrderId);
-    if (!waiters) return;
+    if (!waiters || waiters.size === 0) {
+      // Latch the edge for the next wait: the observation already updated the session snapshot.
+      this.pendingObservation.add(clientOrderId);
+      return;
+    }
     for (const wake of [...waiters]) {
       try { wake(); } catch { /* a waiter must never break the ingestion path */ }
     }
@@ -782,6 +790,15 @@ export class DhanBrokerAdapter implements BrokerAdapter {
       // immediately; with no stream (or a silent one) the poll cadence is exactly as before, so
       // REST stays a controlled fallback rather than being replaced.
       await this.sleepOrObservation(this.cfg.brokerMinIntervalMs, clientOrderId);
+      // A stream observation may have already updated this order's session snapshot (and woken us)
+      // through applyOrderUpdate. That snapshot is authoritative and cumulative-monotonic, so adopt
+      // it FIRST; if it is now terminal the fill was seen on the event, and a REST re-poll would
+      // only risk overwriting a fresh terminal state with a staler snapshot — so skip it.
+      const observed = this.orders.get(clientOrderId);
+      if (observed && observed !== current) {
+        current = observed;
+        if (isBrokerOrderTerminal(current.state)) break;
+      }
       const refreshed = await this.refresh(clientOrderId);
       if (!refreshed) break;
       current = refreshed;

@@ -122,8 +122,9 @@ import { BoxPositionMonitor } from "./positionMonitor.js";
 import { BoxQuoteStore, SpotStore } from "./quotes.js";
 import { orderStreamStatus } from "./orderStreamStatus.js";
 import type { OrderStreamHealth } from "./orderUpdateProjection.js";
-import { zerodhaOrderStreamEnabledFromEnv } from "../brokers/zerodha/orderUpdates.js";
-import { dhanOrderStreamEnabledFromEnv } from "../brokers/dhan/orderFeed.js";
+import { OrderStreamConsumer } from "./orderStreamConsumer.js";
+import { parseKiteOrderFrame, zerodhaOrderStreamEnabledFromEnv } from "../brokers/zerodha/orderUpdates.js";
+import { dhanOrderStreamEnabledFromEnv, type DhanOrderFeed } from "../brokers/dhan/orderFeed.js";
 import { ensureBoxPersistenceReady } from "./repository.js";
 import {
   appendBoxEvent,
@@ -272,6 +273,22 @@ export interface BoxEngineDeps {
    * is the correct default: no injected adapter means no way to place an order.
    */
   createLiveAdapter?: BoxLiveAdapterFactory;
+  /**
+   * Construct the Dhan DEDICATED order-update feed (wss://api-order-update.dhan.co), bound to the
+   * registry's CURRENT session token/client id. Absent ⇒ no Dhan order stream is available and the
+   * consumer honestly reports the stream disabled while REST polling remains the fill authority.
+   * The registry returns null when Dhan is not the active broker, so an order feed can never
+   * observe a broker the system is not trading.
+   */
+  createDhanOrderFeed?: (handlers: {
+    onObservation: (observation: import("./orderUpdateProjection.js").NormalizedOrderObservation) => void;
+    onConnecting?: () => void;
+    onConnected?: (args: { authorised: boolean; reconnect: boolean }) => void;
+    onDisconnected?: () => void;
+    onSessionLost?: (reason: string) => void;
+    nowMono?: () => number;
+    nowWall?: () => number;
+  }) => DhanOrderFeed | null;
 }
 
 /** Minutes past IST midnight, right now. */
@@ -518,6 +535,15 @@ export class BoxEngine {
    */
   private liveAdapter: BrokerAdapter | null = null;
   /**
+   * The order-stream consumer for the active broker — the running component that consumes the
+   * order-update stream, owns the single projection of truth, and drives the health state machine.
+   * Null in paper and until live construction. When present it is registered in
+   * {@link orderStreamConsumers} so `orderStreamStatus` reports the REAL wiring, never `not_wired`.
+   */
+  private orderStreamConsumer: OrderStreamConsumer | null = null;
+  /** The Dhan dedicated order-update socket, when Dhan is active and the stream is armed. */
+  private dhanOrderFeed: DhanOrderFeed | null = null;
+  /**
    * The inner (uncoordinated) gateway.
    *
    * Retained only so read-only diagnostics can reach the per-Box capital report, which is computed
@@ -653,8 +679,44 @@ export class BoxEngine {
       // Re-deriving it from config would usually agree, but "usually" is not a diagnostic: if the
       // adapter ever clamps differently the operator must see the adapter's number, not ours.
       this.liveAdapter = adapter;
+
+      // ── ORDER-STREAM CONSUMER: the running component that consumes the order-update stream ──
+      // Constructed HERE, in production, bound to the live adapter and the active account, so the
+      // stream is not a disconnected helper: a stream event routes through the single projection
+      // and then the adapter's applyOrderUpdate, which wakes the order's waiters. The env gate only
+      // decides whether the transports are STARTED — the consumer always exists so REST
+      // reconciliation and honest health reporting work even when the stream is off.
+      const activeBroker = this.deps.activeBroker();
+      const streamEnabled =
+        activeBroker === "zerodha" ? zerodhaOrderStreamEnabledFromEnv() : dhanOrderStreamEnabledFromEnv();
+      const consumer = new OrderStreamConsumer({
+        broker: activeBroker,
+        account: () => this.liveBrokerAccount(),
+        adapter,
+        streamEnabled,
+        // Targeted REST reconciliation when a stream event is owned but its quantity is absent, and
+        // for the reconnect gap repair. Delegated to the order manager's REST reconcile, which owns
+        // the adapter's transport and the EXISTING guarded durable writes — no second persistence
+        // path is invented here.
+        restReconcile: async (_clientOrderId) => {
+          try {
+            await this.orderManager?.reconcile();
+            consumer.markSynchronized();
+          } catch {
+            // Fail-open: a reconciliation failure leaves the stream DEGRADED/RECONCILING and REST
+            // polling continues; it must never throw into the ingestion path.
+          }
+        },
+        now: () => this.executionClock.wall(),
+      });
+      this.orderStreamConsumer = consumer;
+      // Populate the map READ by orderStreamStatus so the status reflects reality instead of
+      // reporting `not_wired`. The health object is refreshed on every status read below.
+      this.orderStreamConsumers.set(activeBroker, consumer.health());
+
       this.orderManager = new BoxOrderManager({
         adapter,
+        orderStreamConsumer: consumer,
         persistence: boxOrderIntentPersistence,
         limits: orderManagerLimitsFromConfig(this.cfg),
         controls: { entryEnabled: false, liveOrderEnabled: false, emergencyFlatten: false },
@@ -1104,6 +1166,11 @@ export class BoxEngine {
         }
         try {
           const report = await this.orderManager.start();
+          // The order manager's initial reconcile has completed, so the durable nonterminal orders
+          // are known: NOW open the order-stream transports. Starting after reconcile means a
+          // pre-arrival stream event lands in a ledger that was already registered from durable
+          // intent, and the reconnect gap-repair path has a consistent baseline to merge against.
+          this.startOrderStreamTransports();
           if (report.positionMismatches.length > 0 || report.missingAtBroker.length > 0) {
             const mismatchSymbols = new Set(report.positionMismatches.map((item) => item.symbol));
             const affectedIds = new Set(report.affectedTradeIds);
@@ -4870,11 +4937,11 @@ export class BoxEngine {
         brokers: ["zerodha", "dhan"],
         gateEnabled: (broker) =>
           broker === "zerodha" ? zerodhaOrderStreamEnabledFromEnv() : dhanOrderStreamEnabledFromEnv(),
-        // No consumer is registered yet: the parsing/projection layer is implemented and
-        // unit-tested but nothing in the running engine consumes it, so every broker reports
-        // `not_wired` and `rest_polling_only`. Passing a populated map here is the ONLY thing
-        // that will flip that, which keeps the status honest by construction.
-        consumers: this.orderStreamConsumers,
+        // The running consumer's CURRENT health is refreshed into the map on every read (see
+        // refreshOrderStreamConsumerHealth), so this reflects reality: a broker with a live
+        // consumer reports `armed` + its real projection health; a broker with no consumer
+        // (paper, or the inactive broker) honestly reports `not_wired` / `rest_polling_only`.
+        consumers: this.refreshOrderStreamConsumerHealth(),
       }),
       database_healthy: isBoxDbEnabled() && (!live || live.health.persistence === "healthy"),
       daily_risk_seed_healthy: live ? live.health.daily_risk_seed === "healthy" : null,
@@ -5045,6 +5112,95 @@ export class BoxEngine {
   onBoxLaneConnection(connected: boolean): void {
     this.invalidateFeedGeneration();
     if (!connected) this.lastError = "box market-data lane disconnected";
+  }
+
+  /**
+   * Refresh the running consumer's CURRENT health into the status map and return it.
+   *
+   * The map is what `orderStreamStatus` reads. Snapshotting the live health here — rather than at
+   * construction — is what makes the status track reality: a stream that has gone DOWN, or a
+   * reconnect that is still RECONCILING, is reported as it actually is, not as it was when the
+   * consumer was built.
+   */
+  private refreshOrderStreamConsumerHealth(): ReadonlyMap<BrokerId, OrderStreamHealth> {
+    const consumer = this.orderStreamConsumer;
+    if (consumer) this.orderStreamConsumers.set(this.deps.activeBroker(), consumer.health());
+    return this.orderStreamConsumers;
+  }
+
+  /**
+   * A Kite order-update TEXT frame arrived on the box lane's quote socket.
+   *
+   * PRODUCTION WIRING for the Zerodha fast fill path. The frame is parsed by `parseKiteOrderFrame`
+   * and, when it is an order postback, routed into the order-stream consumer's single projection
+   * and thence the live adapter's `applyOrderUpdate` (which wakes the order's waiter). Error/message
+   * frames and unparseable input are ignored — a bad postback must never disturb the market-data
+   * socket that carries the ticks the whole strategy depends on. Inert unless a consumer exists and
+   * the Zerodha stream is armed.
+   */
+  ingestBoxLaneOrderText(raw: string): void {
+    const consumer = this.orderStreamConsumer;
+    if (!consumer) return;
+    const frame = parseKiteOrderFrame(raw);
+    if (frame.type === "order" && frame.observation) {
+      consumer.ingestStreamObservation(frame.observation);
+    }
+    // A `message`/`error`/`unknown` frame carries no fill evidence; it is intentionally dropped.
+  }
+
+  /**
+   * Best-effort active broker account (Kite user_id / Dhan client id), used as the default account
+   * on ownership registration for foreign-account rejection. Returns null when the process cannot
+   * name its own account without extra session plumbing — in which case attribution rests on the
+   * per-order tag/correlationId (unique per order and attempt) and the observation's own account is
+   * still checked against any account a registration DID carry.
+   */
+  private liveBrokerAccount(): string | null {
+    return this.deps.marketData.isAuthenticated() ? null : null;
+  }
+
+  /**
+   * START the order-stream transports for the active broker, if the stream is armed.
+   *
+   * Zerodha needs nothing started here — its postbacks ride the existing box quote socket via
+   * `ingestBoxLaneOrderText`, forwarded by the registry's `onBoxLaneOrderText`. Dhan needs its
+   * DEDICATED order socket opened (`wss://api-order-update.dhan.co`), constructed by the registry
+   * against the CURRENT token. Idempotent and safe to call after live construction.
+   */
+  private startOrderStreamTransports(): void {
+    const consumer = this.orderStreamConsumer;
+    if (!consumer) return;
+    const broker = this.deps.activeBroker();
+    if (broker === "zerodha") {
+      // Nothing to open: the box quote socket already carries the postbacks. If armed, the
+      // consumer's health machine advances as the box lane connects; on connect the box lane
+      // reports through onBoxLaneConnection and the postback path is live automatically.
+      if (zerodhaOrderStreamEnabledFromEnv()) {
+        consumer.onConnecting();
+      }
+      return;
+    }
+    // Dhan: open the dedicated order-update socket via the registry-provided factory.
+    if (broker === "dhan" && dhanOrderStreamEnabledFromEnv() && this.deps.createDhanOrderFeed && !this.dhanOrderFeed) {
+      const feed = this.deps.createDhanOrderFeed({
+        onObservation: (obs) => consumer.ingestStreamObservation(obs),
+        onConnecting: () => consumer.onConnecting(),
+        onConnected: (args) => {
+          // The transport signals socket-open + optimistic auth in one event (Dhan sends no
+          // auth-ack). Drive the machine through both steps so it never reads READY on open.
+          consumer.onSocketOpen();
+          if (args.authorised) consumer.onAuthenticated();
+        },
+        onDisconnected: () => consumer.onDisconnected(),
+        onSessionLost: (reason) => consumer.onSessionLost(reason),
+        nowMono: () => this.executionClock.mono(),
+        nowWall: () => this.executionClock.wall(),
+      });
+      if (feed) {
+        this.dhanOrderFeed = feed;
+        feed.start();
+      }
+    }
   }
 
   invalidateBooks(): void {

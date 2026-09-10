@@ -53,6 +53,7 @@ import { QuoteProvider } from "./quoteProvider.js";
 import { computeFeedHealth, type FeedHealth } from "./feedHealth.js";
 import { DhanHttp, dhanHttpConfigFromEnv } from "./dhan/http.js";
 import { DhanFeed } from "./dhan/feed.js";
+import { DhanOrderFeed, type DhanOrderFeedOptions } from "./dhan/orderFeed.js";
 import { ZerodhaFeed } from "./zerodha/feed.js";
 import { type LaneFeedStats, type MarketDataLane } from "./marketDataLane.js";
 import { DhanInstrumentStore, dhanInternalToken, getDhanParseReport, type DhanInstrument } from "./dhan/instruments.js";
@@ -175,6 +176,15 @@ export interface ActiveBrokerManagerDeps {
    */
   onBoxLaneTicks?: (ticks: Parameters<TickerHub["seed"]>[0]) => void;
   onBoxLaneConnection?: (connected: boolean) => void;
+  /**
+   * Kite order-update TEXT frames from the BOX lane's Zerodha socket.
+   *
+   * Zerodha multiplexes order postbacks onto the SAME quote socket as the binary ticks (text =
+   * postbacks, binary = ticks), and a single API key may hold at most 3 connections — so there is
+   * no dedicated Zerodha order socket to open. When supplied, the box lane forwards every text
+   * frame here for the order-stream consumer to parse. Absent ⇒ text frames are ignored.
+   */
+  onBoxLaneOrderText?: (raw: string) => void;
 }
 
 /** A lane with no socket yet: honest zeros rather than a pretence of health. */
@@ -459,6 +469,10 @@ export class ActiveBrokerManager {
         },
         onConnectionChange: (connected) => this.deps.onBoxLaneConnection?.(connected),
         onDead: (message) => console.warn(`[Broker] box lane (zerodha) feed died: ${message}`),
+        // Order postbacks ride this SAME socket as text frames — no extra Zerodha socket exists.
+        ...(this.deps.onBoxLaneOrderText
+          ? { onTextFrame: (raw: string) => this.deps.onBoxLaneOrderText?.(raw) }
+          : {}),
       });
     }
     return this.boxZerodhaFeed;
@@ -486,6 +500,32 @@ export class ActiveBrokerManager {
   /** Replace the BOX lane's entire token set in one diff. */
   setBoxTokens(tokens: number[]): void {
     this.boxSubscriptions.setOwnerTokens("strategy", tokens);
+  }
+
+  /**
+   * Construct the Dhan DEDICATED order-update feed, bound to the CURRENT session.
+   *
+   * This is a SEPARATE socket from the Dhan market feed (wss://api-order-update.dhan.co vs
+   * wss://api-feed.dhan.co). It reads the token and client id fresh on every connect via the
+   * registry's session, so a reconnect after a token refresh authorises with the current JWT.
+   * The order-stream consumer supplies the observation/lifecycle handlers; the registry supplies
+   * only the credentials and the socket, so credential ownership never leaves this class.
+   *
+   * Returns null unless Dhan is the active broker — an order feed for the inactive broker would
+   * observe an account the system is not trading, exactly the cross-broker leak the manager forbids.
+   */
+  createDhanOrderFeed(
+    handlers: Pick<
+      DhanOrderFeedOptions,
+      "onObservation" | "onConnecting" | "onConnected" | "onDisconnected" | "onSessionLost" | "nowMono" | "nowWall"
+    >,
+  ): DhanOrderFeed | null {
+    if (this.active !== "dhan") return null;
+    return new DhanOrderFeed({
+      accessToken: () => this.usableDhanToken(),
+      clientId: () => this.dhanSessionMeta?.clientId ?? process.env.DHAN_CLIENT_ID?.trim() ?? "",
+      ...handlers,
+    });
   }
 
   /** Per-lane feed statistics for diagnostics. */

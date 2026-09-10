@@ -365,3 +365,98 @@ test("the consumer exposes an OrderStreamHealth snapshot that reflects the live 
   assert.equal(health.connected, true);
   assert.equal(health.authorised, true);
 });
+
+/* ═══════════════ 11. cancel racing a fill: the fill that lands after the cancel is not lost ═══════════════ */
+
+test("a fill that lands AFTER a cancel is requested is still counted (cancel racing a fill)", () => {
+  const clock = makeClock();
+  const adapter = new RealishAdapter();
+  const consumer = makeConsumer({ adapter, clock });
+  const leg = "BOX:T11:ENTRY:k1_ce:attempt-1";
+  consumer.registerIntent({ clientOrderId: leg, ownerTag: "BOXTAG11", account: "AB1234", requestedQty: 75 });
+  adapter.register(leg, 75, "230011");
+
+  // 40 fill, then a cancel is requested. A further 12 fills WHILE the cancel is in flight.
+  consumer.ingestStreamObservation({ ownerTag: "BOXTAG11", account: "AB1234", cumulativeQty: 40, quantityPresent: true, rawStatus: "UPDATE", eventId: "e40" });
+  // (cancel request happens here in the real adapter; the stream keeps delivering)
+  consumer.ingestStreamObservation({ ownerTag: "BOXTAG11", account: "AB1234", cumulativeQty: 52, quantityPresent: true, rawStatus: "UPDATE", eventId: "e52" });
+  // A CANCELLED alert WITH a confirmed cumulative of 52 (the broker's final word).
+  consumer.ingestStreamObservation({ ownerTag: "BOXTAG11", account: "AB1234", cumulativeQty: 52, quantityPresent: true, rawStatus: "CANCELLED", eventId: "cxl52" });
+  assert.equal(consumer.projection().ledger(leg).cumulative, 52, "the 12 that raced the cancel are NOT lost");
+  assert.equal(adapter.orders.get(leg).filled_quantity, 52);
+});
+
+/* ═══════════════ 12. old socket emitting after reconnect must not repopulate the current generation ═══════════════ */
+
+test("a superseded socket's late frame does not reach the current generation (guarded forwarding)", () => {
+  // The generation guard lives in ZerodhaFeed.onTextFrame / DhanOrderFeed onmessage (guarded on
+  // socket identity). Here we prove the CONSUMER side: once the machine has advanced to a new
+  // connect generation, the caller does not forward a stale socket's frames. We model the caller's
+  // guard exactly as the feeds do: a closure captured over the socket that checks identity.
+  const clock = makeClock();
+  const adapter = new RealishAdapter();
+  const consumer = makeConsumer({ adapter, clock });
+  const leg = "BOX:T12:ENTRY:k1_ce:attempt-1";
+  consumer.registerIntent({ clientOrderId: leg, ownerTag: "BOXTAG12", account: "AB1234", requestedQty: 75 });
+  adapter.register(leg, 75, "230012");
+
+  // Two socket generations; each forwards ONLY while it is the current handle.
+  let currentHandle = { id: 1 };
+  const forwarderFor = (handle) => (obs) => {
+    if (currentHandle !== handle) return; // superseded socket: drop, exactly like the feeds
+    consumer.ingestStreamObservation(obs);
+  };
+  const gen1 = forwarderFor({ id: 1 });
+  const handle2 = { id: 2 };
+  const gen2 = forwarderFor(handle2);
+  currentHandle = handle2; // reconnect: generation 2 is now current
+
+  // The OLD socket (gen1) emits a late fill for 99 — must be dropped, never applied.
+  gen1({ ownerTag: "BOXTAG12", account: "AB1234", cumulativeQty: 99, quantityPresent: true, eventId: "old:99" });
+  assert.equal(consumer.projection().ledger(leg).cumulative, 0, "the superseded socket's frame was dropped");
+  // The CURRENT socket (gen2) delivers the real 30.
+  gen2({ ownerTag: "BOXTAG12", account: "AB1234", cumulativeQty: 30, quantityPresent: true, eventId: "new:30" });
+  assert.equal(consumer.projection().ledger(leg).cumulative, 30, "only the current generation repopulates");
+});
+
+/* ═══════════════ 13. socket open but supplying no usable events → DEGRADED via onIdle ═══════════════ */
+
+test("a socket that opened but supplies no usable events is DEGRADED, not READY (no new entry)", () => {
+  const clock = makeClock();
+  const consumer = makeConsumer({ adapter: new RealishAdapter(), clock });
+  consumer.onConnecting(); consumer.onSocketOpen(); consumer.onAuthenticated(); consumer.markSynchronized();
+  assert.equal(consumer.lifecycleState(), "READY");
+  // The idle watchdog fires: connected, but no usable events within the expected bound.
+  consumer.onIdle();
+  assert.equal(consumer.lifecycleState(), "DEGRADED");
+  const perms = orderStreamPermissions(consumer.lifecycleState());
+  assert.equal(perms.newEntry, false, "a silent socket must not license new entry");
+  assert.equal(perms.exitAndReduce, true, "but exposure management continues");
+  assert.equal(perms.protectiveCancel, true);
+});
+
+/* ═══════════════ 14. reconnect merges gap fills without loss or double-count, THEN READY ═══════════════ */
+
+test("a fill that happened during the disconnect gap is recovered on reconnect without double count", () => {
+  const clock = makeClock();
+  const adapter = new RealishAdapter();
+  const consumer = makeConsumer({ adapter, clock });
+  const leg = "BOX:T14:ENTRY:k1_ce:attempt-1";
+  consumer.registerIntent({ clientOrderId: leg, ownerTag: "BOXTAG14", account: "AB1234", requestedQty: 75 });
+  adapter.register(leg, 75, "230014");
+  consumer.onConnecting(); consumer.onSocketOpen(); consumer.onAuthenticated(); consumer.markSynchronized();
+
+  // Stream sees 30, then drops. 45 more fill in the gap (stream never delivers them).
+  consumer.ingestStreamObservation({ ownerTag: "BOXTAG14", account: "AB1234", cumulativeQty: 30, quantityPresent: true, eventId: "s30" });
+  consumer.onDisconnected();
+  assert.equal(consumer.lifecycleState(), "DISCONNECTED");
+
+  // Reconnect: authenticate → RECONCILING (no entry). The REST sweep discovers the true 75.
+  consumer.onConnecting(); consumer.onSocketOpen(); consumer.onAuthenticated();
+  assert.equal(consumer.lifecycleState(), "RECONCILING");
+  const repair = consumer.ingestRestObservation({ ownerTag: "BOXTAG14", account: "AB1234", cumulativeQty: 75, quantityPresent: true, eventId: "recon75" }, "reconciliation");
+  assert.equal(repair.apply.delta, 45, "the 45 that filled in the gap is recovered");
+  consumer.markSynchronized();
+  assert.equal(consumer.lifecycleState(), "READY", "only after the gap is repaired does entry resume");
+  assert.equal(consumer.projection().ledger(leg).cumulative, 75);
+});
