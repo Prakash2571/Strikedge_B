@@ -126,7 +126,7 @@ import type { OrderStreamHealth } from "./orderUpdateProjection.js";
 import { OrderStreamConsumer } from "./orderStreamConsumer.js";
 import { MarketDataStateMachine, marketDataPermissions, entryPermittedFromStreams, type MarketDataState, type OrderStreamLifecycleState } from "./streamHealthPolicy.js";
 import { StagePipeline } from "./boundedQueue.js";
-import { parseKiteOrderFrame, zerodhaOrderStreamEnabledFromEnv } from "../brokers/zerodha/orderUpdates.js";
+import { parseKiteOrderFrame, zerodhaOrderStreamEnabledFromEnv, zerodhaTextFramesConsumed } from "../brokers/zerodha/orderUpdates.js";
 import { dhanOrderStreamEnabledFromEnv, type DhanOrderFeed } from "../brokers/dhan/orderFeed.js";
 import { ensureBoxPersistenceReady } from "./repository.js";
 import {
@@ -5523,11 +5523,22 @@ export class BoxEngine {
    * and, when it is an order postback, routed into the order-stream consumer's single projection
    * and thence the live adapter's `applyOrderUpdate` (which wakes the order's waiter). Error/message
    * frames and unparseable input are ignored — a bad postback must never disturb the market-data
-   * socket that carries the ticks the whole strategy depends on. Inert unless a consumer exists and
-   * the Zerodha stream is armed.
+   * socket that carries the ticks the whole strategy depends on.
+   *
+   * D2 — THE FLAG GATES THE OBSERVATION PATH, NOT A LABEL. When `ZERODHA_ORDER_STREAM_ENABLED` is
+   * unset (the safe default), the frame is DROPPED HERE, before it is parsed or enqueued: no
+   * postback is consumed, no order waiter is ever resolved by the stream, and fills are observed by
+   * REST polling only — exactly what `orderStreamStatus` reports as the mechanism in force. Arming
+   * the flag turns the observation path on; disarming it turns the path off, not just the label.
+   * Inert unless a consumer exists AND the Zerodha stream is armed.
    */
   ingestBoxLaneOrderText(raw: string): void {
     if (!this.orderStreamConsumer) return;
+    // OBSERVATION-PATH GATE (D2): unless the flag is armed, Zerodha postbacks are NOT consumed —
+    // they are discarded here (as ticker.ts did before this path existed) and REST polling remains
+    // the sole fill-observation mechanism. This is what makes the flag control the capability, not
+    // merely relabel it.
+    if (!zerodhaTextFramesConsumed()) return;
     // KEEP THE WS CALLBACK LIGHTWEIGHT: enqueue the raw frame and return. Parsing and ingestion
     // happen off the socket callback in a bounded microtask pump, so a slow projection/analytics
     // stage can never block the socket that also carries the market-data ticks. The order-event

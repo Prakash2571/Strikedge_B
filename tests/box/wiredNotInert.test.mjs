@@ -226,3 +226,18 @@ test("D5: idleness is DRIVEN from a real clock against working-order expectation
   assert.ok(engine.includes("consumer.evaluateIdle("), "the engine must drive the idle detector");
   assert.ok(engine.includes("expectedIdleMs:"), "the consumer must be given an expected-idle bound");
 });
+
+test("D2: the Zerodha text-frame OBSERVATION path is gated by the flag, not just the status label", () => {
+  const engine = code("engine.ts");
+  // ingestBoxLaneOrderText must drop frames unless the flag arms the observation path.
+  assert.ok(engine.includes("zerodhaTextFramesConsumed()"), "the text-frame ingest must consult the observation gate");
+  // The gate must appear in the ingest method, guarding BEFORE the enqueue.
+  const ingest = engine.slice(engine.indexOf("ingestBoxLaneOrderText(raw: string)"));
+  const gateIdx = ingest.indexOf("zerodhaTextFramesConsumed()");
+  const enqueueIdx = ingest.indexOf('enqueue("order_events"');
+  assert.ok(gateIdx >= 0 && gateIdx < enqueueIdx, "the flag gate must precede the enqueue, so an unarmed frame is never consumed");
+  // And the honest predicate is a real export, not a comment.
+  const upd = readFileSync(new URL("../../src/brokers/zerodha/orderUpdates.ts", import.meta.url), "utf8")
+    .replace(/\/\*[\s\S]*?\*\//g, "");
+  assert.ok(upd.includes("export function zerodhaTextFramesConsumed"), "the observation-path gate must be a real export");
+});

@@ -142,13 +142,32 @@ export function parseKiteOrderFrame(raw: string): KiteParsedTextFrame {
 }
 
 /**
- * Whether the Zerodha order-update fast path is enabled, parsed module-locally per the
+ * Whether the Zerodha order-update fast path is armed, parsed module-locally per the
  * codebase precedent (`dhanHttpConfigFromEnv` in brokers/dhan/http.ts).
  *
- * OFF BY DEFAULT. Only `ZERODHA_ORDER_STREAM_ENABLED=true` turns it on. When off, `ticker.ts`
- * keeps discarding text frames exactly as before, so this is inert until explicitly enabled.
- * The stream only OBSERVES — it never places an order.
+ * OFF BY DEFAULT. Only `ZERODHA_ORDER_STREAM_ENABLED=true` turns it on. When off, the box lane's
+ * quote-socket TEXT frames (Kite postbacks) are NOT consumed — the engine's `ingestBoxLaneOrderText`
+ * drops them before parsing, exactly as `ticker.ts` discarded them before this module existed — so
+ * fills are observed by REST polling ONLY. This is the safe default and the verified baseline.
+ *
+ * D2: the flag GATES THE OBSERVATION PATH, not merely a status label. The engine consumes a
+ * postback (and thereby resolves an order waiter on the stream) ONLY when this returns true; when
+ * it returns false no postback is parsed, no waiter is woken by the stream, and REST reconciliation
+ * remains the sole fill-observation mechanism. The stream only OBSERVES — it never places an order.
  */
 export function zerodhaOrderStreamEnabledFromEnv(): boolean {
   return (process.env.ZERODHA_ORDER_STREAM_ENABLED ?? "").trim().toLowerCase() === "true";
+}
+
+/**
+ * The OBSERVATION-PATH GATE (D2). True iff the engine should CONSUME Zerodha order-update TEXT
+ * frames arriving on the box lane's quote socket. When false, `ingestBoxLaneOrderText` drops the
+ * frame before it is parsed, so a postback can NEVER resolve an order waiter and fills are observed
+ * by REST polling only. Named distinctly from the label so the call site reads as a behaviour gate,
+ * not a status toggle; both currently derive from the same single flag by design (there is exactly
+ * one Zerodha order-stream switch), and `orderStreamStatus` reports the same flag as the mechanism
+ * in force — code, status and docs now agree.
+ */
+export function zerodhaTextFramesConsumed(): boolean {
+  return zerodhaOrderStreamEnabledFromEnv();
 }
