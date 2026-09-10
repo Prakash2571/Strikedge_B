@@ -66,6 +66,7 @@ import { ExecutionTimingRecorder } from "./executionTiming.js";
 import { CalibrationPersistenceBuffer } from "./calibrationPersistence.js";
 import { BrokerTimingStore } from "./brokerTimingStore.js";
 import { ExecutionOutcomeStore } from "./executionOutcomes.js";
+import { ExecutionFunnel, type ZeroPostRefusalReason } from "./executionFunnel.js";
 import { ExecutionFaultLog } from "./executionFaults.js";
 import { QueueCalibrationEstimator } from "./queueCalibration.js";
 import { computeExecutionShortfall, type ExecutionShortfall } from "./executionShortfall.js";
@@ -212,6 +213,7 @@ import {
   type ResidualLegExposure,
 } from "./types.js";
 import type { BoxExecutionFailureReason } from "./types.js";
+import type { BoxEntryOutcomeClass } from "./types.js";
 import { entrySideFor } from "./math.js";
 import { brokerOf } from "../brokers/types.js";
 import { peakConcurrentMargin, usableMarginIntervals } from "./marginReplay.js";
@@ -301,6 +303,36 @@ interface SseClient {
   res: Response;
 }
 
+/**
+ * Map a terminal entry {@link BoxExecutionFailureReason} onto the funnel's low-cardinality
+ * zero-POST refusal vocabulary. Only meaningful for a refusal (submitted === false).
+ */
+function zeroPostReasonFor(reason: BoxExecutionFailureReason | null | undefined): ZeroPostRefusalReason {
+  switch (reason) {
+    case "cross_leg_time_skew":
+      return "coherence";
+    case "box_capital_limit":
+      return "capital";
+    case "missing_book":
+    case "feed_unhealthy":
+      return "depth";
+    case "legging_incomplete":
+      return "deadline";
+    case "underlying_already_active":
+    case "duplicate":
+      return "ownership";
+    case "insufficient_quantity":
+    case "price_moved":
+    case "edge_disappeared":
+    case "below_expected_net_profit":
+    case "market_closed":
+    case "discovery_stopped":
+    case "session_limit_reached":
+    default:
+      return "entry_guard";
+  }
+}
+
 export class BoxEngine {
   private cfg: BoxConfig;
   private quotes = new BoxQuoteStore();
@@ -351,6 +383,13 @@ export class BoxEngine {
   private readonly calibrationPersistence: CalibrationPersistenceBuffer;
   /** Measured outcome and reject-family rates (Phases 9, 19). */
   private readonly outcomeStore = new ExecutionOutcomeStore();
+  /**
+   * THE EXECUTION FUNNEL (Task 8): outcome counts with EXPLICIT denominators, incremented from
+   * REAL execution events — candidates at the scanner, qualified at the economic gate, the
+   * terminal entry outcome at {@link observeAttempt}, and completed exits at
+   * {@link closePaperTrade}. Pure accounting; it never decides anything. Read-only via getStatus.
+   */
+  private readonly funnel = new ExecutionFunnel();
   /**
    * Bounded store of TECHNICAL entry-pipeline faults, classified into a fixed taxonomy.
    *
@@ -923,6 +962,9 @@ export class BoxEngine {
       openPaperTrade: (args) => this.openPaperTrade(args),
       onExecutionAttempt: (candidate, legging, reason, detail, detectedGrossEdge) =>
         void this.persistExecutionAttempt(candidate, legging, reason, detail, detectedGrossEdge),
+      // EXECUTION FUNNEL (Task 8): candidate + qualified stages, from the scanner hot path.
+      onCandidateEvaluated: () => this.funnel.recordCandidateEvaluated(),
+      onQualified: () => this.funnel.recordQualified(),
       onEvent: (event, candidate, evaluation, detail) => {
         void appendBoxEvent({
           event,
@@ -2825,6 +2867,18 @@ export class BoxEngine {
     // rate was permanently zero.
     if (args.legging) this.observeAttempt(args.legging, true, evaluation.gross_edge);
 
+    // EXECUTION FUNNEL (Task 8): a four-leg box opened. Recorded here — not only inside
+    // observeAttempt — because an ATOMIC paper open carries no legging record yet is still a
+    // genuine completed four-leg entry. observeAttempt's funnel recorder deliberately skips the
+    // OPENED class (filledAllFour===true) so this is the SOLE place an open is counted, never twice.
+    try {
+      this.funnel.recordAdmitted();
+      this.funnel.recordSubmitted();
+      this.funnel.recordEntryOutcome({ outcome: "OPENED", submitted: true });
+    } catch (err) {
+      console.warn("[Box] funnel open recording failed (diagnostics only):", err);
+    }
+
     // Margin is captured AFTER the fill is recorded, off the hot path.
     void this.captureMargin(id, candidate.legs, candidate.lot_size, candidate.key, direction);
 
@@ -3030,6 +3084,16 @@ export class BoxEngine {
 
     const closed = await closeBoxTrade(position.id, setFields as never, closeIdempotencyKey);
     if (!closed) return false;
+
+    // EXECUTION FUNNEL (Task 8): a box closed cleanly and is durably FLAT. Its realised net P&L
+    // (after all charges) is booked here so the funnel's economics reflect completed round trips.
+    // A residual left behind means the exposure this trade opened is now resolved.
+    try {
+      this.funnel.recordCompletedExit(netPnl);
+      if (args.residual && args.residual.length > 0) this.funnel.recordUnresolvedExposureResolved();
+    } catch (err) {
+      console.warn("[Box] funnel exit recording failed (diagnostics only):", err);
+    }
 
     if (this.orderManager && this.cfg.executionMode === "live") {
       this.orderManager.recordRealisedPnl(netPnl ?? 0);
@@ -4035,6 +4099,14 @@ export class BoxEngine {
         legs.some((leg) => leg.pricing?.order_type === "PASSIVE_LIMIT") ? "PASSIVE_LIMIT" : "MARKETABLE_LIMIT";
       this.outcomeStore.recordOutcome(broker, profile, outcome);
 
+      // ── EXECUTION FUNNEL (Task 8): the SAME terminal event, counted with explicit denominators.
+      // `submitted` is derived from the outcome CLASS the execution path itself stamped: only a
+      // REFUSED_BEFORE_SUBMIT (or an equivalent no-POST classification) had zero broker POSTs, so
+      // it is the only class that must NOT dilute the broker-facing completion rate. Costs and
+      // residual come straight off the record, so recovery losses and unresolved exposure can
+      // never be hidden from the published rate.
+      this.recordEntryFunnelOutcome(legging, filledAllFour);
+
       // ── queue evidence, per leg ────────────────────────────────────────────────────
       for (const leg of legs) {
         const visible = leg.executable_within_limit_at_arrival;
@@ -4144,6 +4216,55 @@ export class BoxEngine {
     } catch (err) {
       // Observability only; never allow it to disturb a completed execution.
       console.warn("[Box] attempt observation failed (diagnostics only):", err);
+    }
+  }
+
+  /**
+   * Feed the terminal entry outcome to the {@link ExecutionFunnel} (Task 8).
+   *
+   * Pure accounting, wrapped so a counting error can never disturb an execution. `submitted` is
+   * whether ANY real broker POST occurred, derived from the outcome CLASS the execution path
+   * stamped: a REFUSED_BEFORE_SUBMIT (or a fallback classification with zero submitted legs)
+   * reached no broker. Recovery costs and unresolved exposure come straight off the record, so the
+   * displayed success rate is computed from the SAME facts and cannot be improved by hiding them.
+   */
+  private recordEntryFunnelOutcome(legging: PaperLeggingExecutionRecord, filledAllFour: boolean): void {
+    try {
+      // A clean four-leg open is counted by openPaperTrade (the only path that also handles atomic
+      // opens with no legging record). Skipping it here is what keeps a completed entry counted
+      // exactly once across the two callers of observeAttempt.
+      if (filledAllFour) return;
+      const outcomeClass: BoxEntryOutcomeClass =
+        legging.outcome_class ??
+        ((legging.submitted_leg_count ?? 0) > 0
+          ? legging.filled_leg_count > 0
+            ? "PARTIAL_ENTRY_UNWOUND"
+            : "NO_FILL"
+          : "REFUSED_BEFORE_SUBMIT");
+      // A real broker POST happened unless this was a proven pre-submit refusal. The outcome CLASS
+      // is authoritative (the execution path stamps REFUSED_BEFORE_SUBMIT only when nothing
+      // reached the broker); submitted_leg_count is the corroborating fact.
+      const submitted =
+        outcomeClass !== "REFUSED_BEFORE_SUBMIT" || (legging.submitted_leg_count ?? 0) > 0;
+      const recoveryCost =
+        (legging.partial_entry_charges ?? 0) + (legging.unwind_charges ?? 0);
+      const leftUnresolvedExposure = (legging.residual_exposure ?? []).length > 0;
+      // Every admitted attempt is counted; recordEntryOutcome files it into the right denominator.
+      this.funnel.recordAdmitted();
+      if (submitted) this.funnel.recordSubmitted();
+      this.funnel.recordEntryOutcome({
+        outcome: outcomeClass,
+        submitted,
+        // On an abort/partial the realised economics are the (negative) legging net loss; on a
+        // clean OPEN there is no realised entry P&L yet (the exit books it), so leave it null.
+        realisedNetPnl:
+          outcomeClass === "OPENED" ? null : legging.legging_net_loss ?? null,
+        recoveryCost: recoveryCost > 0 ? recoveryCost : null,
+        leftUnresolvedExposure,
+        ...(submitted ? {} : { zeroPostReason: zeroPostReasonFor(legging.failure_reason) }),
+      });
+    } catch (err) {
+      console.warn("[Box] funnel outcome recording failed (diagnostics only):", err);
     }
   }
 
@@ -4974,6 +5095,16 @@ export class BoxEngine {
         // (paper, or the inactive broker) honestly reports `not_wired` / `rest_polling_only`.
         consumers: this.refreshOrderStreamConsumerHealth(),
       }),
+      /**
+       * THE EXECUTION FUNNEL (Task 8) — outcome counts with EXPLICIT denominators, from real
+       * execution events (candidates at the scanner, qualified at the economic gate, terminal
+       * entry outcomes at observeAttempt, completed exits at closePaperTrade). Every ratio carries
+       * its denominator's basis; economic success is reported SEPARATELY from execution
+       * completion; recovery costs and unresolved exposure are counted, never hidden.
+       */
+      execution_funnel: this.funnel.snapshot(),
+      /** The economic-admission decision (five distinct quantities), when a control is enabled. */
+      economic_admission: this.centralGateway?.economicDiagnostics() ?? null,
       database_healthy: isBoxDbEnabled() && (!live || live.health.persistence === "healthy"),
       daily_risk_seed_healthy: live ? live.health.daily_risk_seed === "healthy" : null,
       reconciliation_complete: live?.health.reconciliation_complete ?? true,

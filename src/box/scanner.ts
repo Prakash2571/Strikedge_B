@@ -128,6 +128,18 @@ export interface BoxScannerDeps {
     evaluation: BoxEvaluation,
     detail?: string,
   ) => void;
+  /**
+   * EXECUTION FUNNEL (Task 8), candidate stage. Called ONCE per candidate the scanner priced —
+   * the widest denominator. Optional so tests and pure paths need not supply it; pure accounting,
+   * never on the control path.
+   */
+  onCandidateEvaluated?: () => void;
+  /**
+   * EXECUTION FUNNEL (Task 8), qualified stage. Called when a candidate passed the economic
+   * qualification gate (net-profit decision) and is about to be attempted. A strict subset of
+   * candidates. Optional.
+   */
+  onQualified?: () => void;
 }
 
 /** Counters exposed by GET /api/box/status. */
@@ -358,6 +370,9 @@ export class BoxScanner {
     this.stats.evaluations++;
     this.stats.lastEvaluationAt = now;
     this.deps.metrics?.evaluations.mark(1, now);
+    // EXECUTION FUNNEL (Task 8): every candidate the scanner prices is counted here — the widest
+    // denominator. Pure accounting; failure is swallowed so it can never disturb the hot path.
+    try { this.deps.onCandidateEvaluated?.(); } catch { /* diagnostics only */ }
 
     // Hot path: NO depth cloning. Only the touch view is built.
     const evaluation = evaluateCandidate({
@@ -404,6 +419,10 @@ export class BoxScanner {
       }
       return;
     }
+
+    // EXECUTION FUNNEL (Task 8): this candidate cleared the economic qualification gate and is
+    // about to be attempted — a strict subset of candidates.
+    try { this.deps.onQualified?.(); } catch { /* diagnostics only */ }
 
     // This is the rare transition from discovery into a real order pipeline, so
     // take one immutable four-book snapshot with depth. Hot tick evaluation stays
