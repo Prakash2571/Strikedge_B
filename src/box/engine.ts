@@ -795,6 +795,37 @@ export class BoxEngine {
       feedGeneration: () => this.feedGeneration,
       // So LIVE residual flattening bills its own fees, exactly as the paper path already did.
       chargeTotal: (orders) => this.localCharges.legs(orders).total,
+      // ECONOMIC ADMISSION (Task 8): FRESH funds/margin evidence via SUPPORTED broker facilities.
+      // Both are exposed as missing/stale rather than assumed — a throwing or "unavailable" source
+      // yields null, which the economic gate treats as unusable and (when the control is enabled)
+      // refuses on. Only consulted when a control is enabled, so paper/parity paths are untouched.
+      funds: async () => {
+        const adapter = this.liveAdapter;
+        if (!adapter?.margins) return null;
+        const m = await adapter.margins().catch(() => null);
+        if (!m || typeof m.available !== "number" || !Number.isFinite(m.available)) return null;
+        return { availableRupees: m.available, observedAt: Date.now() };
+      },
+      plannedMargin: async (requests) => {
+        const orders = requests.map((r) => ({
+          exchange: r.exchange,
+          tradingsymbol: r.tradingsymbol,
+          transaction_type: r.side,
+          variety: "regular",
+          product: "NRML",
+          order_type: "LIMIT",
+          quantity: r.quantity,
+          price: r.pricing.limit_price,
+          reference_price: r.pricing.limit_price,
+        }));
+        const basket = await this.deps.margins.basketMargin(orders).catch(() => null);
+        // "unavailable" is an HONEST no-figure, not a zero: surface it as missing so the gate
+        // fails closed rather than admitting on a fabricated ₹0 margin.
+        if (!basket || basket.source === "unavailable" || !Number.isFinite(basket.total)) {
+          return { marginRupees: null, observedAt: Date.now() };
+        }
+        return { marginRupees: basket.total, observedAt: Date.now() };
+      },
     });
     // Contract-level exclusion wraps the gateway rather than living inside it, so it
     // sits ABOVE the paper/live branch: paper gets no shortcut around coordination,

@@ -503,6 +503,32 @@ export interface BoxConfig {
    */
   liveMaxBoxCapitalRupees: number;
 
+  // ---- Economic admission (Task 8): FRESH funds/margin evidence gate, distinct from the gross cap ----
+  /**
+   * Require proof that AVAILABLE broker funds cover the entry before any leg is sent. `false`
+   * (default) keeps the pre-existing behaviour — the gross-notional cap alone. When `true`, entry
+   * is refused unless a fresh, broker-confirmed available-funds figure covers the broker margin
+   * (if a fresh margin figure exists) or else the bounded worst-case entry cost. Funds are sourced
+   * from the adapter's own margins() facility; a missing or stale figure BLOCKS rather than admits.
+   *
+   * This is NOT the gross cap and NOT an approved-budget copy: it compares real, freshly observed
+   * funds against a computed requirement. See boxCapital.ts.
+   */
+  liveRequireFundsCover: boolean;
+  /**
+   * Require FRESH, broker-confirmed margin evidence (a basket/multi-order margin estimate) before
+   * entry. `false` (default) keeps existing behaviour. When `true`, entry is refused unless a
+   * broker-confirmed, non-stale planned-margin figure exists — refusing on an estimate or a
+   * missing figure rather than assuming the account can bear the margin. No basket-margin facility
+   * is wired on the adapter yet, so with this enabled and no margin source the gate FAILS CLOSED
+   * (documented, intentional): missing evidence blocks.
+   */
+  liveRequireMarginEvidence: boolean;
+  /** Max age (ms) for an available-funds observation to count as fresh. Default 5000. */
+  liveFundsFreshnessMaxAgeMs: number;
+  /** Max age (ms) for a planned-margin observation to count as fresh. Default 5000. */
+  liveMarginFreshnessMaxAgeMs: number;
+
   // ---- Strategy-level entry restrictions (apply to ENTRY only, never to reduction) ----
   /**
    * Permit at most one active Box per UNDERLYING, regardless of strike pair, expiry or
@@ -1083,6 +1109,13 @@ export function loadBoxConfig(): BoxConfig {
     // bound is deliberately generous (₹100 crore): this is a per-Box notional cap, and clamping
     // it low would silently weaken an operator's intended limit.
     liveMaxBoxCapitalRupees: clampInt("BOX_LIVE_MAX_BOX_CAPITAL_RUPEES", 0, 0, 1_000_000_000),
+
+    // Economic admission (Task 8). Both controls default OFF so existing behaviour is unchanged;
+    // enabling either makes missing/stale funds or margin evidence BLOCK entry.
+    liveRequireFundsCover: bool("BOX_LIVE_REQUIRE_FUNDS_COVER", false),
+    liveRequireMarginEvidence: bool("BOX_LIVE_REQUIRE_MARGIN_EVIDENCE", false),
+    liveFundsFreshnessMaxAgeMs: clampInt("BOX_LIVE_FUNDS_FRESHNESS_MAX_AGE_MS", 5_000, 250, 600_000),
+    liveMarginFreshnessMaxAgeMs: clampInt("BOX_LIVE_MARGIN_FRESHNESS_MAX_AGE_MS", 5_000, 250, 600_000),
 
     oneActiveBoxPerUnderlying: bool("BOX_ONE_ACTIVE_BOX_PER_UNDERLYING", false),
     sessionMaxCompletedTrades: clampInt("BOX_SESSION_MAX_COMPLETED_TRADES", 0, 0, 10_000),

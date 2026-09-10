@@ -14,9 +14,12 @@ import {
 } from "./partialEntryRecovery.js";
 import {
   boxCapitalSummary,
+  buildEconomicPicture,
   evaluateBoxCapitalAdmission,
+  evaluateEconomicAdmission,
   grossEntryOrderNotional,
   type BoxCapitalReport,
+  type EconomicAdmissionReport,
 } from "./boxCapital.js";
 import { entrySubmissionOrder } from "./entrySubmissionOrder.js";
 import {
@@ -165,6 +168,8 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
   readonly mode: BoxConfig["executionMode"];
   /** The most recent per-Box capital decision, for status. Never a correctness input. */
   private lastCapitalReport: BoxCapitalReport | null = null;
+  /** The most recent economic-admission decision (five distinct quantities), for status. */
+  private lastEconomicReport: EconomicAdmissionReport | null = null;
 
   constructor(private readonly deps: {
     cfg: BoxConfig;
@@ -187,6 +192,26 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
      * were never even estimated — a genuine cost silently absent from the trade's accounting.
      */
     chargeTotal?: (orders: { side: OrderSide; tradingsymbol: string; quantity: number; price: number }[]) => number;
+    /**
+     * FRESH available-funds evidence for the active broker account (Task 8, economic admission).
+     *
+     * Sourced from a SUPPORTED broker facility (the adapter's own margins()), returning the
+     * available balance and the wall-clock time it was observed. Returning null — or a stale
+     * observedAt — makes the economic gate treat funds as unavailable and REFUSE rather than
+     * assume the account can fund the entry. Only consulted when a control needs it.
+     */
+    funds?: () => Promise<{ availableRupees: number | null; observedAt: number } | null>;
+    /**
+     * FRESH broker-confirmed planned-margin evidence for the four-leg entry (Task 8).
+     *
+     * A basket/multi-order margin estimate from a supported broker facility, with its observed-at
+     * time. No such facility is wired on the adapter yet, so this is usually absent; when the
+     * margin-evidence control is enabled and this is absent/stale the gate FAILS CLOSED. Never
+     * fabricated from the gross cap or the net debit.
+     */
+    plannedMargin?: (
+      requests: readonly BrokerOrderRequest[],
+    ) => Promise<{ marginRupees: number | null; observedAt: number } | null>;
   }) {
     this.mode = deps.cfg.executionMode;
   }
@@ -323,6 +348,30 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
         this.deps.cfg,
         tradeId,
       );
+    }
+
+    // ── ECONOMIC ADMISSION: FRESH funds / broker-margin evidence (Task 8) ──────────────────
+    //
+    // A DISTINCT gate from the gross-notional cap above. Where the cap bounds gross option-order
+    // notional, this proves the account can actually FUND the entry, using freshly observed broker
+    // evidence — never the cap as a stand-in for a budget, never the net debit as a stand-in for
+    // the requirement. Enabled only when the operator asks for it (funds-cover or margin-evidence);
+    // when enabled, MISSING or STALE evidence REFUSES rather than assumes. Runs on the SAME four
+    // immutable requests, still before any leg is sent, so a refusal is a free pre-submit refusal.
+    const economic = await this.evaluateEntryEconomics(requests);
+    if (economic && !economic.allowed) {
+      const rejected = liveEntryFailure(
+        args.candidate,
+        args.detection.at,
+        submittedAt,
+        [],
+        "box_capital_limit",
+        `economic admission refused entry [${economic.reasons.join(",")}]: ${economic.detail ?? "insufficient economic evidence"}`,
+        this.deps.cfg,
+        tradeId,
+      );
+      rejected.legging.outcome_class = "REFUSED_BEFORE_SUBMIT";
+      return rejected;
     }
 
     // The Box-level decision is stamped onto every leg so the manager can RE-VERIFY it at
@@ -1182,6 +1231,85 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
       ...boxCapitalSummary(this.lastCapitalReport),
       limit_source: this.mode === "live" ? "live" : "paper",
     };
+  }
+
+  /**
+   * Evaluate the economic-admission controls for a built entry request set.
+   *
+   * Returns null when NO economic control is enabled (the gross-cap-only behaviour is unchanged).
+   * When a control is enabled, it sources FRESH funds/margin evidence from the injected broker
+   * facilities and judges the five-quantity picture. Funds/margin are exposed as
+   * missing/stale (unusable) rather than assumed; the gate then fails closed.
+   *
+   * NOT applied to reduction/exit — only `simulateLeggingEntry` calls it, so protective reduction
+   * once partially exposed is never subject to new-entry economics (explicit recovery policy).
+   */
+  private async evaluateEntryEconomics(
+    requests: readonly BrokerOrderRequest[],
+  ): Promise<EconomicAdmissionReport | null> {
+    if (this.mode !== "live") return null;
+    const requireFundsCover = this.deps.cfg.liveRequireFundsCover === true;
+    const requireMarginEvidence = this.deps.cfg.liveRequireMarginEvidence === true;
+    if (!requireFundsCover && !requireMarginEvidence) return null;
+
+    const now = this.now();
+    // FRESH evidence via supported broker facilities. A throwing/absent source yields null, which
+    // the picture treats as unavailable — never a fabricated figure.
+    const fundsEvidence = this.deps.funds ? await this.deps.funds().catch(() => null) : null;
+    const marginEvidence = this.deps.plannedMargin
+      ? await this.deps.plannedMargin(requests).catch(() => null)
+      : null;
+
+    const picture = buildEconomicPicture({
+      requests,
+      now,
+      marginFreshnessMaxAgeMs: this.deps.cfg.liveMarginFreshnessMaxAgeMs,
+      fundsFreshnessMaxAgeMs: this.deps.cfg.liveFundsFreshnessMaxAgeMs,
+      availableFundsRupees: fundsEvidence?.availableRupees ?? null,
+      availableFundsObservedAt: fundsEvidence?.observedAt ?? null,
+      plannedMarginRupees: marginEvidence?.marginRupees ?? null,
+      plannedMarginObservedAt: marginEvidence?.observedAt ?? null,
+      estimatedChargesRupees: this.chargesForRequests(requests),
+      expectedLegCount: BOX_LEG_ROLES.length,
+    });
+
+    const report = evaluateEconomicAdmission({
+      picture,
+      // Reuse the SAME gross cap as the notional gate for the gross-notional check inside the
+      // economic evaluator; the funds/margin controls are independent of it.
+      grossCapRupees: this.capitalLimitRupees(),
+      requireFundsCover,
+      requireMarginEvidence,
+    });
+    this.lastEconomicReport = report;
+    return report;
+  }
+
+  /** Estimated charges (₹) for a request set, from the local fee calculator when available. */
+  private chargesForRequests(requests: readonly BrokerOrderRequest[]): number | null {
+    if (!this.deps.chargeTotal) return null;
+    try {
+      return this.deps.chargeTotal(
+        requests.map((r) => ({
+          side: r.side,
+          tradingsymbol: r.tradingsymbol,
+          quantity: r.quantity,
+          price: r.pricing.limit_price,
+        })),
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The last economic-admission decision, for status/diagnostics.
+   *
+   * Returns null until an economic control has run at least once. The picture carries all five
+   * quantities with their provenance so an operator can see, e.g., ample funds but stale margin.
+   */
+  economicDiagnostics(): EconomicAdmissionReport | null {
+    return this.lastEconomicReport;
   }
 
   /**
