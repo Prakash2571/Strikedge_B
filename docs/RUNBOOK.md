@@ -16,6 +16,24 @@ and the cutover; this document is what you keep open during a trading day.
 3. **15:40 IST — trading window closes** (the market-hours predicate).
 4. **Overnight** — the Mongo projector drains the outbox to Atlas for reporting.
 
+## Arming order (do NOT get this backwards)
+
+Entry authority and exposure-management permission are SEPARATE controls (both
+default off). The safe order is:
+
+- **Before arming:** run `node dist/box/effectiveConfig.js` and confirm the
+  resolved values — especially that live is armed only if you intend it, the
+  capital cap is your approved figure (not the placeholder), and one-box/one-lot
+  limits are in force. Confirm the same on `/api/box/status` `.config`.
+- **Arm exposure management (`liveOrderEnabled`) FIRST**, then **entry
+  (`entryEnabled`)**. Withdrawing entry authority never disables protective
+  cancellation or attributed reduction (`orderManager.ts:831`), so you can disarm
+  entry at any time and still manage exposure.
+- **When winding down: disarm ENTRY first**, confirm flat, and only then disarm
+  exposure management. **Never disable `liveOrderEnabled` while any exposure or
+  unresolved order exists** — that strands risk you can no longer manage.
+
+
 ## Reading `GET /api/runtime/status`
 
 The single pane of glass. Check it first for anything. It reports, among others:
