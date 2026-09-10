@@ -124,7 +124,7 @@ import { BoxQuoteStore, SpotStore } from "./quotes.js";
 import { orderStreamStatus } from "./orderStreamStatus.js";
 import type { OrderStreamHealth } from "./orderUpdateProjection.js";
 import { OrderStreamConsumer } from "./orderStreamConsumer.js";
-import { MarketDataStateMachine, marketDataPermissions, type MarketDataState } from "./streamHealthPolicy.js";
+import { MarketDataStateMachine, marketDataPermissions, entryPermittedFromStreams, type MarketDataState, type OrderStreamLifecycleState } from "./streamHealthPolicy.js";
 import { StagePipeline } from "./boundedQueue.js";
 import { parseKiteOrderFrame, zerodhaOrderStreamEnabledFromEnv } from "../brokers/zerodha/orderUpdates.js";
 import { dhanOrderStreamEnabledFromEnv, type DhanOrderFeed } from "../brokers/dhan/orderFeed.js";
@@ -805,6 +805,22 @@ export class BoxEngine {
             // polling continues; it must never throw into the ingestion path.
           }
         },
+        // POST-RECONNECT GAP-REPAIR SWEEP (D4). Driven by runReconnectReconciliation whenever the
+        // machine is RECONCILING (first connect and every reconnect). It delegates to the SAME
+        // order-manager REST reconcile — the existing guarded durable path — so no second
+        // persistence path is invented. The consumer clears RECONCILING (→ READY) only after this
+        // resolves consistently; a throw leaves it RECONCILING and REST polling continues. The
+        // `_ingestRest` funnel is available for recovered observations that must also land in the
+        // consumer's own projection; the manager's reconcile is the durable authority.
+        reconcileSweep: async (_ingestRest) => {
+          await this.orderManager?.reconcile();
+        },
+        // EXPECTED-IDLE BOUND (D5). A connected order stream that delivers nothing for longer than
+        // this WHILE a working order is outstanding is demoted to DEGRADED. Silence on an account
+        // with nothing working is normal and never demotes. Derived from the live reconcile
+        // interval (the cadence at which REST would otherwise catch a missed fill): if the stream
+        // has said nothing for a working order across a whole reconcile cycle, it is not delivering.
+        expectedIdleMs: Math.max(5_000, this.cfg.liveReconcileIntervalMs),
         now: () => this.executionClock.wall(),
       });
       this.orderStreamConsumer = consumer;
@@ -891,14 +907,36 @@ export class BoxEngine {
       broker: () => this.deps.activeBroker(),
       isTokenWarm: (token) => this.tokenFeedGeneration.get(token) === this.feedGeneration,
       feedGeneration: () => this.feedGeneration,
-      // MARKET-DATA READINESS gate for NEW ENTRY (GAP 1). Live only: the machine is armed only in
-      // live mode (in paper it is DISABLED and this gate would otherwise refuse everything), so the
-      // gate is supplied only when executing live. Reports the driven state as the refusal reason.
+      // COMBINED READINESS gate for NEW ENTRY (GAP 1 + D1). Live only: the market-data machine is
+      // armed only in live mode (in paper it is DISABLED and this gate would otherwise refuse
+      // everything), so the gate is supplied only when executing live.
+      //
+      // D1 FIX: the entry gate is the INTERSECTION of BOTH transports' NEW-ENTRY permission, via
+      // the shared combinedPermissions table (entryPermittedFromStreams), NOT market data alone.
+      // An enabled-but-unhealthy order stream (CONNECTING/AUTHENTICATING/RECONCILING/DEGRADED/
+      // DISCONNECTED/AUTH_EXPIRED) therefore refuses new entry, because taking fresh exposure on
+      // top of an unreconciled or undelivered fill gap is how one unknown becomes two. A DISABLED
+      // order stream never blocks — REST polling is the documented baseline and the stream is OFF
+      // by default. This is ENTRY-ONLY: protective cancel, exit and attributed reduction are never
+      // routed through here and are never blocked by it, so a degraded stream cannot strand a
+      // live position. The refusal reason names whichever transport blocked.
       ...(this.cfg.executionMode === "live"
         ? {
             marketDataEntryPermitted: () => {
               const state = this.marketDataState();
-              return { permitted: marketDataPermissions(state).newEntry, state };
+              const orderStream = this.orderStreamState();
+              // Both transports must license NEW ENTRY (intersection). Market data is scored from
+              // its own permission table; the order stream is intersected via the SAME shared
+              // combinedPermissions table (entryPermittedFromStreams), never an ad-hoc boolean.
+              const marketDataOk = marketDataPermissions(state).newEntry;
+              const permitted = entryPermittedFromStreams({ marketData: state, orderStream }).permitted;
+              // Name whichever transport blocked, so the operator sees an actionable reason.
+              const reason = permitted
+                ? state
+                : marketDataOk
+                  ? `order-stream ${orderStream}`
+                  : state;
+              return { permitted, state: reason };
             },
           }
         : {}),
@@ -5372,7 +5410,36 @@ export class BoxEngine {
   onBoxLaneConnection(connected: boolean): void {
     this.invalidateFeedGeneration();
     this.driveMarketDataConnection(connected);
+    this.driveZerodhaOrderStreamConnection(connected);
     if (!connected) this.lastError = "box market-data lane disconnected";
+  }
+
+  /**
+   * Drive the ZERODHA ORDER-STREAM lifecycle from the SAME quote-socket connection (D6).
+   *
+   * Per the verified broker docs (docs/BROKER_STREAM_DOCS.md), Zerodha multiplexes order postbacks
+   * as TEXT frames onto the very quote socket that carries the ticks — there is no separate order
+   * socket to open. So the order-stream health machine must be driven by the quote socket's
+   * lifecycle, exactly as the market-data machine is. Before this the Zerodha consumer only ever
+   * received `onConnecting()` and was stuck at CONNECTING, causing orderStreamStatus to under-claim
+   * the account as rest_polling_only even while postbacks were resolving waiters.
+   *
+   * A `connected=true` edge stands for "socket open AND authorised" (the box lane only opens once
+   * it holds credentials). We therefore walk CONNECTING → socket-open → authenticated, which puts
+   * the machine in RECONCILING, and then DRIVE the post-(re)connect gap-repair sweep (D4) to
+   * completion — only after which the machine reaches READY. A `connected=false` edge is a
+   * disconnect: exposure management and protective cancel continue, new entry stops, and a missing
+   * postback is never read as a zero fill. Inert unless a Zerodha consumer exists and its stream is
+   * armed; Dhan drives its own DEDICATED order socket via createDhanOrderFeed and is untouched here.
+   */
+  private driveZerodhaOrderStreamConnection(connected: boolean): void {
+    const consumer = this.orderStreamConsumer;
+    if (!consumer) return;
+    if (this.deps.activeBroker() !== "zerodha") return;
+    if (!zerodhaOrderStreamEnabledFromEnv()) return;
+    // Delegate the multiplexed-socket semantics to the consumer. In production we do not block the
+    // socket callback on the reconciliation promise; the consumer fails open internally.
+    void consumer.driveQuoteSocketLifecycle(connected);
   }
 
   /**
@@ -5418,6 +5485,21 @@ export class BoxEngine {
     // Force the age-based demotions no discrete event would trigger (a heartbeat gap or a book
     // that quietly aged past its bound), then report.
     return this.marketDataMachine.evaluate();
+  }
+
+  /**
+   * The current driven ORDER-STREAM lifecycle state (D1). For status and the combined entry gate.
+   *
+   * When no consumer exists (paper deployments) the order stream is DISABLED, which the
+   * combinedPermissions table treats as "does not block" — REST polling is the baseline. When a
+   * consumer exists, this first drives the idleness clock (D5) so a connected-but-not-delivering
+   * stream is demoted to DEGRADED before the gate reads it, then reports the machine's state.
+   */
+  orderStreamState(): OrderStreamLifecycleState {
+    const consumer = this.orderStreamConsumer;
+    if (!consumer) return "DISABLED";
+    consumer.evaluateIdle(this.executionClock.wall());
+    return consumer.lifecycleState();
   }
 
   /**

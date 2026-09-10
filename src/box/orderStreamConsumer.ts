@@ -88,6 +88,24 @@ export interface OrderStreamConsumerOptions {
    * Fail-open: a reconciliation error must not throw into the ingestion path.
    */
   readonly restReconcile?: (clientOrderId: string) => Promise<void>;
+  /**
+   * The POST-RECONNECT GAP-REPAIR SWEEP (D4). Invoked by {@link runReconnectReconciliation} while
+   * the machine is RECONCILING, this reconciles durable nonterminal orders and attributed
+   * positions against the broker over REST. It is handed an `ingestRest` callback so every
+   * observation it recovers is funnelled through the SAME single projection — so a gap fill and a
+   * later stream redelivery of that same fill deduplicate and never double-count. The consumer
+   * clears RECONCILING (→ READY) only AFTER this resolves consistently. Fail-open: a throwing
+   * sweep leaves the machine RECONCILING and REST polling continues.
+   */
+  readonly reconcileSweep?: (
+    ingestRest: (obs: IncomingObservation) => IngestResult,
+  ) => Promise<void>;
+  /**
+   * Expected-idle bound (ms). A connected stream that delivers NO event for longer than this WHILE
+   * a working order is outstanding is demoted to DEGRADED by {@link evaluateIdle} (D5). Silence on
+   * an account with no working orders is NORMAL and never demotes. Default 15000.
+   */
+  readonly expectedIdleMs?: number;
   readonly now?: () => number;
 }
 
@@ -109,11 +127,24 @@ export class OrderStreamConsumer {
   private streamEventsApplied = 0;
   private streamEventsWokeAdapter = 0;
   private absentEvidenceEvents = 0;
+  /**
+   * WORKING ORDERS — the orders we are actually EXPECTING events for (D5). An order enters here on
+   * registerIntent and leaves when it is observed complete (cumulative ≥ requested) or explicitly
+   * settled by the manager. Idleness is only evidence of a problem when this set is non-empty:
+   * a quiet stream on an account with nothing working is normal, not degraded.
+   */
+  private readonly workingOrders = new Set<string>();
+  /** Requested quantity per registered order, so a completing observation can settle it. */
+  private readonly requestedQtyOf = new Map<string, number>();
+  /** Wall-clock ms of the last event delivered by the STREAM (never a REST poll). */
+  private lastStreamEventAtWall: number | null = null;
+  private readonly expectedIdleMs: number;
 
   constructor(opts: OrderStreamConsumerOptions) {
     this.opts = opts;
     this.machine = new OrderStreamStateMachine(opts.streamEnabled);
     this.proj.setStreamEnabled(opts.streamEnabled);
+    this.expectedIdleMs = Math.max(0, opts.expectedIdleMs ?? 15_000);
   }
 
   private now(): number {
@@ -137,6 +168,25 @@ export class OrderStreamConsumer {
       requestedQty: args.requestedQty,
       brokerOrderId: args.brokerOrderId ?? null,
     });
+    // A freshly registered order is a WORKING order: we now EXPECT fill/terminal events for it, so
+    // stream silence past the idle bound becomes evidence of a problem (D5). It leaves the set when
+    // observed complete or explicitly settled.
+    this.requestedQtyOf.set(args.clientOrderId, args.requestedQty);
+    if (args.requestedQty > 0) this.workingOrders.add(args.clientOrderId);
+  }
+
+  /**
+   * Explicitly settle an order that will produce no further events (a confirmed cancel/reject with
+   * residual, a fully-reconciled terminal). The manager calls this so a cancelled-with-residual
+   * order does not keep the idle detector expecting events that will never come.
+   */
+  markOrderSettled(clientOrderId: string): void {
+    this.workingOrders.delete(clientOrderId);
+  }
+
+  /** How many orders are currently WORKING (events expected). For diagnostics and the idle gate. */
+  workingOrderCount(): number {
+    return this.workingOrders.size;
   }
 
   /** Bind a broker order id to the durable client identity once the broker reports it. */
@@ -182,6 +232,13 @@ export class OrderStreamConsumer {
     };
     const result = this.proj.ingest(stamped);
 
+    // STREAM LIVENESS (D5). A genuine stream delivery — with or without a quantity — proves the
+    // socket is delivering RIGHT NOW, so it resets the idle clock. A REST poll never does this, so
+    // a poll can never mask a dead stream as alive.
+    if ((source === "order_update" || source === "postback") && result.attributed) {
+      this.lastStreamEventAtWall = stamped.observedAtWall ?? this.now();
+    }
+
     if (!result.attributed || result.clientOrderId === null) return result;
 
     if (result.quantityEvidence === "absent") {
@@ -199,6 +256,12 @@ export class OrderStreamConsumer {
     // disturb the adapter — the ledger already deduplicated it.
     if (result.apply && (result.apply.outcome === "applied" || result.apply.outcome === "applied_overfill")) {
       this.applyToAdapter(result.clientOrderId, stamped, /* quantityAbsent */ false);
+    }
+
+    // WORKING-ORDER SETTLEMENT (D5). When the ledger reports this order fully filled, it no longer
+    // expects events, so it leaves the working set — a subsequent quiet period is then normal.
+    if (result.apply && result.apply.remaining <= 0) {
+      this.workingOrders.delete(result.clientOrderId);
     }
     return result;
   }
@@ -253,6 +316,9 @@ export class OrderStreamConsumer {
     const reconnect = this.machine.isReconnect();
     this.machine.onAuthenticated();
     this.proj.onStreamConnected({ authorised: true, reconnect });
+    // A fresh (re)connect resets the idle clock: silence is measured from when the socket became
+    // authorised, not from a stale pre-disconnect event.
+    this.lastStreamEventAtWall = this.now();
   }
 
   /**
@@ -264,9 +330,89 @@ export class OrderStreamConsumer {
     this.proj.markReconciled();
   }
 
+  /**
+   * DRIVE THE POST-RECONNECT GAP-REPAIR SWEEP TO COMPLETION (D4).
+   *
+   * Called by the caller (the engine) whenever the machine is RECONCILING — on first connect and
+   * on every reconnect. It runs the injected {@link OrderStreamConsumerOptions.reconcileSweep},
+   * handing it an `ingestRest` funnel so every recovered observation goes through the SAME single
+   * projection: a fill that happened in the disconnect gap (which the broker does NOT replay) is
+   * recovered and counted exactly once, and a stream event that arrives DURING the sweep merges
+   * monotonically without double-counting. Only AFTER the sweep resolves does the machine leave
+   * RECONCILING (→ READY). Fail-open: a throwing sweep leaves it RECONCILING and REST continues.
+   *
+   * Idempotent and safe to poll: it is a no-op unless a reconciliation is actually owed.
+   */
+  async runReconnectReconciliation(): Promise<void> {
+    if (!this.reconcilePending()) return;
+    const sweep = this.opts.reconcileSweep;
+    if (!sweep) {
+      // No explicit sweep supplied: nothing can prove consistency, so stay RECONCILING. This is
+      // deliberately conservative — a gap that cannot be repaired must not silently read READY.
+      return;
+    }
+    try {
+      await sweep((obs) => this.ingestRestObservation(obs, "reconciliation"));
+      // The sweep completed and every recovered observation is in the single projection. NOW the
+      // machine may leave RECONCILING.
+      this.markSynchronized();
+    } catch {
+      // Fail-open: leave RECONCILING/DISCONNECTED as-is; the next poll retries. Never throw.
+    }
+  }
+
   /** Connected but not delivering usable events within the expected idle bound. */
   onIdle(): void {
     this.machine.onIdle();
+  }
+
+  /**
+   * DRIVE THE ZERODHA MULTIPLEXED-QUOTE-SOCKET LIFECYCLE (D6).
+   *
+   * Zerodha carries order postbacks as TEXT frames on the SAME quote socket that carries the
+   * ticks (docs/BROKER_STREAM_DOCS.md), so there is no separate order socket to open — the
+   * order-stream health MUST be driven by the quote socket's connection lifecycle. A
+   * `connected=true` edge means the quote socket is open AND authorised (the box lane only opens
+   * once it holds credentials), so this walks CONNECTING → socket-open → authenticated, landing in
+   * RECONCILING, and drives the post-(re)connect gap-repair sweep (D4) to completion — the only
+   * path to READY. A `connected=false` edge is a disconnect. Inert when the stream is DISABLED.
+   *
+   * Returns the promise of the reconnect reconciliation so a caller may await it in tests; in
+   * production the engine fires it and does not block the socket callback.
+   */
+  driveQuoteSocketLifecycle(connected: boolean): Promise<void> {
+    if (this.machine.state() === "DISABLED") return Promise.resolve();
+    if (connected) {
+      this.onConnecting();
+      this.onSocketOpen();
+      this.onAuthenticated();
+      return this.runReconnectReconciliation();
+    }
+    this.onDisconnected();
+    return Promise.resolve();
+  }
+
+  /**
+   * DRIVE IDLENESS FROM A REAL CLOCK (D5).
+   *
+   * Called on a poll with the current wall time. It demotes a connected stream (READY/RECONCILING)
+   * to DEGRADED ONLY when BOTH are true:
+   *   1. a WORKING order is outstanding (we are actually EXPECTING events), and
+   *   2. no stream event has arrived for longer than the expected-idle bound.
+   * A quiet stream on an account with nothing working is NORMAL and never demotes — the alarm is
+   * based on working-order expectation, not wall-clock silence alone. Any real stream event resets
+   * the clock (see ingest), so a live-but-slow stream is not falsely flagged.
+   */
+  evaluateIdle(nowWall?: number): void {
+    if (this.workingOrders.size === 0) return; // silence is expected — no false alarm
+    const state = this.machine.state();
+    if (state !== "READY" && state !== "RECONCILING") return;
+    const now = nowWall ?? this.now();
+    const since = this.lastStreamEventAtWall;
+    if (since === null) return; // never connected/authorised long enough to measure
+    if (now - since > this.expectedIdleMs) {
+      this.machine.onIdle();
+    }
   }
 
   onDisconnected(): void {

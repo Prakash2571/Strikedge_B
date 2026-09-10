@@ -192,6 +192,38 @@ export function combinedPermissions(args: {
 }
 
 /**
+ * THE COMBINED NEW-ENTRY GATE — the single seam the live entry checkpoint consults (D1).
+ *
+ * NEW ENTRY is the only operation both transports must license, so the entry checkpoint asks THIS
+ * one question and never re-implements the matrix as an ad-hoc boolean. It is a thin wrapper over
+ * {@link combinedPermissions} that also carries BOTH transport states back so the refusal reason
+ * names which transport blocked and why.
+ *
+ * THE ASYMMETRY IT PRESERVES, unchanged from the table:
+ *   - A DISABLED order stream permits entry — REST polling is the documented baseline
+ *     fill-observation mechanism and the order stream is OFF by default. Only an ENABLED-but-
+ *     unhealthy stream (CONNECTING/AUTHENTICATING/RECONCILING/DEGRADED/DISCONNECTED/AUTH_EXPIRED)
+ *     refuses new entry.
+ *   - It gates NEW ENTRY ONLY. Exit, attributed reduction and protective cancel are never routed
+ *     through this gate, so a degraded order stream can never strand a live position.
+ */
+export function entryPermittedFromStreams(args: {
+  readonly marketData: MarketDataState;
+  readonly orderStream: OrderStreamLifecycleState;
+}): {
+  readonly permitted: boolean;
+  readonly marketData: MarketDataState;
+  readonly orderStream: OrderStreamLifecycleState;
+} {
+  const combined = combinedPermissions(args);
+  return {
+    permitted: combined.newEntry,
+    marketData: args.marketData,
+    orderStream: args.orderStream,
+  };
+}
+
+/**
  * Why each blocked operation is blocked, in operator-readable form.
  *
  * Exists so the frontend can say "entry is paused because the order stream reconnected and a
