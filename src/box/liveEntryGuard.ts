@@ -38,6 +38,12 @@
 export type LiveEntryGuardStage =
   /** Before the four broker requests are even constructed. */
   | "pre_build"
+  /**
+   * The asynchronous funds/margin evidence reads have completed. A REAL checkpoint, not a label:
+   * those reads are broker round trips, and the scanner can withdraw the candidate while they are in
+   * flight. Nothing has been transmitted yet, so a refusal here is still free.
+   */
+  | "post_evidence"
   /** Constructed and admitted, immediately before handing them to the order manager. */
   | "pre_enqueue"
   /** The order manager dequeued this leg and took a concurrency slot. */
@@ -86,7 +92,24 @@ export type LiveEntryGuardRefusal =
    * box that turned out uneconomic. It is never applied to an exit or a protective reduction,
    * because the guard is only ever passed for ENTRY legs.
    */
-  | "cross_leg_incoherent";
+  | "cross_leg_incoherent"
+
+  /**
+   * The FUNDS/MARGIN EVIDENCE that admitted this entry no longer applies at the final send boundary.
+   *
+   * Section 3 requirement 12. Admission proved the account could fund the sequence using freshly
+   * observed broker evidence. The leg then waits — queued, persisted, parked on the hedge-first
+   * barrier, paced by the adapter — and by the time it is about to POST any of three things may have
+   * happened: the evidence AGED past its freshness bound, the broker/account/session CHANGED, or a
+   * chase RE-PRICED the leg so the basket-margin figure is no longer about the order being sent.
+   * Each makes the admission decision unproven, and unproven is not permission.
+   *
+   * EXPOSURE-AWARE, exactly like `cross_leg_incoherent`: raised only while the attempt holds NO
+   * exposure. Once a leg has POSTed the policy is to COMPLETE the hedged box and record the
+   * degradation, because abandoning legs 2-4 manufactures a partial entry with a real recovery cost.
+   * Never applied to an exit or a protective reduction — the guard is only ever passed for ENTRY.
+   */
+  | "economic_evidence_expired";
 
 export interface LiveEntryGuardInputs {
   readonly stage: LiveEntryGuardStage;
@@ -138,6 +161,17 @@ export interface LiveEntryGuardInputs {
    * "no objection from here", NOT "coherence is proven".
    */
   readonly crossLegCoherenceGap: string | null;
+
+  /**
+   * FUNDS/MARGIN EVIDENCE validity at the send boundary, or null when it is not applicable.
+   *
+   * A non-null value is the specific reason the economic admission decision no longer holds:
+   * expired evidence, a changed broker/account/session, or an order plan that differs from the one
+   * the margin figure was fetched for. Only the `pre_post` checkpoint supplies one, and only while
+   * the attempt holds NO exposure — see `economic_evidence_expired`. Layers with no economic control
+   * enabled pass `null`, which means "no objection from here", NOT "funding is proven".
+   */
+  readonly economicEvidenceGap?: string | null;
 }
 
 export type LiveEntryGuardDecision =
@@ -182,6 +216,12 @@ export function evaluateLiveEntryGuard(inputs: LiveEntryGuardInputs): LiveEntryG
     return refuse(
       "cross_leg_incoherent",
       `the four legs no longer form a coherent snapshot ${at}: ${inputs.crossLegCoherenceGap}`,
+    );
+  }
+  if (inputs.economicEvidenceGap !== null && inputs.economicEvidenceGap !== undefined) {
+    return refuse(
+      "economic_evidence_expired",
+      `the funds/margin evidence that admitted this entry no longer applies ${at}: ${inputs.economicEvidenceGap}`,
     );
   }
   if (!inputs.entryAdmissible) {

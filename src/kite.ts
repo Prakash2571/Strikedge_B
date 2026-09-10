@@ -727,12 +727,43 @@ export class KiteClient {
   }
 
   /**
-   * Basket margin (/margins/basket): net margin for a set of orders, factoring
-   * in hedge/spread benefits. Used to size a calendar spread's capital.
+   * Basket margin (/margins/basket): margin for a set of orders.
+   *
+   * VERIFIED against https://kite.trade/docs/connect/v3/margins/ (2026-09-10). The response has two
+   * distinct blocks and the documentation defines them as:
+   *
+   *   initial — "Total margins required to execute the orders"
+   *   final   — "Total margins with the spread benefit"
+   *
+   * They are NOT interchangeable. In Zerodha's own documented example the same two-leg basket shows
+   * initial ₹96,504.98 and final ₹34,786.73 — a factor of ~2.8. `final` describes the COMPLETED
+   * hedged structure; it is not evidence that the account can fund the SEQUENCE that creates it,
+   * because at the first leg no spread benefit exists yet.
+   *
+   * WHAT THIS USED TO DO, AND WHY IT WAS WRONG. It returned `total: final || initial`, which
+   *   (a) handed callers the spread-benefit figure as the funding number, and
+   *   (b) silently fell back to `initial` whenever `final.total` was 0 — a legitimate value — so the
+   *       caller could not tell which of two very different quantities it had received.
+   *
+   * Now `initial` and `final` are both preserved, `total` names which one it is via `total_basis`,
+   * and a missing block is reported as `null` rather than coerced to 0. `total` remains `final` when
+   * present, because that is the right number for DISPLAYING the margin of a completed box; callers
+   * making a FUNDING decision must use the stage model in src/box/boxCapital.ts, which consumes
+   * `initial` and `final` separately.
+   *
+   * `option_premium` is a COMPONENT of each block's `total` (see the documented margin structure), so
+   * premium must never be added on top of these figures — that would double-count it.
    */
   async getBasketMargin(
     orders: BasketOrder[],
-  ): Promise<{ initial: number; final: number; total: number }> {
+  ): Promise<{
+    initial: number;
+    final: number;
+    total: number;
+    initial_available: boolean;
+    final_available: boolean;
+    total_basis: "final" | "initial" | "unavailable";
+  }> {
     const { status, ok, json } = await this.postJson<{
       status: string;
       data?: { initial?: { total?: number }; final?: { total?: number } };
@@ -745,9 +776,23 @@ export class KiteClient {
         status || 500,
       );
     }
-    const initial = json.data.initial?.total ?? 0;
-    const final = json.data.final?.total ?? 0;
-    return { initial, final, total: final || initial };
+    // PRESENCE is tracked separately from VALUE: a block Zerodha did not send is UNKNOWN, and a
+    // block whose total is genuinely 0 is a real zero. Collapsing the two with `??  0` is what made
+    // the old `final || initial` fallback undetectable.
+    const rawInitial = json.data.initial?.total;
+    const rawFinal = json.data.final?.total;
+    const initialAvailable = typeof rawInitial === "number" && Number.isFinite(rawInitial);
+    const finalAvailable = typeof rawFinal === "number" && Number.isFinite(rawFinal);
+    const initial = initialAvailable ? (rawInitial as number) : 0;
+    const final = finalAvailable ? (rawFinal as number) : 0;
+    return {
+      initial,
+      final,
+      total: finalAvailable ? final : initial,
+      initial_available: initialAvailable,
+      final_available: finalAvailable,
+      total_basis: finalAvailable ? "final" : initialAvailable ? "initial" : "unavailable",
+    };
   }
 
   /**

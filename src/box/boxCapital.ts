@@ -43,6 +43,7 @@
  */
 
 import type { BoxLegRole, OrderSide } from "./types.js";
+import type { AgedEvidence, EvidenceIdentity } from "./evidenceTiming.js";
 
 /** ₹ -> integer paise, half-up. Total: non-finite input yields 0. */
 export function toPaise(rupees: number): number {
@@ -328,10 +329,17 @@ export function boxCapitalSummary(report: BoxCapitalReport | null): {
  *   "broker_confirmed" — returned by a supported broker margin/funds facility THIS session.
  *   "estimate"         — computed by us (e.g. gross notional, worst-case cost). Deterministic
  *                        but NOT a promise the broker will accept the orders.
- *   "unavailable"      — no figure could be obtained. Distinct from a value of 0.
+ *   "unavailable"      — no figure could be obtained (absent source, timeout, throw, null).
+ *                        Distinct from a value of 0.
  *   "stale"            — a figure was obtained but is older than the configured freshness bound.
+ *   "invalid"          — a figure was obtained but cannot be AGED or ATTRIBUTED: a non-finite
+ *                        timestamp, a source clock materially in the future, inverted monotonic
+ *                        readings, or an account/session/broker that changed during the read.
+ *                        Distinct from "stale" on purpose: stale means "too old", invalid means
+ *                        "this number is not about what we are trading, or cannot be trusted to be
+ *                        timed at all". Both are unusable; conflating them hides a clock fault.
  */
-export type EconomicProvenance = "broker_confirmed" | "estimate" | "unavailable" | "stale";
+export type EconomicProvenance = "broker_confirmed" | "estimate" | "unavailable" | "stale" | "invalid";
 
 /**
  * A single economic quantity with full provenance.
@@ -343,51 +351,86 @@ export type EconomicProvenance = "broker_confirmed" | "estimate" | "unavailable"
 export interface EconomicFigure {
   readonly value_rupees: number | null;
   readonly provenance: EconomicProvenance;
-  /** Epoch ms the figure was observed, or null when never observed. */
+  /** Epoch ms the figure was observed, or null when never observed. WALL clock, for audit only. */
   readonly observed_at: number | null;
-  /** Age (ms) at the time the report was built, or null when never observed. */
+  /**
+   * Monotonic ms the figure was observed. Null for a locally computed estimate or when unavailable.
+   * NEVER comparable with `observed_at`; this is the reading `age_ms` is derived from.
+   */
+  readonly observed_at_mono: number | null;
+  /** Age (ms) at the time the report was built, or null when never observed. Never negative. */
   readonly age_ms: number | null;
+  /** True when `age_ms` came from the monotonic clock rather than a wall-clock difference. */
+  readonly age_is_monotonic: boolean;
   /** True when provenance is broker_confirmed AND within the freshness bound. */
   readonly usable: boolean;
+  /**
+   * The order plan this figure is evidence ABOUT, when it is plan-specific (a basket margin).
+   * Null for account-level figures (available funds) and local estimates.
+   */
+  readonly plan_fingerprint: string | null;
   /** Free-text describing exactly what this figure can and cannot prove. */
   readonly note: string;
 }
 
 /**
- * Build an {@link EconomicFigure} for a REMOTE (broker) figure, applying the freshness bound.
+ * Build an {@link EconomicFigure} from an ALREADY-AGED observation.
  *
- * A figure older than `maxAgeMs` is downgraded to "stale" and marked unusable, because a margin
- * or funds number that predates the current book cannot be trusted to admit a live entry.
+ * The freshness decision itself lives in {@link ageEvidence} (src/box/evidenceTiming.ts), which owns
+ * the one coherent clock model: monotonic for durations, wall for audit, evaluation instant stamped
+ * AFTER the reads resolve. This function only projects that decision into the reporting shape, so
+ * there is exactly ONE place in the system that decides whether a broker figure is fresh.
+ *
+ * WHY THIS CHANGED. It used to compute `age = now - observedAt` from two wall-clock readings taken
+ * on opposite sides of an `await`, which made the age of every real broker response NEGATIVE and
+ * downgraded fresh evidence to "stale". See src/box/evidenceTiming.ts for the full root cause.
  */
 export function brokerFigure(args: {
   readonly valueRupees: number | null;
-  readonly observedAt: number | null;
-  readonly now: number;
-  readonly maxAgeMs: number;
+  readonly aged: AgedEvidence;
+  /** Wall time the figure was observed, for the audit record. */
+  readonly observedAtWall: number | null;
+  /** Monotonic time the figure was observed, which `aged.age_ms` is derived from. */
+  readonly observedAtMono: number | null;
+  readonly planFingerprint?: string | null;
   readonly confirmedNote: string;
 }): EconomicFigure {
-  if (args.valueRupees === null || !Number.isFinite(args.valueRupees) || args.observedAt === null) {
+  const plan = args.planFingerprint ?? null;
+  // No value, or a non-finite one, is UNKNOWN — never ₹0, and never merely "stale".
+  if (args.valueRupees === null || !Number.isFinite(args.valueRupees)) {
     return {
       value_rupees: null,
       provenance: "unavailable",
       observed_at: null,
+      observed_at_mono: null,
       age_ms: null,
+      age_is_monotonic: false,
       usable: false,
-      note: "no broker figure obtained; treated as UNKNOWN, never as ₹0",
+      plan_fingerprint: plan,
+      note:
+        args.aged.status === "unavailable"
+          ? args.aged.note
+          : `${args.aged.note} (and no finite figure was returned; treated as UNKNOWN, never as ₹0)`,
     };
   }
-  const age = args.now - args.observedAt;
-  const fresh = Number.isFinite(age) && age >= 0 && age <= args.maxAgeMs;
+  const provenance: EconomicProvenance =
+    args.aged.status === "usable"
+      ? "broker_confirmed"
+      : args.aged.status === "stale"
+        ? "stale"
+        : args.aged.status === "invalid"
+          ? "invalid"
+          : "unavailable";
   return {
     value_rupees: args.valueRupees,
-    provenance: fresh ? "broker_confirmed" : "stale",
-    observed_at: args.observedAt,
-    age_ms: Number.isFinite(age) ? age : null,
-    usable: fresh,
-    note: fresh
-      ? args.confirmedNote
-      : `broker figure is ${Number.isFinite(age) ? age : "?"}ms old, over the ${args.maxAgeMs}ms ` +
-        "freshness bound; treated as STALE and not usable for admission",
+    provenance,
+    observed_at: args.observedAtWall,
+    observed_at_mono: args.observedAtMono,
+    age_ms: args.aged.age_ms,
+    age_is_monotonic: args.aged.age_is_monotonic,
+    usable: provenance === "broker_confirmed",
+    plan_fingerprint: plan,
+    note: provenance === "broker_confirmed" ? `${args.confirmedNote} (${args.aged.note})` : args.aged.note,
   };
 }
 
@@ -398,8 +441,11 @@ export function estimateFigure(valueRupees: number | null, now: number, note: st
       value_rupees: null,
       provenance: "unavailable",
       observed_at: null,
+      observed_at_mono: null,
       age_ms: null,
+      age_is_monotonic: false,
       usable: false,
+      plan_fingerprint: null,
       note: "estimate could not be computed (an unpriced leg); treated as UNKNOWN",
     };
   }
@@ -407,8 +453,11 @@ export function estimateFigure(valueRupees: number | null, now: number, note: st
     value_rupees: valueRupees,
     provenance: "estimate",
     observed_at: now,
+    observed_at_mono: null,
     age_ms: 0,
+    age_is_monotonic: false,
     usable: true,
+    plan_fingerprint: null,
     note: `${note} This is OUR estimate from the bounded requests, NOT a broker-confirmed figure.`,
   };
 }
@@ -472,6 +521,168 @@ export function worstCaseEntryCost(
 }
 
 /**
+ * A single stage of the ACTUAL hedge-first execution sequence, and what it costs to reach.
+ *
+ * WHY STAGES EXIST (section 8). A four-leg box is only cheap once all four legs exist. The broker's
+ * `final` basket margin is the requirement for the COMPLETED structure — it already contains the
+ * spread benefit. Using it to decide whether the account can fund the sequence that CREATES the
+ * structure is circular: at stage 1 the account holds one long option and has earned no spread
+ * benefit at all. Zerodha's own documented example makes the size of the gap plain: `initial`
+ * ₹96,504.98 vs `final` ₹34,786.73 for the same two-leg basket.
+ *
+ * So the funding question is asked stage by stage, in the order the legs are ACTUALLY transmitted
+ * (BUY hedges first — see entrySubmissionOrder.ts), and the binding requirement is the WORST stage,
+ * not the last one.
+ */
+export interface FundingStage {
+  /** 0-based transport rank, matching entrySubmissionOrder(). */
+  readonly index: number;
+  readonly role: string;
+  readonly side: OrderSide;
+  /** True while this stage is still sending BUY hedges (no SELL proceeds exist yet). */
+  readonly hedge: boolean;
+  /** Cumulative premium PAID by the BUY legs sent up to and including this stage (₹). */
+  readonly cumulative_premium_debit_rupees: number | null;
+  /**
+   * Cumulative premium RECEIVED from SELL legs up to and including this stage (₹).
+   *
+   * NOT treated as available funding for a later stage: option sale proceeds are not free
+   * collateral at the moment of sale, and the SELL legs are last in the sequence anyway. It is
+   * reported so an operator can see the real cash shape of the sequence.
+   */
+  readonly cumulative_premium_credit_rupees: number | null;
+  /** Which broker margin figure applies at this stage, and why. */
+  readonly margin_basis: "initial_basket" | "final_basket" | "unknown";
+  /** Total funding needed to REACH this stage, or null when it cannot be established. */
+  readonly requirement_rupees: number | null;
+  readonly known: boolean;
+  readonly note: string;
+}
+
+/**
+ * The explicit funding figures section 8 requires, each separately labelled and never substituted.
+ *
+ * `binding_requirement` is the number admission compares available funds against. It is the WORST
+ * stage requirement plus charges, the configured recovery reserve and any observed encumbrance —
+ * never the completed-basket `final` margin alone.
+ */
+export interface FundingPicture {
+  readonly initial_basket_margin: EconomicFigure;
+  readonly final_basket_margin: EconomicFigure;
+  readonly hedge_premium_requirement: EconomicFigure;
+  readonly intermediate_stage_requirement: EconomicFigure;
+  readonly encumbrance: EconomicFigure;
+  readonly estimated_charges: EconomicFigure;
+  readonly recovery_reserve: EconomicFigure;
+  readonly binding_requirement: EconomicFigure;
+  readonly stages: readonly FundingStage[];
+  /** True when the hedge-first sequence was verified as BUY-before-SELL. */
+  readonly hedge_first_sequence_valid: boolean;
+  /** Every stage whose requirement could not be established. Non-empty ⇒ refuse the profile. */
+  readonly unknown_stages: readonly string[];
+}
+
+/**
+ * Build the stage-by-stage funding requirement for the REAL transmitted sequence.
+ *
+ * DOUBLE-COUNTING (section 8 requirement 4). Kite's basket-margin totals already include an
+ * `option_premium` component, so the BUY premium is inside `initial`/`final`. Therefore the stage
+ * requirement is NOT "margin + premium": it is the margin figure applicable at that stage, floored
+ * by the premium actually payable by then. Flooring cannot double-count, and it protects against a
+ * broker figure that understates the cash a BUY leg must actually pay.
+ *
+ * `requests` must be the bounded LIMIT requests that will really be transmitted.
+ */
+export function buildFundingStages(args: {
+  readonly requests: readonly BoxCapitalOrderLike[];
+  /** Transport order (hedge-first). Roles not present in `requests` are skipped. */
+  readonly transportOrder: readonly { readonly role: string; readonly side: OrderSide; readonly rank: number }[];
+  /** Broker `initial` basket margin (₹) — margin to EXECUTE the orders, no spread benefit. */
+  readonly initialMarginRupees: number | null;
+  /** Broker `final` basket margin (₹) — margin WITH the spread benefit, once all legs exist. */
+  readonly finalMarginRupees: number | null;
+}): { readonly stages: readonly FundingStage[]; readonly hedgeFirstValid: boolean; readonly unknown: readonly string[] } {
+  const byRole = new Map(args.requests.map((r) => [String(r.role), r]));
+  const ordered = [...args.transportOrder].sort((a, b) => a.rank - b.rank);
+  const stages: FundingStage[] = [];
+  const unknown: string[] = [];
+  let debitPaise = 0;
+  let creditPaise = 0;
+  let seenSell = false;
+  let hedgeFirstValid = true;
+  let index = 0;
+
+  for (const slot of ordered) {
+    const request = byRole.get(slot.role);
+    if (slot.side === "SELL") seenSell = true;
+    else if (seenSell) hedgeFirstValid = false; // a BUY after a SELL breaks hedge-first
+    const limit = request?.pricing?.limit_price;
+    const qty = request?.quantity;
+    const priced = request !== undefined && Number.isFinite(limit) && (limit as number) > 0 &&
+      Number.isFinite(qty) && (qty as number) > 0;
+    if (priced) {
+      const legPaise = Math.abs(toPaise(limit as number) * (qty as number));
+      if (slot.side === "BUY") debitPaise += legPaise;
+      else creditPaise += legPaise;
+    }
+
+    // While hedges are going out, the completed-basket spread benefit does NOT exist. Only the
+    // FINAL stage — every leg on the book — may use the `final` figure.
+    const isFinalStage = index === ordered.length - 1;
+    const marginBasis: FundingStage["margin_basis"] = isFinalStage
+      ? args.finalMarginRupees !== null && Number.isFinite(args.finalMarginRupees)
+        ? "final_basket"
+        : "unknown"
+      : args.initialMarginRupees !== null && Number.isFinite(args.initialMarginRupees)
+        ? "initial_basket"
+        : "unknown";
+    const marginRupees =
+      marginBasis === "final_basket"
+        ? (args.finalMarginRupees as number)
+        : marginBasis === "initial_basket"
+          ? (args.initialMarginRupees as number)
+          : null;
+
+    const premiumDue = priced || request === undefined ? fromPaise(debitPaise) : null;
+    let requirement: number | null = null;
+    let note: string;
+    if (!priced) {
+      note = `${slot.role} is unpriced or missing from the plan; its stage requirement is UNKNOWN`;
+      unknown.push(`${slot.role}:unpriced`);
+    } else if (marginRupees === null) {
+      note =
+        `no broker ${isFinalStage ? "final" : "initial"} basket-margin figure is available, so the ` +
+        `funding requirement at stage ${index} (${slot.role}) is UNKNOWN — refusing is the only ` +
+        "honest answer; gross premium does NOT bound a margin requirement";
+      unknown.push(`${slot.role}:no_${isFinalStage ? "final" : "initial"}_margin`);
+    } else {
+      // FLOOR, not sum: the broker total already contains an option-premium component.
+      requirement = Math.max(marginRupees, premiumDue ?? 0);
+      note =
+        `stage ${index}: after sending ${slot.side} ${slot.role}, cumulative BUY premium payable is ` +
+        `₹${premiumDue}; applicable broker figure is the ${marginBasis === "final_basket" ? "FINAL (spread-benefit)" : "INITIAL (no spread benefit)"} ` +
+        `basket margin ₹${marginRupees}. Requirement is the greater of the two (the broker total already ` +
+        "includes an option-premium component, so they are not added).";
+    }
+    stages.push({
+      index,
+      role: slot.role,
+      side: slot.side,
+      hedge: slot.side === "BUY",
+      cumulative_premium_debit_rupees: priced ? fromPaise(debitPaise) : null,
+      cumulative_premium_credit_rupees: priced ? fromPaise(creditPaise) : null,
+      margin_basis: marginBasis,
+      requirement_rupees: requirement,
+      known: requirement !== null,
+      note,
+    });
+    index++;
+  }
+  if (!hedgeFirstValid) unknown.push("sequence:not_hedge_first");
+  return { stages, hedgeFirstValid, unknown };
+}
+
+/**
  * The complete, HONEST economic picture of a candidate box — all five quantities, each with its
  * own provenance, none substituted for another.
  *
@@ -492,49 +703,77 @@ export interface EconomicPicture {
   readonly worst_case_entry: EconomicFigure;
   /** The underlying gross-notional metric object, for the leg breakdown. */
   readonly gross_notional_metrics: BoxCapitalMetrics;
+  /**
+   * Section 8: the stage-by-stage funding requirement of the REAL hedge-first sequence, with
+   * initial and final basket margin preserved SEPARATELY. Null when no margin evidence at all was
+   * supplied (in which case the funding controls have nothing to judge and refuse).
+   */
+  readonly funding: FundingPicture | null;
 }
 
 /**
- * Assemble the five quantities into one picture.
+ * Assemble the quantities into one picture from ALREADY-AGED observations.
  *
  * PEAK LEGGING EXPOSURE is derived from the bounded requests, NOT from the broker margin: while
  * legging, before the offsetting legs both exist, the account can be exposed to as much as the
  * gross cost of the legs already sent. We therefore bound #3 by the gross notional (#4) as a
  * conservative upper bound and label it an estimate — the true peak depends on fill order, which
  * the execution-sequence owner (orderManager) knows and this pure module deliberately does not.
+ *
+ * `now` is the WALL-clock evaluation instant, used only for the audit stamp on local estimates.
+ * FRESHNESS IS NOT DECIDED HERE — the caller passes {@link AgedEvidence} produced by
+ * `ageEvidence()`, which owns the single coherent clock model. That is the fix for the reported
+ * defect: this function can no longer subtract two wall readings taken across an `await`.
  */
 export function buildEconomicPicture(args: {
   readonly requests: readonly BoxCapitalOrderLike[];
   readonly now: number;
-  readonly marginFreshnessMaxAgeMs: number;
-  readonly fundsFreshnessMaxAgeMs: number;
   readonly availableFundsRupees?: number | null;
-  readonly availableFundsObservedAt?: number | null;
+  readonly availableFundsAged: AgedEvidence;
+  readonly availableFundsObservedAtWall?: number | null;
+  readonly availableFundsObservedAtMono?: number | null;
   readonly plannedMarginRupees?: number | null;
-  readonly plannedMarginObservedAt?: number | null;
+  readonly plannedMarginAged: AgedEvidence;
+  readonly plannedMarginObservedAtWall?: number | null;
+  readonly plannedMarginObservedAtMono?: number | null;
+  readonly planFingerprint?: string | null;
   readonly estimatedChargesRupees?: number | null;
   readonly expectedLegCount?: number;
+  /** Section 8 inputs. Absent ⇒ `funding` is null and the funding controls refuse. */
+  readonly funding?: {
+    readonly transportOrder: readonly { readonly role: string; readonly side: OrderSide; readonly rank: number }[];
+    readonly initialMarginRupees: number | null;
+    readonly finalMarginRupees: number | null;
+    /** ₹ blocked by existing open orders/positions, when observable. Null ⇒ unknown, not zero. */
+    readonly encumbranceRupees: number | null;
+    /** Operator-configured reserve kept back for recovery actions (₹). */
+    readonly recoveryReserveRupees: number;
+  };
 }): EconomicPicture {
   const metrics = grossEntryOrderNotional(args.requests, args.expectedLegCount ?? 4);
   const worst = worstCaseEntryCost(args.requests, args.estimatedChargesRupees ?? null);
 
+  const available_funds = brokerFigure({
+    valueRupees: args.availableFundsRupees ?? null,
+    aged: args.availableFundsAged,
+    observedAtWall: args.availableFundsObservedAtWall ?? null,
+    observedAtMono: args.availableFundsObservedAtMono ?? null,
+    confirmedNote: "broker-confirmed available funds for this account/session",
+  });
+  const planned_margin = brokerFigure({
+    valueRupees: args.plannedMarginRupees ?? null,
+    aged: args.plannedMarginAged,
+    observedAtWall: args.plannedMarginObservedAtWall ?? null,
+    observedAtMono: args.plannedMarginObservedAtMono ?? null,
+    planFingerprint: args.planFingerprint ?? null,
+    confirmedNote:
+      "broker basket-margin estimate for the four-leg sequence (Kite basket / Dhan multi). " +
+      "An ESTIMATE of the requirement — it does NOT guarantee the broker will accept the orders.",
+  });
+
   return {
-    available_funds: brokerFigure({
-      valueRupees: args.availableFundsRupees ?? null,
-      observedAt: args.availableFundsObservedAt ?? null,
-      now: args.now,
-      maxAgeMs: args.fundsFreshnessMaxAgeMs,
-      confirmedNote: "broker-confirmed available funds for this account/session",
-    }),
-    planned_margin: brokerFigure({
-      valueRupees: args.plannedMarginRupees ?? null,
-      observedAt: args.plannedMarginObservedAt ?? null,
-      now: args.now,
-      maxAgeMs: args.marginFreshnessMaxAgeMs,
-      confirmedNote:
-        "broker basket-margin estimate for the four-leg sequence (Kite basket / Dhan multi). " +
-        "An ESTIMATE of the requirement — it does NOT guarantee the broker will accept the orders.",
-    }),
+    available_funds,
+    planned_margin,
     peak_legging_exposure: estimateFigure(
       metrics.complete ? metrics.gross_entry_order_notional_rupees : null,
       args.now,
@@ -552,7 +791,264 @@ export function buildEconomicPicture(args: {
       "bounded worst-case gross entry cost from the LIMIT requests.",
     ),
     gross_notional_metrics: metrics,
+    funding: args.funding
+      ? buildFundingPicture({
+          requests: args.requests,
+          now: args.now,
+          plannedMarginAged: args.plannedMarginAged,
+          planFingerprint: args.planFingerprint ?? null,
+          estimatedChargesRupees: args.estimatedChargesRupees ?? null,
+          ...args.funding,
+        })
+      : null,
   };
+}
+
+/** Assemble the section-8 funding figures. Exported for direct testing of the stage model. */
+export function buildFundingPicture(args: {
+  readonly requests: readonly BoxCapitalOrderLike[];
+  readonly now: number;
+  readonly transportOrder: readonly { readonly role: string; readonly side: OrderSide; readonly rank: number }[];
+  readonly initialMarginRupees: number | null;
+  readonly finalMarginRupees: number | null;
+  readonly encumbranceRupees: number | null;
+  readonly recoveryReserveRupees: number;
+  readonly plannedMarginAged: AgedEvidence;
+  readonly planFingerprint: string | null;
+  readonly estimatedChargesRupees: number | null;
+}): FundingPicture {
+  const { stages, hedgeFirstValid, unknown } = buildFundingStages({
+    requests: args.requests,
+    transportOrder: args.transportOrder,
+    initialMarginRupees: args.initialMarginRupees,
+    finalMarginRupees: args.finalMarginRupees,
+  });
+
+  const marginUsable = args.plannedMarginAged.status === "usable";
+  const marginNote = marginUsable
+    ? args.plannedMarginAged.note
+    : `broker margin evidence is ${args.plannedMarginAged.status}: ${args.plannedMarginAged.note}`;
+
+  const initial_basket_margin: EconomicFigure = figureOrUnknown(
+    args.initialMarginRupees,
+    marginUsable,
+    args.planFingerprint,
+    "broker INITIAL basket margin — the margin required to EXECUTE the orders, WITHOUT the spread " +
+      "benefit. This is the figure that applies while legging, because the completed structure does " +
+      "not exist yet.",
+    marginNote,
+  );
+  const final_basket_margin: EconomicFigure = figureOrUnknown(
+    args.finalMarginRupees,
+    marginUsable,
+    args.planFingerprint,
+    "broker FINAL basket margin — the margin WITH the spread benefit, applicable only once every " +
+      "leg is on the book. NOT proof that the account can fund the sequence that creates it.",
+    marginNote,
+  );
+
+  // The BUY hedge premium: cash the account must be able to pay before ANY sale proceeds exist.
+  const hedgePremium = hedgePremiumRupees(args.requests, args.transportOrder);
+  const hedge_premium_requirement: EconomicFigure = hedgePremium === null
+    ? unknownFigure(
+        "the BUY hedge premium could not be computed (an unpriced hedge leg); UNKNOWN, never ₹0",
+      )
+    : {
+        value_rupees: hedgePremium,
+        provenance: "estimate",
+        observed_at: args.now,
+        observed_at_mono: null,
+        age_ms: 0,
+        age_is_monotonic: false,
+        usable: true,
+        plan_fingerprint: args.planFingerprint,
+        note:
+          `premium payable by the BUY hedge legs before any SELL proceeds exist (₹${hedgePremium}). ` +
+          "Computed from the bounded LIMIT requests, so it is an upper bound on the hedge debit.",
+      };
+
+  const knownStageRequirements = stages
+    .map((s) => s.requirement_rupees)
+    .filter((v): v is number => v !== null);
+  const worstStage = knownStageRequirements.length ? Math.max(...knownStageRequirements) : null;
+  const stagesComplete = unknown.length === 0 && stages.length > 0;
+
+  const intermediate_stage_requirement: EconomicFigure = !stagesComplete || worstStage === null
+    ? unknownFigure(
+        "the intermediate execution-stage requirement is UNKNOWN: " +
+          (unknown.length ? unknown.join("; ") : "no stages could be modelled") +
+          ". Refusing the supervised entry profile is the only honest response.",
+      )
+    : {
+        value_rupees: worstStage,
+        provenance: marginUsable ? "broker_confirmed" : "stale",
+        observed_at: args.now,
+        observed_at_mono: null,
+        age_ms: args.plannedMarginAged.age_ms,
+        age_is_monotonic: args.plannedMarginAged.age_is_monotonic,
+        usable: marginUsable,
+        plan_fingerprint: args.planFingerprint,
+        note:
+          `the WORST stage of the ${stages.length}-stage hedge-first sequence requires ₹${worstStage}. ` +
+          "This — not the completed-basket final margin — is what the account must be able to fund.",
+      };
+
+  const encumbrance: EconomicFigure = args.encumbranceRupees === null || !Number.isFinite(args.encumbranceRupees)
+    ? unknownFigure(
+        "₹ blocked by existing open orders/positions is UNKNOWN (the broker facility did not report " +
+          "it). Treated as unknown, never as ₹0: other activity on this account can consume the same " +
+          "available-funds allowance.",
+      )
+    : {
+        value_rupees: args.encumbranceRupees,
+        provenance: "broker_confirmed",
+        observed_at: args.now,
+        observed_at_mono: null,
+        age_ms: args.plannedMarginAged.age_ms,
+        age_is_monotonic: args.plannedMarginAged.age_is_monotonic,
+        usable: true,
+        plan_fingerprint: null,
+        note: "₹ already blocked by open orders/positions on this account.",
+      };
+
+  const estimated_charges: EconomicFigure =
+    args.estimatedChargesRupees !== null && Number.isFinite(args.estimatedChargesRupees)
+      ? {
+          value_rupees: args.estimatedChargesRupees,
+          provenance: "estimate",
+          observed_at: args.now,
+          observed_at_mono: null,
+          age_ms: 0,
+          age_is_monotonic: false,
+          usable: true,
+          plan_fingerprint: args.planFingerprint,
+          note: "locally estimated brokerage/statutory charges for the four entry legs.",
+        }
+      : unknownFigure("estimated charges are UNKNOWN (no local fee calculator result).");
+
+  const reserve = Number.isFinite(args.recoveryReserveRupees) && args.recoveryReserveRupees >= 0
+    ? args.recoveryReserveRupees
+    : 0;
+  const recovery_reserve: EconomicFigure = {
+    value_rupees: reserve,
+    provenance: "estimate",
+    observed_at: args.now,
+    observed_at_mono: null,
+    age_ms: 0,
+    age_is_monotonic: false,
+    usable: true,
+    plan_fingerprint: null,
+    note:
+      `operator-configured reserve of ₹${reserve} held back so a recovery action (cancel, unwind, ` +
+      "complete) is not blocked by having spent every rupee on the entry.",
+  };
+
+  // The BINDING requirement. Deliberately conservative and additive across INDEPENDENT costs:
+  // the worst execution stage, plus charges, plus the recovery reserve, plus whatever is already
+  // encumbered. Unknown encumbrance does NOT silently become zero — it makes the total unknown.
+  const parts: (number | null)[] = [
+    intermediate_stage_requirement.usable ? intermediate_stage_requirement.value_rupees : null,
+    estimated_charges.value_rupees,
+    recovery_reserve.value_rupees,
+    encumbrance.value_rupees,
+  ];
+  const binding = parts.some((p) => p === null)
+    ? null
+    : parts.reduce<number>((sum, p) => sum + (p as number), 0);
+  const binding_requirement: EconomicFigure = binding === null
+    ? unknownFigure(
+        "the binding funding requirement is UNKNOWN because at least one component is unknown " +
+          `(worst stage: ${intermediate_stage_requirement.value_rupees ?? "unknown"}, charges: ` +
+          `${estimated_charges.value_rupees ?? "unknown"}, encumbrance: ${encumbrance.value_rupees ?? "unknown"}). ` +
+          "The supervised entry profile must be refused rather than admitted on a guess.",
+      )
+    : {
+        value_rupees: binding,
+        provenance: marginUsable ? "broker_confirmed" : "stale",
+        observed_at: args.now,
+        observed_at_mono: null,
+        age_ms: args.plannedMarginAged.age_ms,
+        age_is_monotonic: args.plannedMarginAged.age_is_monotonic,
+        usable: marginUsable,
+        plan_fingerprint: args.planFingerprint,
+        note:
+          `worst stage ₹${intermediate_stage_requirement.value_rupees} + charges ` +
+          `₹${estimated_charges.value_rupees} + recovery reserve ₹${recovery_reserve.value_rupees} + ` +
+          `encumbrance ₹${encumbrance.value_rupees} = ₹${binding}. This is what available funds are ` +
+          "compared against — NOT the completed-basket final margin.",
+      };
+
+  return {
+    initial_basket_margin,
+    final_basket_margin,
+    hedge_premium_requirement,
+    intermediate_stage_requirement,
+    encumbrance,
+    estimated_charges,
+    recovery_reserve,
+    binding_requirement,
+    stages,
+    hedge_first_sequence_valid: hedgeFirstValid,
+    unknown_stages: unknown,
+  };
+}
+
+function unknownFigure(note: string): EconomicFigure {
+  return {
+    value_rupees: null,
+    provenance: "unavailable",
+    observed_at: null,
+    observed_at_mono: null,
+    age_ms: null,
+    age_is_monotonic: false,
+    usable: false,
+    plan_fingerprint: null,
+    note,
+  };
+}
+
+function figureOrUnknown(
+  valueRupees: number | null,
+  usable: boolean,
+  planFingerprint: string | null,
+  confirmedNote: string,
+  agedNote: string,
+): EconomicFigure {
+  if (valueRupees === null || !Number.isFinite(valueRupees)) {
+    return unknownFigure(`${confirmedNote} — NOT AVAILABLE: ${agedNote}`);
+  }
+  return {
+    value_rupees: valueRupees,
+    provenance: usable ? "broker_confirmed" : "stale",
+    observed_at: null,
+    observed_at_mono: null,
+    age_ms: null,
+    age_is_monotonic: false,
+    usable,
+    plan_fingerprint: planFingerprint,
+    note: usable ? confirmedNote : `${confirmedNote} — NOT USABLE: ${agedNote}`,
+  };
+}
+
+/** Premium payable by the BUY (hedge) legs, or null when any hedge leg is unpriced. */
+function hedgePremiumRupees(
+  requests: readonly BoxCapitalOrderLike[],
+  transportOrder: readonly { readonly role: string; readonly side: OrderSide; readonly rank: number }[],
+): number | null {
+  const hedgeRoles = new Set(transportOrder.filter((s) => s.side === "BUY").map((s) => s.role));
+  if (hedgeRoles.size === 0) return null;
+  let paise = 0;
+  let seen = 0;
+  for (const r of requests) {
+    if (!hedgeRoles.has(String(r.role))) continue;
+    const limit = r.pricing?.limit_price;
+    if (!Number.isFinite(limit) || (limit as number) <= 0 || !Number.isFinite(r.quantity) || r.quantity <= 0) {
+      return null;
+    }
+    paise += Math.abs(toPaise(limit as number) * r.quantity);
+    seen++;
+  }
+  return seen === hedgeRoles.size ? fromPaise(paise) : null;
 }
 
 /** Why an economic admission was refused. Distinct, non-conflated reasons. */
@@ -560,6 +1056,10 @@ export type EconomicRefusalReason =
   | "gross_notional_over_cap"
   | "insufficient_available_funds"
   | "margin_evidence_stale_or_missing"
+  | "margin_evidence_invalid"
+  | "funds_evidence_invalid"
+  | "funding_stage_unknown"
+  | "hedge_sequence_invalid"
   | "metric_incomplete";
 
 export interface EconomicAdmissionReport {
@@ -572,20 +1072,34 @@ export interface EconomicAdmissionReport {
     readonly gross_cap_enabled: boolean;
     readonly funds_check_enabled: boolean;
     readonly margin_evidence_required: boolean;
+    /** Section 8: require every hedge-first funding stage to be establishable. */
+    readonly stage_funding_required: boolean;
   };
+  /** WALL-clock instant the decision was made — captured AFTER the evidence reads resolved. */
+  readonly evaluated_at: number;
+  /** The order plan this decision is about. Re-checked at the send boundary. */
+  readonly plan_fingerprint: string | null;
+  /** Broker/account/session the evidence was read under, in non-secret form. */
+  readonly evidence_context: EvidenceIdentity | null;
+  /** How long each evidence read took (monotonic ms), for instrumentation. */
+  readonly read_elapsed_ms: { readonly funds: number | null; readonly margin: number | null };
 }
 
 /**
- * Evaluate the configured economic controls against the five-quantity picture, BEFORE any leg is
- * sent. Each control is independent and fails CLOSED:
+ * Evaluate the configured economic controls against the picture, BEFORE any leg is sent. Each
+ * control is independent and fails CLOSED:
  *
  *   - `grossCapRupees > 0`: refuse if gross notional (#4) exceeds it, or is incomplete. (Same
  *     semantics as {@link evaluateBoxCapitalAdmission}; kept in step deliberately.)
- *   - `requireFundsCover`: refuse unless AVAILABLE FUNDS (#1) are usable AND cover the planned
- *     margin (#2) when that is usable, else the worst-case entry cost (#5). Never admits on a
- *     stale/unavailable funds figure.
+ *   - `requireFundsCover`: refuse unless AVAILABLE FUNDS (#1) are usable AND cover the BINDING
+ *     STAGE REQUIREMENT (section 8) when the funding model could be built, else the planned margin,
+ *     else the worst-case entry cost. Never admits on a stale/unavailable/invalid funds figure.
  *   - `requireMarginEvidence`: refuse unless the planned-margin figure (#2) is broker-confirmed
  *     and fresh. This is the "do not admit on an estimate alone" control.
+ *   - `requireStageFunding`: refuse unless EVERY stage of the real hedge-first sequence has an
+ *     establishable requirement AND the sequence is genuinely hedge-first. This is the control that
+ *     stops `final` (completed-basket, spread-benefit) margin being used as proof that the account
+ *     can fund the sequence that creates the box.
  *
  * Returning MULTIPLE reasons is intentional: an operator debugging a refusal should see every
  * failing control at once, not fix one and rediscover the next.
@@ -595,6 +1109,11 @@ export function evaluateEconomicAdmission(args: {
   readonly grossCapRupees: number;
   readonly requireFundsCover: boolean;
   readonly requireMarginEvidence: boolean;
+  readonly requireStageFunding?: boolean;
+  readonly evaluatedAt?: number;
+  readonly planFingerprint?: string | null;
+  readonly evidenceContext?: EvidenceIdentity | null;
+  readonly readElapsedMs?: { readonly funds: number | null; readonly margin: number | null };
 }): EconomicAdmissionReport {
   const { picture } = args;
   const reasons: EconomicRefusalReason[] = [];
@@ -622,35 +1141,86 @@ export function evaluateEconomicAdmission(args: {
   }
 
   if (args.requireMarginEvidence && !picture.planned_margin.usable) {
-    reasons.push("margin_evidence_stale_or_missing");
-    details.push(
-      `planned-margin evidence is not usable (${picture.planned_margin.provenance}); ` +
-        "refusing rather than admitting on an estimate or a stale figure",
-    );
+    // INVALID is reported distinctly from STALE: "the clock or the account changed" is a different
+    // operational problem from "the figure is too old", and an operator must be able to tell them
+    // apart without reading the note.
+    if (picture.planned_margin.provenance === "invalid") {
+      reasons.push("margin_evidence_invalid");
+      details.push(`planned-margin evidence is INVALID: ${picture.planned_margin.note}`);
+    } else {
+      reasons.push("margin_evidence_stale_or_missing");
+      details.push(
+        `planned-margin evidence is not usable (${picture.planned_margin.provenance}); ` +
+          "refusing rather than admitting on an estimate or a stale figure",
+      );
+    }
+  }
+
+  const stageFundingRequired = args.requireStageFunding === true;
+  if (stageFundingRequired) {
+    const funding = picture.funding;
+    if (!funding) {
+      reasons.push("funding_stage_unknown");
+      details.push(
+        "no stage-by-stage funding model could be built (no broker initial/final basket margin was " +
+          "supplied); the supervised entry profile is refused rather than admitted on the completed-" +
+          "basket figure",
+      );
+    } else {
+      if (!funding.hedge_first_sequence_valid) {
+        reasons.push("hedge_sequence_invalid");
+        details.push(
+          "the transmitted sequence is not hedge-first (a BUY hedge would follow a SELL); refusing " +
+            "because an uncovered SELL must never be sent first",
+        );
+      }
+      if (funding.unknown_stages.length > 0 || !funding.binding_requirement.usable) {
+        reasons.push("funding_stage_unknown");
+        details.push(
+          `at least one funding stage is UNKNOWN [${funding.unknown_stages.join(", ")}]: ` +
+            funding.binding_requirement.note,
+        );
+      }
+    }
   }
 
   if (args.requireFundsCover) {
-    if (!picture.available_funds.usable || picture.available_funds.value_rupees === null) {
+    if (picture.available_funds.provenance === "invalid") {
+      reasons.push("funds_evidence_invalid");
+      details.push(`available-funds evidence is INVALID: ${picture.available_funds.note}`);
+    } else if (!picture.available_funds.usable || picture.available_funds.value_rupees === null) {
       reasons.push("insufficient_available_funds");
       details.push(
         `available funds not usable (${picture.available_funds.provenance}); ` +
           "cannot prove the account can fund this entry",
       );
     } else {
-      // Require funds to cover the strongest requirement we can prove: broker margin if usable,
-      // else the conservative worst-case entry cost. NEVER the (smaller) net debit alone.
+      // Require funds to cover the strongest requirement we can prove, in DESCENDING order of
+      // fidelity to the real sequence:
+      //   1. the section-8 binding stage requirement (worst stage + charges + reserve + encumbrance)
+      //   2. the broker basket margin, if usable
+      //   3. the conservative worst-case entry cost
+      // NEVER the (smaller) net debit, and never the FINAL completed-basket margin alone.
+      const funding = picture.funding;
       const need =
-        picture.planned_margin.usable && picture.planned_margin.value_rupees !== null
-          ? picture.planned_margin.value_rupees
-          : picture.worst_case_entry.value_rupees;
+        funding?.binding_requirement.usable && funding.binding_requirement.value_rupees !== null
+          ? funding.binding_requirement.value_rupees
+          : picture.planned_margin.usable && picture.planned_margin.value_rupees !== null
+            ? picture.planned_margin.value_rupees
+            : picture.worst_case_entry.value_rupees;
+      const basis =
+        funding?.binding_requirement.usable && funding.binding_requirement.value_rupees !== null
+          ? "binding hedge-first stage requirement"
+          : picture.planned_margin.usable
+            ? "broker margin"
+            : "worst-case entry cost";
       if (need === null) {
         reasons.push("metric_incomplete");
-        details.push("cannot compute a funding requirement: no usable margin or worst-case cost");
+        details.push("cannot compute a funding requirement: no usable stage model, margin or worst-case cost");
       } else if (picture.available_funds.value_rupees < need) {
         reasons.push("insufficient_available_funds");
         details.push(
-          `available funds ₹${picture.available_funds.value_rupees} < required ₹${need} ` +
-            (picture.planned_margin.usable ? "(broker margin)" : "(worst-case entry cost)"),
+          `available funds ₹${picture.available_funds.value_rupees} < required ₹${need} (${basis})`,
         );
       }
     }
@@ -665,7 +1235,12 @@ export function evaluateEconomicAdmission(args: {
       gross_cap_enabled: grossCapEnabled,
       funds_check_enabled: args.requireFundsCover,
       margin_evidence_required: args.requireMarginEvidence,
+      stage_funding_required: stageFundingRequired,
     },
+    evaluated_at: args.evaluatedAt ?? 0,
+    plan_fingerprint: args.planFingerprint ?? null,
+    evidence_context: args.evidenceContext ?? null,
+    read_elapsed_ms: args.readElapsedMs ?? { funds: null, margin: null },
   };
 }
 

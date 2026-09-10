@@ -21,6 +21,17 @@ import {
   type BoxCapitalReport,
   type EconomicAdmissionReport,
 } from "./boxCapital.js";
+import {
+  ageEvidence,
+  identityMismatch,
+  monoElapsed,
+  orderPlanFingerprint,
+  readEvidence,
+  type EvidenceClock,
+  type EvidenceIdentity,
+  type EvidenceInstant,
+} from "./evidenceTiming.js";
+import { monotonicNow } from "../brokers/deadline.js";
 import { entrySubmissionOrder } from "./entrySubmissionOrder.js";
 import {
   planExitDependencies,
@@ -71,6 +82,7 @@ import {
   BOX_LEG_ROLES,
   directionSign,
   type BoxCandidate,
+  type BoxDirection,
   type BoxEntryDecision,
   type BoxEvaluation,
   type BoxExecutionFailureReason,
@@ -170,6 +182,21 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
   private lastCapitalReport: BoxCapitalReport | null = null;
   /** The most recent economic-admission decision (five distinct quantities), for status. */
   private lastEconomicReport: EconomicAdmissionReport | null = null;
+  /**
+   * The evidence that admitted the CURRENT entry attempt, retained so the final send boundary can
+   * re-check expiry, identity and the order plan WITHOUT re-fetching from the broker. Null when no
+   * economic control is enabled or admission was refused.
+   */
+  private economicEvidence: {
+    readonly fundsObservedAtMono: number | null;
+    readonly marginObservedAtMono: number | null;
+    readonly fundsMaxAgeMs: number;
+    readonly marginMaxAgeMs: number;
+    readonly planFingerprint: string;
+    readonly identity: EvidenceIdentity | null;
+    readonly fundsRequired: boolean;
+    readonly marginRequired: boolean;
+  } | null = null;
 
   constructor(private readonly deps: {
     cfg: BoxConfig;
@@ -214,13 +241,41 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
      * FRESH broker-confirmed planned-margin evidence for the four-leg entry (Task 8).
      *
      * A basket/multi-order margin estimate from a supported broker facility, with its observed-at
-     * time. No such facility is wired on the adapter yet, so this is usually absent; when the
-     * margin-evidence control is enabled and this is absent/stale the gate FAILS CLOSED. Never
-     * fabricated from the gross cap or the net debit.
+     * time. When the margin-evidence control is enabled and this is absent/stale the gate FAILS
+     * CLOSED. Never fabricated from the gross cap or the net debit.
+     *
+     * SECTION 8: `initialMarginRupees` and `finalMarginRupees` are kept SEPARATE and must not be
+     * collapsed. Kite documents them as "Total margins required to execute the orders" (initial)
+     * versus "Total margins with the spread benefit" (final) — in Zerodha's own example ₹96,504.98
+     * vs ₹34,786.73 for the same basket. `final` describes the COMPLETED structure and is not proof
+     * that the account can fund the sequence which creates it, so the stage model needs both.
+     * `encumbranceRupees` is ₹ already blocked by other open orders/positions, when observable;
+     * null means UNKNOWN, never zero.
      */
     plannedMargin?: (
       requests: readonly BrokerOrderRequest[],
-    ) => Promise<{ marginRupees: number | null; observedAt: number } | null>;
+    ) => Promise<{
+      marginRupees: number | null;
+      observedAt: number;
+      initialMarginRupees?: number | null;
+      finalMarginRupees?: number | null;
+      encumbranceRupees?: number | null;
+    } | null>;
+    /**
+     * MONOTONIC clock for measuring durations (evidence aging, read deadlines).
+     *
+     * Separate from `now` on purpose: `now` is the WALL clock used for audit stamps and can step
+     * backward under NTP, which is exactly how a freshness check gets fooled. Absent ⇒
+     * `performance.now()`.
+     */
+    monotonicNow?: () => number;
+    /**
+     * WHO the economic evidence is about — broker, masked account reference, session/token
+     * generation. Read before AND after the asynchronous evidence reads so a broker switch, token
+     * rotation onto a different account, or session restart in flight invalidates the evidence
+     * instead of admitting an entry against the wrong account.
+     */
+    evidenceContext?: () => EvidenceIdentity | null;
   }) {
     this.mode = deps.cfg.executionMode;
   }
@@ -390,7 +445,7 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     // the requirement. Enabled only when the operator asks for it (funds-cover or margin-evidence);
     // when enabled, MISSING or STALE evidence REFUSES rather than assumes. Runs on the SAME four
     // immutable requests, still before any leg is sent, so a refusal is a free pre-submit refusal.
-    const economic = await this.evaluateEntryEconomics(requests);
+    const economic = await this.evaluateEntryEconomics(requests, args.candidate.direction ?? "LONG_BOX");
     if (economic && !economic.allowed) {
       const rejected = liveEntryFailure(
         args.candidate,
@@ -404,6 +459,18 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
       );
       rejected.legging.outcome_class = "REFUSED_BEFORE_SUBMIT";
       return rejected;
+    }
+
+    // ── RE-VALIDATE THE CANDIDATE AFTER THE ASYNCHRONOUS EVIDENCE READS ──────────────────
+    //
+    // Section 3 requirement 11. The funds/margin reads above are real broker round trips: the
+    // scanner can have withdrawn the candidate (STOP, budget exhausted, the opportunity closed) or
+    // the session can have been disarmed while we were waiting. Still nothing has been transmitted,
+    // so this remains a free refusal — and skipping it would mean entering a box nobody wants any
+    // more purely because the decision to enter predated the evidence.
+    const wantedAfterEvidence = this.entryGuardRefusal(args.stillWanted, "post_evidence");
+    if (wantedAfterEvidence) {
+      return this.refusedBeforeSubmit(args, submittedAt, tradeId, wantedAfterEvidence);
     }
 
     // The Box-level decision is stamped onto every leg so the manager can RE-VERIFY it at
@@ -469,6 +536,13 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
               ? null
               : `[${verdict.reason}] ${verdict.detail}`;
           },
+          // SECTION 3 requirement 12. The economic half of the same boundary: evidence that has
+          // EXPIRED, an account/session that has CHANGED, or an order plan that no longer matches
+          // the one the margin figure was computed for must all refuse the POST while there is
+          // still no exposure. The manager decides WHEN to honour it, using the same rule as the
+          // coherence check (no exposure ⇒ refuse; exposure taken ⇒ complete and record).
+          sendBoundaryEconomics: (candidateRequest?: BrokerOrderRequest) =>
+            this.economicSendBoundary(candidateRequest ?? request),
         });
       }),
     );
@@ -585,7 +659,7 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
    */
   private entryGuardRefusal(
     stillWanted: (() => boolean) | undefined,
-    stage: "pre_build" | "pre_enqueue",
+    stage: "pre_build" | "post_evidence" | "pre_enqueue",
   ): string | null {
     const decision = evaluateLiveEntryGuard({
       stage,
@@ -1276,33 +1350,127 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
    * NOT applied to reduction/exit — only `simulateLeggingEntry` calls it, so protective reduction
    * once partially exposed is never subject to new-entry economics (explicit recovery policy).
    */
+  /**
+   * FRESH funds/margin evidence, read and judged on ONE coherent clock model.
+   *
+   * ROOT CAUSE THIS FIXES. The previous implementation captured `const now = this.now()` BEFORE
+   * awaiting the broker reads, while the engine's providers stamp `observedAt` AFTER their round
+   * trip resolves. Every real response therefore had `observedAt > now`, the computed age was
+   * NEGATIVE, and `brokerFigure()`'s `age >= 0` rule downgraded fresh evidence to "stale" — so the
+   * economic gate refused valid live entries. See src/box/evidenceTiming.ts for the full account.
+   *
+   * WHAT IT NOW DOES, in order:
+   *   1. Snapshots the identity (broker/account/session) and fingerprints the exact order plan.
+   *   2. Reads funds and margin with a HARD per-read deadline, so a stalled broker endpoint cannot
+   *      hold admission open. Concurrently only when the broker integration permits it.
+   *   3. Stamps the EVALUATION INSTANT after both reads have settled — ages are >= 0 by
+   *      construction, and each observation keeps its OWN timestamp.
+   *   4. Ages each observation on the MONOTONIC clock, so an NTP step cannot fabricate or erase
+   *      staleness, while retaining wall time for the audit record.
+   *   5. Re-reads the identity and invalidates evidence acquired for a different
+   *      broker/account/session.
+   *   6. Builds the section-8 stage model (initial vs final basket margin kept separate) and
+   *      evaluates the configured controls.
+   *
+   * Returns null when no economic control is enabled (paper and legacy paths are untouched).
+   */
   private async evaluateEntryEconomics(
     requests: readonly BrokerOrderRequest[],
+    direction: BoxDirection,
   ): Promise<EconomicAdmissionReport | null> {
     if (this.mode !== "live") return null;
     const requireFundsCover = this.deps.cfg.liveRequireFundsCover === true;
     const requireMarginEvidence = this.deps.cfg.liveRequireMarginEvidence === true;
-    if (!requireFundsCover && !requireMarginEvidence) return null;
+    const requireStageFunding = this.deps.cfg.liveRequireStageFunding === true;
+    if (!requireFundsCover && !requireMarginEvidence && !requireStageFunding) return null;
 
-    const now = this.now();
-    // FRESH evidence via supported broker facilities. A throwing/absent source yields null, which
-    // the picture treats as unavailable — never a fabricated figure.
-    const fundsEvidence = this.deps.funds ? await this.deps.funds().catch(() => null) : null;
-    const marginEvidence = this.deps.plannedMargin
-      ? await this.deps.plannedMargin(requests).catch(() => null)
-      : null;
+    const clock = this.evidenceClock();
+    const identity = () => this.evidenceIdentity();
+    const planFingerprint = orderPlanFingerprint(requests);
+    const timeoutMs = this.deps.cfg.liveEvidenceReadTimeoutMs;
+    const futureSkewGraceMs = this.deps.cfg.liveEvidenceFutureSkewGraceMs;
 
+    const readFunds = () =>
+      readEvidence({
+        read: this.deps.funds,
+        timeoutMs,
+        clock,
+        identity,
+        sourceObservedAtWall: (value) => value.observedAt ?? null,
+        label: "available-funds",
+      });
+    const readMargin = () =>
+      readEvidence({
+        read: this.deps.plannedMargin ? () => this.deps.plannedMargin!(requests) : undefined,
+        timeoutMs,
+        clock,
+        identity,
+        sourceObservedAtWall: (value) => value.observedAt ?? null,
+        label: "planned-margin",
+      });
+
+    // CONCURRENCY IS OPT-IN. Two independent GETs against different endpoints are safe to overlap,
+    // but a broker's rate limiter and this process's own pacing rules are the authority on that —
+    // so the default is SERIAL, and overlapping is enabled only when configured.
+    let fundsObs: Awaited<ReturnType<typeof readFunds>>;
+    let marginObs: Awaited<ReturnType<typeof readMargin>>;
+    if (this.deps.cfg.liveEvidenceConcurrentReads === true) {
+      [fundsObs, marginObs] = await Promise.all([readFunds(), readMargin()]);
+    } else {
+      fundsObs = await readFunds();
+      marginObs = await readMargin();
+    }
+
+    // ── THE FIX: the evaluation instant is captured HERE, after every read has settled. ──
+    const evaluatedAt: EvidenceInstant = { mono: clock.mono(), wall: clock.wall() };
+    const currentIdentity = this.evidenceIdentity();
+
+    const fundsAged = ageEvidence({
+      observation: fundsObs,
+      evaluatedAt,
+      maxAgeMs: this.deps.cfg.liveFundsFreshnessMaxAgeMs,
+      futureSkewGraceMs,
+      currentIdentity,
+      label: "available-funds",
+    });
+    const marginAged = ageEvidence({
+      observation: marginObs,
+      evaluatedAt,
+      maxAgeMs: this.deps.cfg.liveMarginFreshnessMaxAgeMs,
+      futureSkewGraceMs,
+      currentIdentity,
+      label: "planned-margin",
+    });
+
+    const marginValue = marginObs.value;
     const picture = buildEconomicPicture({
       requests,
-      now,
-      marginFreshnessMaxAgeMs: this.deps.cfg.liveMarginFreshnessMaxAgeMs,
-      fundsFreshnessMaxAgeMs: this.deps.cfg.liveFundsFreshnessMaxAgeMs,
-      availableFundsRupees: fundsEvidence?.availableRupees ?? null,
-      availableFundsObservedAt: fundsEvidence?.observedAt ?? null,
-      plannedMarginRupees: marginEvidence?.marginRupees ?? null,
-      plannedMarginObservedAt: marginEvidence?.observedAt ?? null,
+      now: evaluatedAt.wall,
+      availableFundsRupees: fundsObs.value?.availableRupees ?? null,
+      availableFundsAged: fundsAged,
+      availableFundsObservedAtWall: fundsObs.at?.wall ?? null,
+      availableFundsObservedAtMono: fundsObs.at?.mono ?? null,
+      plannedMarginRupees: marginValue?.marginRupees ?? null,
+      plannedMarginAged: marginAged,
+      plannedMarginObservedAtWall: marginObs.at?.wall ?? null,
+      plannedMarginObservedAtMono: marginObs.at?.mono ?? null,
+      planFingerprint,
       estimatedChargesRupees: this.chargesForRequests(requests),
       expectedLegCount: BOX_LEG_ROLES.length,
+      // Section 8: the stage model needs INITIAL and FINAL basket margin kept apart. It is built
+      // only when the provider actually supplied them, so a broker that cannot distinguish the two
+      // produces an explicit "unknown stage" refusal rather than a fabricated stage requirement.
+      ...(marginValue && (marginValue.initialMarginRupees != null || marginValue.finalMarginRupees != null)
+        ? {
+            funding: {
+              transportOrder: entrySubmissionOrder(direction),
+              initialMarginRupees: marginValue.initialMarginRupees ?? null,
+              finalMarginRupees: marginValue.finalMarginRupees ?? null,
+              encumbranceRupees: marginValue.encumbranceRupees ?? null,
+              recoveryReserveRupees: this.deps.cfg.liveRecoveryReserveRupees,
+            },
+          }
+        : {}),
     });
 
     const report = evaluateEconomicAdmission({
@@ -1312,9 +1480,91 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
       grossCapRupees: this.capitalLimitRupees(),
       requireFundsCover,
       requireMarginEvidence,
+      requireStageFunding,
+      evaluatedAt: evaluatedAt.wall,
+      planFingerprint,
+      evidenceContext: currentIdentity,
+      readElapsedMs: { funds: fundsObs.elapsed_ms, margin: marginObs.elapsed_ms },
     });
     this.lastEconomicReport = report;
+    // Retained so the SEND BOUNDARY can re-check expiry and the plan without re-fetching.
+    this.economicEvidence = report.allowed
+      ? {
+          fundsObservedAtMono: fundsObs.at?.mono ?? null,
+          marginObservedAtMono: marginObs.at?.mono ?? null,
+          fundsMaxAgeMs: this.deps.cfg.liveFundsFreshnessMaxAgeMs,
+          marginMaxAgeMs: this.deps.cfg.liveMarginFreshnessMaxAgeMs,
+          planFingerprint,
+          identity: currentIdentity,
+          fundsRequired: requireFundsCover,
+          marginRequired: requireMarginEvidence || requireStageFunding,
+        }
+      : null;
     return report;
+  }
+
+  /** The clock pair evidence is stamped against: wall for audit, monotonic for durations. */
+  private evidenceClock(): EvidenceClock {
+    return {
+      wall: () => this.now(),
+      mono: () => this.deps.monotonicNow?.() ?? monotonicNow(),
+    };
+  }
+
+  /** Who the evidence is about, in non-secret form. Null when the deployment cannot report it. */
+  private evidenceIdentity(): EvidenceIdentity | null {
+    if (this.deps.evidenceContext) return this.deps.evidenceContext();
+    const broker = this.deps.broker?.();
+    return broker ? { broker, account_ref: null, session_id: null } : null;
+  }
+
+  /**
+   * THE FINAL ENTRY BOUNDARY for economic evidence (section 3 requirement 12).
+   *
+   * Called by the order manager at the last moment before a broker mutation, after queueing,
+   * durable persistence and broker pacing have each consumed real time. It refuses when:
+   *   - the evidence that admitted this entry has since EXPIRED, or
+   *   - the order plan about to be sent DIFFERS from the plan the evidence was fetched for, or
+   *   - the broker/account/session has CHANGED since admission.
+   *
+   * It returns a reason string to refuse, or null to allow. It does NOT decide what happens once
+   * exposure already exists — the manager owns that, and its policy is "no exposure ⇒ refuse;
+   * exposure taken ⇒ complete and record", which is why this must never be used to abandon a leg
+   * that could already be filling.
+   */
+  private economicSendBoundary(request?: BrokerOrderRequest): string | null {
+    const evidence = this.economicEvidence;
+    if (!evidence) return null; // no economic control enabled, or admission produced no evidence
+    const mono = this.deps.monotonicNow?.() ?? monotonicNow();
+
+    if (evidence.fundsRequired && evidence.fundsObservedAtMono !== null) {
+      const age = monoElapsed(evidence.fundsObservedAtMono, mono);
+      if (age === null || age > evidence.fundsMaxAgeMs) {
+        return `available-funds evidence EXPIRED before transmit (age ${age ?? "?"}ms > ${evidence.fundsMaxAgeMs}ms)`;
+      }
+    }
+    if (evidence.marginRequired && evidence.marginObservedAtMono !== null) {
+      const age = monoElapsed(evidence.marginObservedAtMono, mono);
+      if (age === null || age > evidence.marginMaxAgeMs) {
+        return `planned-margin evidence EXPIRED before transmit (age ${age ?? "?"}ms > ${evidence.marginMaxAgeMs}ms)`;
+      }
+    }
+    const mismatch = identityMismatch(evidence.identity, this.evidenceIdentity());
+    if (mismatch) return `economic evidence no longer applies: ${mismatch}`;
+
+    // PLAN BINDING. The manager hands us the request it is about to POST; if its contract, side,
+    // quantity or limit price is not the one the margin figure was computed for, the evidence is
+    // not about this order.
+    if (request) {
+      const leg = orderPlanFingerprint([request]);
+      if (!evidence.planFingerprint.split("|").includes(leg)) {
+        return (
+          "order plan CHANGED after evidence acquisition (quantity or limit price differs from the " +
+          `plan the margin figure was fetched for): ${leg}`
+        );
+      }
+    }
+    return null;
   }
 
   /** Estimated charges (₹) for a request set, from the local fee calculator when available. */

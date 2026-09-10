@@ -244,6 +244,12 @@ export interface BoxEngineDeps {
    */
   brokerGeneration?: () => number;
   /**
+   * A NON-SECRET reference to the authenticated broker account (masked id / hash, never a token).
+   * Binds funds/margin evidence to the account it was read for. Absent ⇒ null ⇒ the account half of
+   * the identity check is skipped, and unknown is never treated as a mismatch.
+   */
+  brokerAccountRef?: () => string | null;
+  /**
    * The ACTIVE broker's live feed. Not a TickerHub: the engine must not be able to
    * reach a specific broker's socket (see brokerContext.ts).
    */
@@ -951,6 +957,8 @@ export class BoxEngine {
         if (!adapter?.margins) return null;
         const m = await adapter.margins().catch(() => null);
         if (!m || typeof m.available !== "number" || !Number.isFinite(m.available)) return null;
+        // `observedAt` is stamped HERE, when the broker answer is in hand. The gateway captures its
+        // evaluation instant AFTER every read has settled, so this can never produce a negative age.
         return { availableRupees: m.available, observedAt: Date.now() };
       },
       plannedMargin: async (requests) => {
@@ -971,8 +979,34 @@ export class BoxEngine {
         if (!basket || basket.source === "unavailable" || !Number.isFinite(basket.total)) {
           return { marginRupees: null, observedAt: Date.now() };
         }
-        return { marginRupees: basket.total, observedAt: Date.now() };
+        // SECTION 8. `initial` and `final` are passed through SEPARATELY and are never collapsed
+        // here. Kite documents `initial` as "Total margins required to execute the orders" and
+        // `final` as "Total margins with the spread benefit"; the stage model needs both, because
+        // while legging the spread benefit does not exist yet. `total` is retained for the existing
+        // single-figure margin control, unchanged.
+        return {
+          marginRupees: basket.total,
+          observedAt: Date.now(),
+          initialMarginRupees: Number.isFinite(basket.initial) ? basket.initial : null,
+          finalMarginRupees: Number.isFinite(basket.final) ? basket.final : null,
+          // Not observable from the basket endpoint. NULL means UNKNOWN — with the stage-funding
+          // control enabled this refuses, rather than assuming nothing else is blocked on the
+          // account. Other applications trading the same account are exactly this hazard.
+          encumbranceRupees: null,
+        };
       },
+      // MONOTONIC clock for evidence aging and read deadlines, separate from the wall clock used
+      // for audit stamps. An NTP correction must not be able to fabricate or erase staleness.
+      monotonicNow: () => performance.now(),
+      // WHO the economic evidence is about. Read before AND after the asynchronous broker reads, so
+      // a broker switch or a token rotation onto a different account in flight invalidates the
+      // evidence instead of admitting an entry against the wrong account. Non-secret by
+      // construction: the account reference is whatever masked id the broker state exposes.
+      evidenceContext: () => ({
+        broker: this.deps.activeBroker(),
+        account_ref: this.deps.brokerAccountRef?.() ?? null,
+        session_id: this.deps.brokerGeneration ? String(this.deps.brokerGeneration()) : null,
+      }),
     });
     // Contract-level exclusion wraps the gateway rather than living inside it, so it
     // sits ABOVE the paper/live branch: paper gets no shortcut around coordination,

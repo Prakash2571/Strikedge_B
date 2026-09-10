@@ -98,6 +98,14 @@ export interface BoxModuleDeps {
    */
   brokerGeneration?: () => number;
   /**
+   * A NON-SECRET reference to the broker account currently authenticated — a masked user id or a
+   * hash, never a token. Used to bind funds/margin evidence to the account it was read for, so a
+   * token rotation onto a DIFFERENT account mid-read invalidates the evidence instead of admitting
+   * an entry against the wrong account. Absent ⇒ null ⇒ the account half of the check is skipped
+   * (unknown is never treated as a mismatch), preserving existing wiring exactly.
+   */
+  brokerAccountRef?: () => string | null;
+  /**
    * Overrides the market-data provider. When absent, one is adapted from `kite`,
    * preserving current Zerodha behaviour bit for bit.
    */
@@ -157,6 +165,7 @@ export function registerBoxModule(app: Express, deps: BoxModuleDeps): BoxModule 
     marketData: deps.marketData ?? kiteMarketData(deps.kite),
     activeBroker: deps.activeBroker ?? (() => "zerodha" as const),
     ...(deps.brokerGeneration === undefined ? {} : { brokerGeneration: deps.brokerGeneration }),
+    ...(deps.brokerAccountRef === undefined ? {} : { brokerAccountRef: deps.brokerAccountRef }),
     // The hub already satisfies BoxFeedProvider structurally, so a Zerodha-only
     // deployment needs no adapter at all.
     feed: deps.feed ?? deps.tickerHub,

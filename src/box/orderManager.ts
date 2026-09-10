@@ -122,6 +122,20 @@ export interface LiveEntryTransportGuard {
    * absent means "no objection from here", never "coherence is proven".
    */
   readonly sendBoundaryCoherence?: () => string | null;
+  /**
+   * FUNDS/MARGIN EVIDENCE validity, re-evaluated at the send boundary against the request that is
+   * actually about to be transmitted.
+   *
+   * Supplied by the gateway, which owns the evidence it admitted the entry with. Returns null when
+   * the evidence still applies, or the reason it does not (expired, account/session changed, or the
+   * order plan differs from the one the margin figure was fetched for). Consulted ONLY at
+   * `pre_post`, and only while the attempt has taken no exposure — see `economic_evidence_expired`
+   * in liveEntryGuard.ts.
+   *
+   * Optional so callers with no economic control enabled (and every existing test) are unchanged;
+   * absent means "no objection from here", never "funding is proven".
+   */
+  readonly sendBoundaryEconomics?: (request?: BrokerOrderRequest) => string | null;
 }
 
 /**
@@ -308,6 +322,14 @@ export interface OrderManagerStatus {
    */
   coherenceDegradedAfterExposure: number;
   lastCoherenceDegradation: string | null;
+  /**
+   * Times the funds/margin evidence had already expired (or the plan/account had changed) at the
+   * send boundary but the attempt held exposure, so the box was COMPLETED and the degradation
+   * recorded rather than refused. A non-zero value means real entries are racing their own evidence
+   * window: either the window is too tight or the queue/persistence/pacing path is too slow.
+   */
+  economicEvidenceDegradedAfterExposure: number;
+  lastEconomicEvidenceDegradation: string | null;
 }
 
 export interface OrderManagerLimits {
@@ -516,6 +538,8 @@ export class BoxOrderManager {
    */
   private coherenceDegradedAfterExposure = 0;
   private lastCoherenceDegradation: string | null = null;
+  private economicEvidenceDegradedAfterExposure = 0;
+  private lastEconomicEvidenceDegradation: string | null = null;
   private disposed = false;
   private lastReconciledAt: number | null = null;
   /** Guarded durable transitions the intent state machine refused. Bounded counter. */
@@ -1117,6 +1141,8 @@ export class BoxOrderManager {
       durableTransitionRefusals: this.durableTransitionRefusals,
       coherenceDegradedAfterExposure: this.coherenceDegradedAfterExposure,
       lastCoherenceDegradation: this.lastCoherenceDegradation,
+      economicEvidenceDegradedAfterExposure: this.economicEvidenceDegradedAfterExposure,
+      lastEconomicEvidenceDegradation: this.lastEconomicEvidenceDegradation,
     };
   }
 
@@ -1353,6 +1379,10 @@ export class BoxOrderManager {
       // CROSS-LEG COHERENCE at the final boundary only, and only while this attempt has taken NO
       // exposure. See `entryCrossLegCoherenceGap`.
       crossLegCoherenceGap: this.entryCrossLegCoherenceGap(guard, gate, stage),
+      // ECONOMIC EVIDENCE at the final boundary only, and only while this attempt has taken NO
+      // exposure. Same exposure-aware policy as coherence: refusing a leg after siblings have
+      // POSTed would manufacture a partial entry. See `entryEconomicEvidenceGap`.
+      economicEvidenceGap: this.entryEconomicEvidenceGap(request, guard, gate, stage),
     });
     if (!decision.allowed) {
       this.entryGuardRefusals.set(stage, (this.entryGuardRefusals.get(stage) ?? 0) + 1);
@@ -1462,6 +1492,53 @@ export class BoxOrderManager {
     }
   }
 
+  /**
+   * The FUNDS/MARGIN EVIDENCE gap at the final send boundary, or null when it still applies.
+   *
+   * Section 3 requirement 12/13, and the exact mirror of {@link entryCrossLegCoherenceGap}:
+   *
+   *  1. `pre_post` ONLY. Earlier checkpoints re-verify ownership and admission; the evidence
+   *     expiry question only becomes meaningful at the boundary where the POST would happen.
+   *  2. NO EXPOSURE ONLY (requirement 13: an explicit recovery policy, not blind re-admission). If
+   *     any leg of this attempt has already POSTed, the attempt COMPLETES the hedged box and the
+   *     degradation is RECORDED. Refusing leg 4 because a funds figure aged out would leave an
+   *     unhedged partial that costs real money to unwind — strictly worse than completing a hedged
+   *     box whose post-fill economics gate can still unwind it.
+   *  3. A THROWING callback is an explicit objection, not silent permission — matching
+   *     `stillWantedSafely` and the coherence check.
+   *
+   * The request about to be transmitted is passed through so the gateway can compare it against the
+   * order plan its margin evidence was fetched for.
+   */
+  private entryEconomicEvidenceGap(
+    request: BrokerOrderRequest,
+    guard: LiveEntryTransportGuard,
+    gate: EntryTransportGate | undefined,
+    stage: LiveEntryGuardStage,
+  ): string | null {
+    if (stage !== "pre_post") return null;
+    if (guard.sendBoundaryEconomics === undefined) return null;
+    const alreadyExposed = gate !== undefined &&
+      [...gate.decided.values()].some((outcome) => outcome === "posted");
+    if (alreadyExposed) {
+      try {
+        const gap = guard.sendBoundaryEconomics(request);
+        if (gap !== null) {
+          this.economicEvidenceDegradedAfterExposure++;
+          this.lastEconomicEvidenceDegradation = gap;
+        }
+      } catch {
+        this.economicEvidenceDegradedAfterExposure++;
+      }
+      return null;
+    }
+    try {
+      return guard.sendBoundaryEconomics(request);
+    } catch (error) {
+      return `funds/margin evidence could not be re-evaluated: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
+
   /** {@link evaluateEntryGuard} as a reason string, matching the `*BlockReason` convention. */
   private entryGuardBlockReason(
     request: BrokerOrderRequest,
@@ -1476,6 +1553,7 @@ export class BoxOrderManager {
   entryGuardDiagnostics(): Record<LiveEntryGuardStage, number> {
     return {
       pre_build: this.entryGuardRefusals.get("pre_build") ?? 0,
+      post_evidence: this.entryGuardRefusals.get("post_evidence") ?? 0,
       pre_enqueue: this.entryGuardRefusals.get("pre_enqueue") ?? 0,
       dequeue: this.entryGuardRefusals.get("dequeue") ?? 0,
       post_persist: this.entryGuardRefusals.get("post_persist") ?? 0,

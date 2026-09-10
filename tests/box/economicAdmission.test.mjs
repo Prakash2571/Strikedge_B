@@ -18,9 +18,40 @@ import {
   evaluateEconomicAdmission,
   worstCaseEntryCost,
 } from "../../dist/box/boxCapital.js";
+import { ageEvidence } from "../../dist/box/evidenceTiming.js";
 
 const ROLES = ["k1_ce", "k2_ce", "k2_pe", "k1_pe"];
 const NOW = 10_000_000;
+
+/**
+ * Age an observation exactly the way the production path does.
+ *
+ * `brokerFigure()` no longer decides freshness itself — that lives in `ageEvidence()`
+ * (src/box/evidenceTiming.ts), which owns the single coherent clock model: MONOTONIC for durations,
+ * wall for audit, and an evaluation instant stamped AFTER the reads resolve. This helper drives the
+ * REAL ageing function rather than hand-rolling a status, so these tests still exercise the code
+ * that makes the decision. `observedAt === null` models a read that produced nothing at all.
+ */
+function agedAt(observedAt, { now = NOW, maxAgeMs, label = "figure" } = {}) {
+  const observation = observedAt === null
+    ? {
+        value: null, at: null, source_observed_at_wall: null, failure: "absent",
+        detail: null, identity: null, identity_at_resolution: null, elapsed_ms: null,
+      }
+    : {
+        value: {}, at: { mono: observedAt, wall: observedAt },
+        source_observed_at_wall: observedAt, failure: null, detail: null,
+        identity: null, identity_at_resolution: null, elapsed_ms: 0,
+      };
+  return ageEvidence({
+    observation,
+    evaluatedAt: { mono: now, wall: now },
+    maxAgeMs,
+    futureSkewGraceMs: 1_000,
+    currentIdentity: null,
+    label,
+  });
+}
 
 function legs({ prices, quantity = 100, sides = ["BUY", "SELL", "BUY", "SELL"] }) {
   return ROLES.map((role, i) => ({
@@ -35,7 +66,13 @@ function legs({ prices, quantity = 100, sides = ["BUY", "SELL", "BUY", "SELL"] }
 // ── provenance is a first-class concept ─────────────────────────────────────────────────────
 
 test("a broker figure within the freshness bound is broker_confirmed and usable", () => {
-  const f = brokerFigure({ valueRupees: 41_250, observedAt: NOW - 500, now: NOW, maxAgeMs: 2_000, confirmedNote: "ok" });
+  const f = brokerFigure({
+    valueRupees: 41_250,
+    aged: agedAt(NOW - 500, { maxAgeMs: 2_000 }),
+    observedAtWall: NOW - 500,
+    observedAtMono: NOW - 500,
+    confirmedNote: "ok",
+  });
   assert.equal(f.provenance, "broker_confirmed");
   assert.equal(f.usable, true);
   assert.equal(f.value_rupees, 41_250);
@@ -43,14 +80,26 @@ test("a broker figure within the freshness bound is broker_confirmed and usable"
 });
 
 test("a broker figure OVER the freshness bound is downgraded to stale and NOT usable", () => {
-  const f = brokerFigure({ valueRupees: 41_250, observedAt: NOW - 5_000, now: NOW, maxAgeMs: 2_000, confirmedNote: "ok" });
+  const f = brokerFigure({
+    valueRupees: 41_250,
+    aged: agedAt(NOW - 5_000, { maxAgeMs: 2_000 }),
+    observedAtWall: NOW - 5_000,
+    observedAtMono: NOW - 5_000,
+    confirmedNote: "ok",
+  });
   assert.equal(f.provenance, "stale");
   assert.equal(f.usable, false, "a stale margin must not admit a live entry");
   assert.equal(f.value_rupees, 41_250, "the value is retained for display, but marked unusable");
 });
 
 test("a missing broker figure is UNAVAILABLE with null value, never ₹0", () => {
-  const f = brokerFigure({ valueRupees: null, observedAt: null, now: NOW, maxAgeMs: 2_000, confirmedNote: "ok" });
+  const f = brokerFigure({
+    valueRupees: null,
+    aged: agedAt(null, { maxAgeMs: 2_000 }),
+    observedAtWall: null,
+    observedAtMono: null,
+    confirmedNote: "ok",
+  });
   assert.equal(f.provenance, "unavailable");
   assert.equal(f.value_rupees, null, "absent must read as null, not 0");
   assert.equal(f.usable, false);
@@ -90,12 +139,21 @@ test("worst-case entry with an unpriced leg is incomplete", () => {
 
 // ── the five-quantity picture keeps everything distinct ──────────────────────────────────────
 
-function picture(overrides = {}) {
+/**
+ * The five-quantity picture. `availableFundsObservedAt` / `plannedMarginObservedAt` are kept as the
+ * test's vocabulary and translated into the production `AgedEvidence` inputs here, so each test
+ * still reads as "a figure observed N ms ago" while driving the real ageing code.
+ */
+function picture({ availableFundsObservedAt = null, plannedMarginObservedAt = null, ...overrides } = {}) {
   return buildEconomicPicture({
     requests: legs({ prices: [50, 50, 50, 50] }), // gross = 50*100*4 = 20,000
     now: NOW,
-    marginFreshnessMaxAgeMs: 2_000,
-    fundsFreshnessMaxAgeMs: 5_000,
+    availableFundsAged: agedAt(availableFundsObservedAt, { maxAgeMs: 5_000, label: "available-funds" }),
+    availableFundsObservedAtWall: availableFundsObservedAt,
+    availableFundsObservedAtMono: availableFundsObservedAt,
+    plannedMarginAged: agedAt(plannedMarginObservedAt, { maxAgeMs: 2_000, label: "planned-margin" }),
+    plannedMarginObservedAtWall: plannedMarginObservedAt,
+    plannedMarginObservedAtMono: plannedMarginObservedAt,
     ...overrides,
   });
 }
@@ -191,7 +249,9 @@ test("gross cap control stays consistent with the standalone gross-notional gate
 test("an incomplete gross metric refuses under a cap (fail closed)", () => {
   const partial = buildEconomicPicture({
     requests: legs({ prices: [50, 50, 50, 50] }).slice(0, 3),
-    now: NOW, marginFreshnessMaxAgeMs: 2_000, fundsFreshnessMaxAgeMs: 5_000,
+    now: NOW,
+    availableFundsAged: agedAt(null, { maxAgeMs: 5_000, label: "available-funds" }),
+    plannedMarginAged: agedAt(null, { maxAgeMs: 2_000, label: "planned-margin" }),
   });
   const r = evaluateEconomicAdmission({ picture: partial, grossCapRupees: 100_000, requireFundsCover: false, requireMarginEvidence: false });
   assert.equal(r.allowed, false);
