@@ -360,3 +360,34 @@ $ node --test tests/box/effectiveConfig.test.mjs   # pass 14 fail 0
 ---
 
 ## VERIFICATION (Agent 2 finishing state) — see the "FINAL VERIFICATION" appendix below for command output.
+
+## FINAL VERIFICATION (Agent 2, committed state 9fca48e + d694c9a)
+
+```
+$ npm run build                       # tsc -b, exit 0
+$ /home/ubuntu/Cal/run-suites.sh /home/ubuntu/Cal/Strikedge_B
+unit         pass=1752   fail=0    skipped=0    rc=0
+invariants   pass=3      fail=0    skipped=0    rc=0
+tokens       pass=48     fail=0    skipped=0    rc=0
+access       pass=31     fail=0    skipped=0    rc=0
+switch       pass=32     fail=0    skipped=0    rc=0
+shutdown     pass=11     fail=0    skipped=0    rc=0
+readiness    pass=24     fail=0    skipped=0    rc=0
+contract     pass=44     fail=0    skipped=0    rc=0
+pg           pass=74     fail=0    skipped=0    rc=0
+projector    pass=17     fail=0    skipped=0    rc=0
+TOTAL pass=2036 fail=0 skipped=0 overall_rc=0
+```
+Agent 1 left 2031/0/0; Agent 2 leaves 2036/0/0 (+5: D2 repro 2 + wiredNotInert D2 assertion 1;
+D3 real-PG 2). fail=0, pass count did not drop.
+
+```
+$ bash .github/ci/no-live-hostnames.sh   # OK, rc=0
+$ node .github/ci/no-egress-guard.mjs     # CI-EGRESS-GUARD: armed (loopback-only egress), rc=0
+$ node contract/validate.mjs              # rc=0
+```
+
+CONTRACT: NOT changed. D2's fix makes the EXISTING status payload (`gated_off` /
+`rest_polling_only`) truthful without changing its shape; no contract version bump was needed and
+the contract suite (44) is green. No CI guard script was modified; no test was skipped, deleted or
+weakened; no new npm dependency; no real orders/credentials/egress.
