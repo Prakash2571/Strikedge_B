@@ -150,9 +150,13 @@ async function main() {
     // Distribution for concurrency 2 as a representative histogram of four-leg completion.
     const rep = report.cells.find((x) => x.scenario === scenario.key && x.concurrency === 2);
     const h = rep.completion_histogram;
-    const total = h.buckets.reduce((a, b) => a + b, 0) || 1;
-    const bars = h.labels.map((lbl, i) => `${lbl}ms:${h.buckets[i]}`).join("  ");
-    console.log(`   four-leg completion histogram (conc 2, n=${total}): ${bars}`);
+    const total = h.buckets.reduce((a, b) => a + b, 0);
+    if (total === 0) {
+      console.log(`   four-leg completion histogram (conc 2): NONE — 0/${rep.iterations} entries reached four-leg completion under this scenario (honest: this scenario forces a cancel/reject, so no full box is expected)`);
+    } else {
+      const bars = h.labels.map((lbl, i) => `${lbl}ms:${h.buckets[i]}`).join("  ");
+      console.log(`   four-leg completion histogram (conc 2, n=${total}): ${bars}`);
+    }
     // Honest outcome accounting: every leg outcome is visible, none hidden.
     const o = rep.outcomes;
     console.log(`   leg outcomes (conc 2): completed=${o.completed} partial=${o.partial} cancelled=${o.cancelled} rejected=${o.rejected}`);
@@ -167,10 +171,12 @@ async function main() {
   console.log("    NOT collapse four-leg execution to one round trip: dependent SELLs still wait for the");
   console.log("    two BUY hedges to be CONFIRMED).");
   console.log("  • That a healthy order stream makes the SAME confirmed fill arrive sooner while the REST");
-  console.log("    poll remains a working fallback. `rest polls` is NEVER zero — the real waitForResolution");
-  console.log("    loop always confirms via getOrder — and `extobs` counts external observations APPLIED to");
-  console.log("    the adapter (push events PLUS manager-forwarded REST snapshots), so it can be >0 even when");
-  console.log("    the push stream is off. Neither ever removes the REST confirmation.");
+  console.log("    poll remains the fallback. With the stream OFF, `rest polls` is the sole confirmation");
+  console.log("    path (never zero). With a FAST stream, the push event can resolve the waiter BEFORE");
+  console.log("    the first REST poll fires (see `updates_precede_ack`, rest polls p50=0) — the stream");
+  console.log("    made the SAME confirmed truth arrive first; the REST poll is still armed as fallback and");
+  console.log("    is used the instant the stream is silent. `extobs` counts external observations APPLIED");
+  console.log("    to the adapter (push events PLUS manager-forwarded REST snapshots).");
   console.log("");
   console.log("WHAT THIS BENCHMARK CANNOT TELL YOU (and must never be quoted as):");
   console.log("  • Live Mumbai broker latency. Every broker delay above is an ASSUMPTION we chose.");
