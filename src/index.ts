@@ -190,6 +190,9 @@ const brokerManager = new ActiveBrokerManager({
     boxModule.engine.ingestBoxLaneTicks(ticks);
   },
   onBoxLaneConnection: (connected) => boxModule.engine.onBoxLaneConnection(connected),
+  // A market-data session/token rejection on the box lane drives the health machine to
+  // AUTH_EXPIRED (no fast-forever reconnect on a known-invalid token), distinct from a drop.
+  onBoxLaneSessionLost: (reason) => boxModule.engine.onMarketDataSessionLost(reason),
   // Kite order postbacks ride the box lane's quote socket as TEXT frames (no dedicated Zerodha
   // order socket exists). Forward them to the engine's order-stream consumer.
   onBoxLaneOrderText: (raw) => boxModule.engine.ingestBoxLaneOrderText(raw),

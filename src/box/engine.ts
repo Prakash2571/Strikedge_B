@@ -124,6 +124,7 @@ import { BoxQuoteStore, SpotStore } from "./quotes.js";
 import { orderStreamStatus } from "./orderStreamStatus.js";
 import type { OrderStreamHealth } from "./orderUpdateProjection.js";
 import { OrderStreamConsumer } from "./orderStreamConsumer.js";
+import { MarketDataStateMachine, marketDataPermissions, type MarketDataState } from "./streamHealthPolicy.js";
 import { parseKiteOrderFrame, zerodhaOrderStreamEnabledFromEnv } from "../brokers/zerodha/orderUpdates.js";
 import { dhanOrderStreamEnabledFromEnv, type DhanOrderFeed } from "../brokers/dhan/orderFeed.js";
 import { ensureBoxPersistenceReady } from "./repository.js";
@@ -508,6 +509,8 @@ export class BoxEngine {
   /** Cached exchange-hours state, refreshed on the market timer. */
   private marketOpen = false;
   private feedHealthy = false;
+  /** Monotonic reference for the market-watch loop-stall check that feeds the backlog signal. */
+  private marketWatchStallRef: number | null = null;
   /** Raw current-socket arrival clock; intentionally independent of depth books. */
   private lastRawTickAt: number | null = null;
   private feedGeneration = 0;
@@ -583,6 +586,18 @@ export class BoxEngine {
   /** The Dhan dedicated order-update socket, when Dhan is active and the stream is armed. */
   private dhanOrderFeed: DhanOrderFeed | null = null;
   /**
+   * THE DRIVEN MARKET-DATA HEALTH MACHINE (GAP 1).
+   *
+   * Turns the box market-data feed lifecycle into a {@link MarketDataState}. `READY` is
+   * unreachable by socket-open: it requires authentication AND fresh usable depth for EVERY
+   * traded (desired) instrument in the CURRENT generation. Driven from `onTicks` (frame + per-leg
+   * depth), the feed connection listener / `onBoxLaneConnection` (connect/disconnect →
+   * authenticated/disconnected), a feed session loss (`onMarketDataSessionLost` → AUTH_EXPIRED),
+   * and the market-watch timer (`evaluate()` for heartbeat-gap / stale-book / backlog demotion).
+   * Constructed on the monotonic clock so age comparisons never step with an NTP correction.
+   */
+  private readonly marketDataMachine: MarketDataStateMachine;
+  /**
    * The inner (uncoordinated) gateway.
    *
    * Retained only so read-only diagnostics can reach the per-Box capital report, which is computed
@@ -622,6 +637,15 @@ export class BoxEngine {
 
     // ── Calibration infrastructure, built before the simulator so it can consume it ──
     this.executionClock = createExecutionClock();
+    // The market-data health machine reads the MONOTONIC clock so a heartbeat-gap / stale-book
+    // comparison is never corrupted by an NTP step. heartbeatMaxAgeMs mirrors the feed-liveness
+    // bound; bookMaxAgeMs mirrors the per-leg usable-book age the coherence gate already enforces.
+    this.marketDataMachine = new MarketDataStateMachine({
+      enabled: this.cfg.executionMode === "live",
+      now: () => this.executionClock.mono(),
+      heartbeatMaxAgeMs: this.cfg.feedMaxAgeMs,
+      bookMaxAgeMs: this.cfg.quoteMaxAgeMs,
+    });
     this.environmentMonitor = new ExecutionEnvironmentMonitor({
       enabled: this.cfg.executionEventLoopMetricsEnabled,
       clock: this.executionClock,
@@ -832,6 +856,17 @@ export class BoxEngine {
       broker: () => this.deps.activeBroker(),
       isTokenWarm: (token) => this.tokenFeedGeneration.get(token) === this.feedGeneration,
       feedGeneration: () => this.feedGeneration,
+      // MARKET-DATA READINESS gate for NEW ENTRY (GAP 1). Live only: the machine is armed only in
+      // live mode (in paper it is DISABLED and this gate would otherwise refuse everything), so the
+      // gate is supplied only when executing live. Reports the driven state as the refusal reason.
+      ...(this.cfg.executionMode === "live"
+        ? {
+            marketDataEntryPermitted: () => {
+              const state = this.marketDataState();
+              return { permitted: marketDataPermissions(state).newEntry, state };
+            },
+          }
+        : {}),
       // So LIVE residual flattening bills its own fees, exactly as the paper path already did.
       chargeTotal: (orders) => this.localCharges.legs(orders).total,
       // ECONOMIC ADMISSION (Task 8): FRESH funds/margin evidence via SUPPORTED broker facilities.
@@ -1862,6 +1897,17 @@ export class BoxEngine {
           );
         }
       }
+      // MARKET-DATA HEALTH: keep the machine's DESIRED set aligned with the real subscription
+      // intent, and force an evaluation so a heartbeat gap or a book that quietly aged past its
+      // bound demotes READY → DEGRADED even though no discrete event would fire. A significant
+      // event-loop stall is a processing backlog: the loop was blocked long enough that queued
+      // market data could not be drained, which must block NEW ENTRY without touching exposure
+      // management.
+      this.marketDataMachine.setDesiredInstruments(this.subscribedOptionTokens);
+      const loopStall = this.environmentMonitor.annotate(this.marketWatchStallRef);
+      this.marketWatchStallRef = this.executionClock.mono();
+      this.marketDataMachine.onProcessingBacklog(loopStall.stalled);
+      this.marketDataMachine.evaluate();
       // Enrich any open position still missing its margin (adopted-on-restart
       // trades, or entries whose margin call had failed).
       this.backfillMissingMargins();
@@ -2018,9 +2064,10 @@ export class BoxEngine {
       );
     }
     if (!this.removeConnectionListener) {
-      this.removeConnectionListener = this.deps.feed.addConnectionListener(() =>
-        this.invalidateFeedGeneration(),
-      );
+      this.removeConnectionListener = this.deps.feed.addConnectionListener((connected) => {
+        this.invalidateFeedGeneration();
+        this.driveMarketDataConnection(connected);
+      });
     }
     if (!this.releaseRetainer) {
       this.releaseRetainer = this.deps.feed.retain();
@@ -2093,9 +2140,18 @@ export class BoxEngine {
     }
     this.metrics.ticks.mark(ticks.length, now);
     const changed = this.quotes.applyTicks(ticks, now);
+    // MARKET-DATA HEALTH: any packet on the current socket is a received frame (transport
+    // liveness); a token that now carries a usable book is FRESH DEPTH for that instrument this
+    // generation. These are fed as DISTINCT facts — a frame never counts as depth — so the machine
+    // cannot read READY off a socket that is alive but publishing no usable book.
+    this.marketDataMachine.onFrame();
     for (const token of changed) {
-      if (this.quotes.get(token)) this.tokenFeedGeneration.set(token, this.feedGeneration);
-      else this.tokenFeedGeneration.delete(token);
+      if (this.quotes.get(token)) {
+        this.tokenFeedGeneration.set(token, this.feedGeneration);
+        this.marketDataMachine.onUsableDepth(token);
+      } else {
+        this.tokenFeedGeneration.delete(token);
+      }
     }
     if (changed.length > 0) {
       this.metrics.wsUpdates.mark(changed.length, now);
@@ -5135,6 +5191,13 @@ export class BoxEngine {
       executable_book_diagnostics: this.quotes.diagnostics(),
       feed_healthy: this.isFeedHealthy(),
       /**
+       * The DRIVEN market-data health state (GAP 1). Distinct from `feed_healthy` (a raw-tick
+       * liveness boolean): this reports the state machine that gates NEW ENTRY on READY and only
+       * reaches READY with fresh usable depth per traded instrument in the current generation.
+       */
+      market_data_state: this.marketDataState(),
+      market_data_health: this.marketDataMachine.diagnostics(),
+      /**
        * APPROXIMATE lag behind the exchange, from Kite's second-resolution
        * exchange_timestamp. Distinct from feed_age_ms (a liveness heartbeat):
        * this estimates how stale the data itself is versus NSE. null until a
@@ -5273,7 +5336,53 @@ export class BoxEngine {
    */
   onBoxLaneConnection(connected: boolean): void {
     this.invalidateFeedGeneration();
+    this.driveMarketDataConnection(connected);
     if (!connected) this.lastError = "box market-data lane disconnected";
+  }
+
+  /**
+   * Drive the MARKET-DATA health machine from a coarse feed connection change.
+   *
+   * The feed provider only surfaces a connected boolean (the socket lifecycle lives inside the
+   * lane feed / TickerHub), so a `connected=true` edge stands for "socket open AND authorised" —
+   * the feed only opens once it holds credentials, and both broker feeds guard their handlers on
+   * generation so a superseded socket can never emit. We therefore walk the machine through
+   * CONNECTING → socket-open → authenticated (which advances the generation and drops prior
+   * readiness), leaving it SYNCHRONIZING until fresh depth per instrument arrives via `onTicks`.
+   * A `connected=false` edge is a disconnect: exposure management and protective cancel continue,
+   * new entry stops, and a missing book is never read as a zero. AUTH_EXPIRED is reached only via
+   * {@link onMarketDataSessionLost}, never inferred from a plain disconnect.
+   */
+  private driveMarketDataConnection(connected: boolean): void {
+    if (connected) {
+      this.marketDataMachine.onConnecting();
+      this.marketDataMachine.onSocketOpen();
+      this.marketDataMachine.onAuthenticated();
+      // Publish the CURRENT desired traded instruments so readiness is measured against the real
+      // subscription intent, not a stale set from the previous generation.
+      this.marketDataMachine.setDesiredInstruments(this.subscribedOptionTokens);
+    } else {
+      this.marketDataMachine.onDisconnected();
+    }
+  }
+
+  /**
+   * The market-data feed reported a session/token rejection (a dead or expired token).
+   *
+   * Distinct from a transient disconnect: reconnecting with a rejected token is pointless and the
+   * broker will refuse everything but a cancel, so the machine goes AUTH_EXPIRED and NO data event
+   * can revive it. Wired to the lane feed's `onDead`/`onSessionLost` callback by the registry.
+   */
+  onMarketDataSessionLost(reason: string): void {
+    this.marketDataMachine.onSessionLost();
+    this.lastError = reason;
+  }
+
+  /** The current driven market-data health state (GAP 1). For status and the entry gate. */
+  marketDataState(): MarketDataState {
+    // Force the age-based demotions no discrete event would trigger (a heartbeat gap or a book
+    // that quietly aged past its bound), then report.
+    return this.marketDataMachine.evaluate();
   }
 
   /**

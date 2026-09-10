@@ -178,6 +178,13 @@ export interface ActiveBrokerManagerDeps {
   onBoxLaneTicks?: (ticks: Parameters<TickerHub["seed"]>[0]) => void;
   onBoxLaneConnection?: (connected: boolean) => void;
   /**
+   * The BOX lane's market-data socket reported a session/token rejection (a dead or expired
+   * token), as opposed to a transient disconnect. Forwarded to the engine so the driven
+   * MarketDataStateMachine reaches AUTH_EXPIRED and does not reconnect fast-forever on a
+   * known-invalid token. Distinct from a plain `onBoxLaneConnection(false)`.
+   */
+  onBoxLaneSessionLost?: (reason: string) => void;
+  /**
    * Kite order-update TEXT frames from the BOX lane's Zerodha socket.
    *
    * Zerodha multiplexes order postbacks onto the SAME quote socket as the binary ticks (text =
@@ -478,7 +485,12 @@ export class ActiveBrokerManager {
           this.deps.onBoxLaneTicks?.(ticks);
         },
         onConnectionChange: (connected) => this.deps.onBoxLaneConnection?.(connected),
-        onDead: (message) => console.warn(`[Broker] box lane (zerodha) feed died: ${message}`),
+        onDead: (message) => {
+          console.warn(`[Broker] box lane (zerodha) feed died: ${message}`);
+          // A Kite feed death is a credential/token rejection (not a reconnectable network blip):
+          // surface it as a market-data session loss so the health machine goes AUTH_EXPIRED.
+          this.deps.onBoxLaneSessionLost?.(message);
+        },
         // Order postbacks ride this SAME socket as text frames — no extra Zerodha socket exists.
         ...(this.deps.onBoxLaneOrderText
           ? { onTextFrame: (raw: string) => this.deps.onBoxLaneOrderText?.(raw) }
@@ -499,7 +511,14 @@ export class ActiveBrokerManager {
           this.deps.onBoxLaneTicks?.(ticks);
         },
         onConnection: (connected) => this.deps.onBoxLaneConnection?.(connected),
-        onSessionLost: (reason) => void this.onDhanSessionLost(reason),
+        onSessionLost: (reason) => {
+          // Distinguish an auth/session rejection (dhan/feed classifies close codes 1008/4401 etc)
+          // from a transient drop: this path only fires for the former, so it is a market-data
+          // session loss too — the box lane's health machine must reach AUTH_EXPIRED, not merely
+          // DISCONNECTED, and must not reconnect fast-forever on a dead token.
+          this.deps.onBoxLaneSessionLost?.(reason);
+          void this.onDhanSessionLost(reason);
+        },
         resolve: (token) => this.dhanInstruments.identify(token),
         depthLevel: 5,
       });

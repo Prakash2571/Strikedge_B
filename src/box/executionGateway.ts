@@ -183,6 +183,15 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     isTokenWarm?: (token: number) => boolean;
     /** Current socket generation, captured with each checked executable book. */
     feedGeneration?: () => number;
+    /**
+     * MARKET-DATA READINESS gate for NEW ENTRY (GAP 1). When supplied and it reports NOT permitted,
+     * a live entry is refused at the cheapest checkpoint (before any request is built or any
+     * exposure is created). The driven MarketDataStateMachine gates entry on READY: a socket that
+     * has merely opened, a partly-restored subscription set, a heartbeat gap, a stale book or an
+     * ingestion backlog all report NOT permitted with the state as the reason. Absent (paper, and
+     * older single-broker wiring) ⇒ no additional gate, preserving prior behaviour exactly.
+     */
+    marketDataEntryPermitted?: () => { permitted: boolean; state: string };
     now?: () => number;
     /**
      * Total charges (₹) for a set of orders, from the LOCAL fee calculator.
@@ -264,6 +273,29 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     const submittedAt = this.now();
     const wantedAtBuild = this.entryGuardRefusal(args.stillWanted, "pre_build");
     if (wantedAtBuild) return this.refusedBeforeSubmit(args, submittedAt, tradeId, wantedAtBuild);
+
+    // ── MARKET-DATA READINESS: gate NEW ENTRY on READY (GAP 1) ─────────────────────────────
+    //
+    // The driven MarketDataStateMachine only reports permitted when the feed is authenticated AND
+    // every traded instrument has fresh usable depth in the CURRENT generation. A socket that has
+    // merely opened, a partly-restored subscription set after a reconnect, a heartbeat gap, a
+    // stale book, or an ingestion backlog all refuse here — at the cheapest checkpoint, before any
+    // request is built or any exposure is created. This is ENTRY-ONLY: protective cancel, exit and
+    // attributed reduction are never routed through here and are never blocked by it.
+    const mdGate = this.deps.marketDataEntryPermitted?.();
+    if (mdGate && !mdGate.permitted) {
+      return liveEntryFailure(
+        args.candidate,
+        args.detection.at,
+        submittedAt,
+        [],
+        "feed_unhealthy",
+        `market-data not READY for new entry (state ${mdGate.state}); ` +
+          `entry requires fresh usable depth per leg in the current connection generation`,
+        this.deps.cfg,
+        tradeId,
+      );
+    }
 
     const requests: BrokerOrderRequest[] = [];
     let checkedFeed = new Map<string, CheckedFeedStamp>();
