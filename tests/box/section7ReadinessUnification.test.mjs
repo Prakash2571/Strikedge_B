@@ -461,6 +461,28 @@ test("WIRING: runtime status live_entry is PROJECTED from the decision, not reco
   );
 });
 
+test("WIRING: the MASKED identity has a real production source, not just a tested code path", () => {
+  // Found by audit: `brokerAccountRef` was never supplied to registerBoxModule, so
+  // `identity.account_masked` published null forever. The masking function was correct and
+  // unit-tested, and fed by nothing — the exact "built, tested and never called" failure this
+  // section exists to remove. An operator could not tell WHICH account a live verdict was for.
+  const index = codeOf("index.ts");
+  assert.ok(
+    index.includes("brokerAccountRef: () => brokerManager.sessionFor("),
+    "the readiness decision's account reference must have a real source",
+  );
+  const engine = codeOf("box/engine.ts");
+  assert.ok(
+    engine.includes("account: this.deps.brokerAccountRef?.() ?? null"),
+    "and the engine must pass it into the decision, where it is masked",
+  );
+  // It must be an IDENTIFIER accessor, never a token accessor.
+  assert.ok(
+    !/brokerAccountRef: \(\) => [^\n]*(access_token|Token|token)\b/.test(index),
+    "the account reference must never be sourced from a token",
+  );
+});
+
 test("WIRING: the consumer's published health is derived from the machine, at the only producer", () => {
   const consumer = codeOf("box/orderStreamConsumer.ts");
   assert.ok(

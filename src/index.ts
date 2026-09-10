@@ -322,6 +322,21 @@ const boxModule: BoxModule = registerBoxModule(app, {
   // Stamped onto every durable instrument reservation and re-checked before
   // execution, so a lease taken under a superseded broker cannot authorise a trade.
   brokerGeneration: () => brokerManager.generation,
+  /**
+   * SECTION 7 — the NON-SECRET account reference behind the MASKED identity in the readiness
+   * decision (and the existing `account_ref` on economic evidence).
+   *
+   * Without this the decision's `identity.account_masked` published null forever: the masking path
+   * existed and was tested, but nothing fed it — which is precisely the "built, tested and never
+   * called" failure this section is about. An operator could not tell WHICH account a live verdict
+   * was computed for.
+   *
+   * `sessionFor().client_id` is an account IDENTIFIER, never a token, and it is masked again in
+   * `buildOperationalReadiness` before it reaches the wire. Zerodha does not track a client id here,
+   * so it is honestly null there and the decision reports `account_present: false` rather than
+   * inventing a placeholder. Read fresh on every call so a broker switch or re-login is reflected.
+   */
+  brokerAccountRef: () => brokerManager.sessionFor(brokerManager.activeBroker).client_id ?? null,
   marketData: brokerManager.marketData(),
   margins: brokerManager.margins(),
   feed: {
