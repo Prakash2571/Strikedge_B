@@ -48,6 +48,7 @@ import {
   type IngestResult,
   type NormalizedOrderObservation,
   type OrderStreamHealth,
+  type OrderStreamState,
 } from "./orderUpdateProjection.js";
 import {
   OrderStreamStateMachine,
@@ -117,6 +118,70 @@ export type IncomingObservation = Omit<NormalizedOrderObservation, "source"> & {
   readonly observedAtWall?: number | null;
   readonly observedAtMono?: number | null;
 };
+
+/**
+ * SECTION 7 — THE ONE MAPPING from the governing lifecycle to the published order-stream state.
+ *
+ * TOTAL by construction (a `switch` over a closed union, so a future lifecycle state is a COMPILE
+ * error here rather than a silent default). Because the published `state` is produced only by this
+ * function, from only `OrderStreamStateMachine.state()`, it is not possible for the operator-facing
+ * state to contradict the state that governs entry — which is exactly what defect (a) was.
+ *
+ * The mapping is deliberately conservative at every step: only a genuinely READY lifecycle (socket
+ * up, authorised AND the reconciliation sweep completed) is published as `LIVE`. Everything else
+ * names its real situation.
+ */
+export function publishedStateForLifecycle(lifecycle: OrderStreamLifecycleState): OrderStreamState {
+  switch (lifecycle) {
+    case "DISABLED":
+      return "DISABLED";
+    case "CONNECTING":
+      return "CONNECTING";
+    // A socket that has merely opened is NOT live: authorisation is still owed. It reports as
+    // CONNECTING because that is what it still is from the operator's point of view.
+    case "AUTHENTICATING":
+      return "CONNECTING";
+    case "RECONCILING":
+      return "RECONNECTED_PENDING_RECONCILE";
+    case "READY":
+      return "LIVE";
+    case "DEGRADED":
+      return "DEGRADED";
+    case "DISCONNECTED":
+      return "DOWN";
+    case "AUTH_EXPIRED":
+      return "AUTH_EXPIRED";
+  }
+}
+
+/** Operator-readable sentence for a lifecycle state, used when it supersedes the projection's. */
+function describeLifecycle(lifecycle: OrderStreamLifecycleState): string {
+  switch (lifecycle) {
+    case "DISABLED":
+      return "Order-update stream disabled — fills are observed by REST polling only.";
+    case "CONNECTING":
+      return "Connecting to the order-update stream…";
+    case "AUTHENTICATING":
+      return "Order-update socket open but not yet authorised — a route is not readiness.";
+    case "RECONCILING":
+      return "Order-update stream connected — a REST reconciliation is owed before it is trusted.";
+    case "READY":
+      return "Order-update stream live — fills observed here first, REST reconciles.";
+    case "DEGRADED":
+      return (
+        "Order-update stream connected but NOT delivering (no event within the expected idle bound " +
+        "while a fill is expected) — REST polling is observing fills. New entry is paused; exit, " +
+        "reduction and protective cancel continue."
+      );
+    case "DISCONNECTED":
+      return "Order-update stream is down — REST polling remains the source of truth.";
+    case "AUTH_EXPIRED":
+      return (
+        "The session behind the order-update stream was rejected or expired — reconnecting with it " +
+        "is pointless. REST polling observes fills; the broker will refuse all but a cancel."
+      );
+  }
+}
 
 export class OrderStreamConsumer {
   private readonly proj = new OrderUpdateProjection();
@@ -364,6 +429,10 @@ export class OrderStreamConsumer {
   /** Connected but not delivering usable events within the expected idle bound. */
   onIdle(): void {
     this.machine.onIdle();
+    // SECTION 7 / defect (a). The PROJECTION must hear this too. It used to be told nothing, so
+    // `health()` — the surface an operator reads — went on reporting LIVE while the lifecycle that
+    // governs entry had already degraded. Two truths, one of them flattering.
+    this.proj.onStreamIdle();
   }
 
   /**
@@ -411,7 +480,10 @@ export class OrderStreamConsumer {
     const since = this.lastStreamEventAtWall;
     if (since === null) return; // never connected/authorised long enough to measure
     if (now - since > this.expectedIdleMs) {
-      this.machine.onIdle();
+      // SECTION 7 / defect (a): go through onIdle(), NOT this.machine.onIdle(). The direct machine
+      // call was the bug — it demoted the governing state and left the PUBLISHED projection saying
+      // LIVE. Every idle demotion now travels the one path that informs both.
+      this.onIdle();
     }
   }
 
@@ -422,8 +494,10 @@ export class OrderStreamConsumer {
 
   onSessionLost(_reason: string): void {
     this.machine.onSessionLost();
-    // A lost session is also a disconnect for the projection's gap accounting.
-    this.proj.onStreamDisconnected();
+    // SECTION 7: a lost session is its OWN published state, not a plain disconnect. Reporting it as
+    // DOWN invited a futile reconnect with a credential the broker has already rejected. The
+    // projection still records that a gap exists, so a reconciliation remains owed.
+    this.proj.onStreamSessionLost();
   }
 
   setStreamEnabled(enabled: boolean): void {
@@ -445,9 +519,39 @@ export class OrderStreamConsumer {
     return this.machine.reconcilePending() || this.proj.reconcilePending();
   }
 
-  /** The order-stream health snapshot, for the operator-facing status. Its OWN signal. */
+  /**
+   * THE PUBLISHED ORDER-STREAM HEALTH — SECTION 7 / defect (a): derived from the ONE lifecycle
+   * authority, so the state that GOVERNS entry and the state the operator READS cannot disagree.
+   *
+   * WHAT WAS WRONG. This used to be `return this.proj.orderStreamHealth()` — a straight pass-through
+   * of a SECOND state holder. `onIdle`/`evaluateIdle` demoted `this.machine` to DEGRADED and never
+   * touched the projection, whose `streamState` had no way to express "connected but not
+   * delivering" and so stayed `LIVE`. `engine.getStatus()` publishes this object into
+   * `order_stream`, and `orderStreamStatus()` scores `fills_observed_by` off `state === "LIVE"`. So
+   * the dashboard advertised `stream_primary_rest_reconcile` — the FAST fill path — at the precise
+   * moment the engine was refusing new entry because that same stream was degraded.
+   *
+   * THE FIX IS STRUCTURAL, NOT A PATCH. The projection keeps supplying the facts it genuinely
+   * observes (connected, authorised, last event, disconnect count, detail). The `state` — the field
+   * every consumer branches on — is now MAPPED from `this.machine.state()`, the same value
+   * `lifecycleState()` returns and the same value the entry gate scores. `reconcilePending` is taken
+   * from the union read (`reconcilePending()`), so neither holder can under-report an owed
+   * reconciliation. `lifecycle` carries the authority verbatim so a reader is never left inferring.
+   */
   health(): OrderStreamHealth {
-    return this.proj.orderStreamHealth();
+    const lifecycle = this.machine.state();
+    const projected = this.proj.orderStreamHealth();
+    const state = publishedStateForLifecycle(lifecycle);
+    return {
+      ...projected,
+      state,
+      lifecycle,
+      // Either holder owing a reconciliation means one is owed. Never the narrower answer.
+      reconcilePending: this.reconcilePending(),
+      // Keep the projection's own sentence when the two agree; otherwise the lifecycle wins and
+      // says so, because a stale sentence next to a corrected state is its own small lie.
+      detail: state === projected.state ? projected.detail : describeLifecycle(lifecycle),
+    };
   }
 
   /** The single projection of truth for this broker account. */

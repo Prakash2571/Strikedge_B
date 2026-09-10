@@ -154,6 +154,40 @@ test("minimum and maximum are inclusive", () => {
   bad(6, { type: "integer", maximum: 5 });
 });
 
+/* ───────────────────────── minItems (SECTION 7) ───────────────────────── */
+
+/**
+ * `minItems` is ENFORCED, not annotated.
+ *
+ * It was added for `operational-readiness.exposure_management.limitations`, which must never be
+ * empty: an empty limitations list would read as "reducing exposure carries no caveats", which is
+ * the precise false reassurance that field exists to prevent. A keyword that validated nothing
+ * would let exactly that through, so it is implemented and pinned here.
+ */
+test("minItems enforces an array length floor", () => {
+  ok(["a"], { type: "array", minItems: 1, items: { type: "string" } });
+  ok(["a", "b"], { type: "array", minItems: 1, items: { type: "string" } });
+  bad([], { type: "array", minItems: 1, items: { type: "string" } });
+  bad(["a"], { type: "array", minItems: 2, items: { type: "string" } });
+});
+
+test("minItems reports the actual length, and still validates the elements", () => {
+  const errs = validate([], { type: "array", minItems: 2, items: { type: "string" } });
+  assert.equal(errs.length, 1);
+  assert.match(errs[0].message, /at least 2 item\(s\), got 0/);
+  // A long-enough array with a bad element still reports the element error.
+  const elementErrs = validate(["a", 7], { type: "array", minItems: 1, items: { type: "string" } });
+  assert.equal(elementErrs.length, 1);
+  assert.equal(elementErrs[0].path, "1");
+});
+
+test("minItems works with no items keyword, and a non-integer minItems is a LOUD error", () => {
+  ok([1, 2], { type: "array", minItems: 2 });
+  bad([1], { type: "array", minItems: 2 });
+  assert.throws(() => validate([1], { type: "array", minItems: 1.5 }), /minItems .* non-negative integer/);
+  assert.throws(() => validate([1], { type: "array", minItems: -1 }), /minItems .* non-negative integer/);
+});
+
 /* ───────────────────────── format: date-time ───────────────────────── */
 
 test("format date-time is a shallow ISO-8601 check", () => {

@@ -28,6 +28,7 @@
  */
 
 import type { OrderStreamHealth } from "./orderUpdateProjection.js";
+import type { OrderStreamLifecycleState } from "./streamHealthPolicy.js";
 import type { BrokerId } from "./latencyModel.js";
 
 /** How the order-update capability stands for one broker, independent of socket health. */
@@ -44,6 +45,14 @@ export interface BrokerOrderStreamStatus {
   gate_enabled: boolean;
   /** Live health from the projection, or null when nothing is consuming the stream. */
   health: OrderStreamHealth | null;
+  /**
+   * SECTION 7 — the AUTHORITATIVE order-stream lifecycle, or null when nothing consumes the stream.
+   *
+   * This is the value the live-entry gate scores. Publishing it next to `fills_observed_by` is what
+   * makes defect (a) unrepeatable: the operator can see that the mechanism label and the entry
+   * permission were decided from the SAME state, rather than from two holders that drifted apart.
+   */
+  lifecycle: OrderStreamLifecycleState | null;
   fills_observed_by: FillObservationMechanism;
   /** Plain-language, safe to display verbatim. Never contains a token or account id. */
   detail: string;
@@ -98,8 +107,23 @@ export function orderStreamStatus(args: {
     // A fill is observed by the stream ONLY when a consumer exists, the gate is on, and the
     // projection itself reports a usable connection. Anything less is REST polling, and the
     // pending-reconcile state counts as REST because the stream is not yet trusted.
+    //
+    // SECTION 7 / defect (a). `health.state` is now DERIVED from the single lifecycle authority
+    // (see OrderStreamConsumer.health / publishedStateForLifecycle), so `state === "LIVE"` can no
+    // longer be true while the governing lifecycle is DEGRADED. When the payload carries that
+    // authority verbatim we additionally require it to be READY, so this decision is scored off the
+    // SAME value the entry gate scores — the published fill mechanism and the entry permission are
+    // then incapable of contradicting one another. Health WITHOUT a `lifecycle` (a projection read
+    // in isolation) keeps the original rule, so no existing caller changes meaning.
+    const lifecycleUsable =
+      health === null || health.lifecycle === undefined ? true : health.lifecycle === "READY";
     const streamUsable =
-      wiring === "armed" && health !== null && health.state === "LIVE" && health.connected && health.authorised;
+      wiring === "armed" &&
+      health !== null &&
+      health.state === "LIVE" &&
+      health.connected &&
+      health.authorised &&
+      lifecycleUsable;
     const fills_observed_by: FillObservationMechanism =
       streamUsable ? "stream_primary_rest_reconcile" : "rest_polling_only";
 
@@ -109,6 +133,9 @@ export function orderStreamStatus(args: {
       gate_env_var: gateVar,
       gate_enabled: gateEnabled,
       health,
+      // SECTION 7: the AUTHORITATIVE lifecycle, published alongside the mechanism it decided, so a
+      // reader never has to infer it from a mechanism label. Null when nothing consumes the stream.
+      lifecycle: health?.lifecycle ?? null,
       fills_observed_by,
       detail: describe(broker, wiring, gateVar, gateEnabled, health),
     };

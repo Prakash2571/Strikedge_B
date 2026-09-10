@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "readiness-blocker.schema.json",
+  "title": "One named reason something is not permitted",
+  "description": "SECTION 7. Source: src/box/operationalReadiness.ts ReadinessBlocker. The `scope` field is the whole point: it is what makes it STRUCTURALLY impossible for an entry-only restriction to block a reduction of exposure already owned. A blocker is a bounded, operator-readable sentence plus a stable machine code — never a stack trace, never SQL, never a secret.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["code", "scope", "detail"],
+  "properties": {
+    "code": {
+      "type": "string",
+      "description": "Stable snake_case machine code, for the UI to key and group on. Never localised, never free text."
+    },
+    "scope": {
+      "enum": ["entry", "reduction", "both"],
+      "description": "entry = may stop creating NEW exposure ONLY, and can never reach the reduction verdict. reduction = genuinely prevents REDUCING exposure (an expired session; no priceable book) — rare and serious, because it means a live position cannot be closed right now. both = a fact that really does stop everything."
+    },
+    "detail": {
+      "type": "string",
+      "description": "One bounded sentence a human can act on. Safe to display verbatim."
+    }
+  }
+}

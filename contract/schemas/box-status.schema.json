@@ -76,7 +76,8 @@
     "execution_funnel",
     "economic_admission",
     "market_data_state",
-    "market_data_health"
+    "market_data_health",
+    "operational_readiness"
   ],
   "properties": {
     "running": {
@@ -190,6 +191,10 @@
     "market_data_health": {
       "$comment": "OPEN by design: the MarketDataStateMachine diagnostics (generation, per-instrument readiness, transport-heartbeat / last-frame / last-valid-depth ages, backlog signal). An engine-owned observability object pinned as presence + object-ness. Source: MarketDataStateMachine.diagnostics().",
       "type": "object"
+    },
+    "operational_readiness": {
+      "$comment": "SECTION 7. THE ONE authoritative readiness decision. market_data_state and order_stream above are RAW FACTS about two independent transports; this is the single VERDICT derived from them through the SAME permission table the live-entry checkpoint enforces. A client MUST render this rather than recombining the raw facts into a second permission matrix, and MUST NOT show a permitted/ready state when entry.permitted is false. CLOSED, because a silently added or renamed field here would be a silently changed permission.",
+      "$ref": "operational-readiness.schema.json"
     },
     "database_healthy": {
       "type": "boolean"

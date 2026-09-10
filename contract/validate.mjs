@@ -65,6 +65,11 @@ const SUPPORTED_KEYWORDS = new Set([
   "$ref",
   "minimum",
   "maximum",
+  // SECTION 7: a genuinely enforced array-length floor. Added because
+  // operational-readiness.exposure_management.limitations must NEVER be empty — an empty
+  // limitations list would read as "reduction has no caveats", which is the exact false
+  // reassurance the field exists to prevent. Implemented, not ignored (see below).
+  "minItems",
   "format",
 ]);
 
@@ -317,8 +322,22 @@ function validateNode(value, schema, path, registry, errors) {
   // Array shape: prefixItems then items.
   const hasArrayKeywords =
     Object.prototype.hasOwnProperty.call(schema, "items") ||
-    Object.prototype.hasOwnProperty.call(schema, "prefixItems");
+    Object.prototype.hasOwnProperty.call(schema, "prefixItems") ||
+    Object.prototype.hasOwnProperty.call(schema, "minItems");
   if (hasArrayKeywords && jsonTypeOf(value) === "array") {
+    // minItems — an ENFORCED length floor, checked before the element walk so a too-short array
+    // reports its real problem rather than merely passing an empty element loop.
+    if (Object.prototype.hasOwnProperty.call(schema, "minItems")) {
+      if (typeof schema.minItems !== "number" || !Number.isInteger(schema.minItems) || schema.minItems < 0) {
+        throw new SchemaError(`minItems at ${path || "#"} must be a non-negative integer`);
+      }
+      if (value.length < schema.minItems) {
+        errors.push({
+          path: path || "#",
+          message: `must have at least ${schema.minItems} item(s), got ${value.length}`,
+        });
+      }
+    }
     let prefixLen = 0;
     if (Object.prototype.hasOwnProperty.call(schema, "prefixItems")) {
       if (!Array.isArray(schema.prefixItems)) {
