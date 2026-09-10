@@ -41,6 +41,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import { OrderStreamConsumer } from "../../dist/box/orderStreamConsumer.js";
 import { orderStreamStatus } from "../../dist/box/orderStreamStatus.js";
@@ -381,4 +382,102 @@ test("evidence freshness is reported as an AGE, and an absent observation is nul
   assert.equal(d.evidence.market_data_depth_age_ms, null, "never-observed depth is null, not a fresh 0");
   assert.equal(d.evidence.market_data_frame_age_ms, null);
   assert.equal(d.evidence.order_stream_event_age_ms, null);
+});
+
+/* ═══════════ 4. PRODUCTION WIRING: the decision must be FED and PUBLISHED, not merely built ═══════════ */
+
+/**
+ * A module that is built, unit-tested and never called reports nothing forever while looking
+ * finished. These assertions pin the real CALL SITES, in the same style as
+ * tests/box/wiredNotInert.test.mjs — comments stripped, so a mention in prose never counts.
+ *
+ * They matter most for `src/index.ts`, which cannot be booted hermetically (it needs PostgreSQL, a
+ * token service and a broker registry): without these, the two changes that actually collapse the
+ * three disagreeing readiness answers into one — the blocker source and the `live_entry` projection
+ * — would have no automated evidence at all.
+ */
+const stripComments = (text) =>
+  text
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .split("\n")
+    .filter((l) => !l.trim().startsWith("*") && !l.trim().startsWith("//"))
+    .join("\n");
+const codeOf = (rel) => stripComments(readFileSync(new URL(`../../src/${rel}`, import.meta.url), "utf8"));
+
+test("WIRING: the engine BUILDS the decision and PUBLISHES it in getStatus()", () => {
+  const engine = codeOf("box/engine.ts");
+  assert.ok(engine.includes("buildOperationalReadiness({"), "the engine must build the decision");
+  assert.ok(
+    engine.includes("operational_readiness: this.operationalReadiness()"),
+    "and getStatus() must publish it, or the dashboard receives nothing",
+  );
+  assert.ok(
+    engine.includes("++this.readinessDecisionGeneration"),
+    "the generation must be incremented per decision, or a client cannot detect a stale response",
+  );
+  // The decision must read the SAME accessors the live-entry checkpoint reads.
+  assert.ok(engine.includes("const marketDataState = this.marketDataState()"));
+  assert.ok(engine.includes("const orderStreamLifecycle = this.orderStreamState()"));
+});
+
+test("WIRING: src/index.ts FEEDS the env/DB/token evidence in as scoped blockers", () => {
+  const index = codeOf("index.ts");
+  assert.ok(
+    index.includes("setExternalReadinessBlockers("),
+    "the evidence only index.ts can see must reach the ONE decision",
+  );
+  // Each fact that used to be computed into a SECOND verdict must now be a blocker.
+  for (const code of [
+    "postgres_unavailable",
+    "active_broker_token_not_ready",
+    "box_live_trading_disabled",
+    "migrations_pending",
+  ]) {
+    assert.ok(index.includes(code), `${code} must be supplied as a readiness blocker`);
+  }
+  // …and every one of them ENTRY-scoped, so none can block a reduction.
+  assert.ok(!/scope: "reduction"/.test(index), "index.ts must not declare a reduction-scoped blocker");
+  assert.ok(!/scope: "both"/.test(index), "nor a both-scoped one — none of these facts stops an exit");
+});
+
+test("WIRING: runtime status live_entry is PROJECTED from the decision, not recomputed", () => {
+  const index = codeOf("index.ts");
+  assert.ok(
+    index.includes("boxModule.engine.operationalReadiness()"),
+    "the runtime endpoint must read the ONE decision",
+  );
+  assert.ok(
+    index.includes("blocked: !readiness.entry.permitted"),
+    "live_entry.blocked must BE the decision's verdict",
+  );
+  assert.ok(
+    index.includes("readiness.entry.reasons.map((r) => r.code)"),
+    "and its reasons must be the decision's codes",
+  );
+  // The old second computation must be GONE, not merely bypassed.
+  assert.ok(
+    !index.includes('reasons.push("postgres_unavailable")'),
+    "the old independent live_entry computation must be removed, or it will drift again",
+  );
+});
+
+test("WIRING: the consumer's published health is derived from the machine, at the only producer", () => {
+  const consumer = codeOf("box/orderStreamConsumer.ts");
+  assert.ok(
+    consumer.includes("const lifecycle = this.machine.state();"),
+    "health() must read the ONE lifecycle authority",
+  );
+  assert.ok(
+    consumer.includes("const state = publishedStateForLifecycle(lifecycle);"),
+    "and derive the published state from it via the total mapping",
+  );
+  assert.ok(
+    !consumer.includes("return this.proj.orderStreamHealth();"),
+    "the straight pass-through of the second state holder must be gone — it WAS defect (a)",
+  );
+  assert.ok(consumer.includes("this.proj.onStreamIdle()"), "an idle demotion must reach the projection");
+  assert.ok(
+    consumer.includes("this.onIdle();"),
+    "evaluateIdle must route through onIdle, not poke the machine directly",
+  );
 });
