@@ -72,7 +72,9 @@
     "metrics",
     "last_error",
     "config",
-    "order_stream"
+    "order_stream",
+    "execution_funnel",
+    "economic_admission"
   ],
   "properties": {
     "running": {
@@ -157,6 +159,17 @@
     "order_stream": {
       "$ref": "order-stream-status.schema.json",
       "$comment": "Order-update stream status. NOT market-data health: a healthy tick feed is no evidence that fills are observed promptly. See order-stream-status.schema.json."
+    },
+    "execution_funnel": {
+      "$comment": "OPEN by design (Task 8): the execution funnel snapshot — outcome counts with explicit denominators, incremented from real execution events. An engine-owned observability ring whose internal field set is not part of the strict frontend contract; pinned as presence + object-ness. Source: ExecutionFunnel.snapshot().",
+      "type": "object"
+    },
+    "economic_admission": {
+      "$comment": "OPEN by design (Task 8): the last economic-admission decision (five distinct quantities with provenance), or null when no economic control is enabled. Source: CentralBoxExecutionGateway.economicDiagnostics().",
+      "type": [
+        "object",
+        "null"
+      ]
     },
     "database_healthy": {
       "type": "boolean"
