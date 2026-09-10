@@ -354,3 +354,307 @@ export class OrderStreamStateMachine {
     return orderStreamPermissions(this.current);
   }
 }
+
+
+/**
+ * THE MARKET-DATA LIFECYCLE STATE MACHINE.
+ *
+ * The mirror of {@link OrderStreamStateMachine} for the OTHER transport — and the piece that was
+ * missing (GAP 1). {@link MarketDataState} and its permission table existed, but NOTHING drove the
+ * state: readiness fell back to a scattered "did a tick arrive recently" boolean, which a socket
+ * that had merely opened could satisfy. This class turns real market-data lifecycle EVENTS into
+ * the {@link MarketDataState} the table scores, and makes `READY` genuinely expensive to reach.
+ *
+ * WHY IT NEEDS MORE THAN THE ORDER-STREAM MACHINE
+ * The order stream is account-wide: one reconciliation sweep proves the whole account is caught
+ * up, so a single `markSynchronized` reaches READY. Market data is PER-INSTRUMENT: "the feed is
+ * up" says nothing about whether the four specific legs a box needs each have a fresh usable book.
+ * A reconnect that restores 2,798 of 2,800 subscriptions is not READY for a box whose leg is one
+ * of the missing two. So this machine tracks, PER TRADED INSTRUMENT, whether fresh usable depth
+ * has been observed IN THE CURRENT GENERATION, and only reaches READY when every DESIRED instrument
+ * has. On reconnect the generation advances and all per-instrument readiness is dropped: a book
+ * observed under a superseded socket is not evidence for the new one.
+ *
+ * THE FOUR TIME FACTS, KEPT DISTINCT (item 5 discipline):
+ *   - transport heartbeat  (`onHeartbeat`)   — the 1-byte keep-alive; proves the socket is alive,
+ *                                               proves NOTHING about any book's freshness.
+ *   - last received frame  (`onFrame`)        — any inbound frame, tick or heartbeat.
+ *   - last valid depth     (`onUsableDepth`)  — a usable two-sided book for a specific instrument.
+ *   - per-instrument age   (readiness map)    — when each traded instrument last had usable depth.
+ * A machine that read a heartbeat as a depth update would report READY on a dead-book feed; these
+ * are deliberately four separate clocks and the machine never substitutes one for another.
+ *
+ * THE LOAD-BEARING TRANSITIONS (compare OrderStreamStateMachine):
+ *   - `onSocketOpen`  CONNECTING → AUTHENTICATING. A route, not authorisation. Never READY.
+ *   - `onAuthenticated` AUTHENTICATING → SYNCHRONIZING, and ADVANCES THE GENERATION, dropping all
+ *     prior per-instrument readiness. Even a first connect must observe depth before READY.
+ *   - `onUsableDepth`/`onSubscriptionsConfirmed`/`evaluate` are the ONLY paths to READY, and only
+ *     when EVERY desired instrument has fresh depth this generation and the feed is live.
+ *   - `onDisconnected` → DISCONNECTED (exposure management + cancel continue; new entry stops).
+ *   - `onSessionLost`  → AUTH_EXPIRED, TERMINAL: no data event can revive it (the token is dead).
+ *   - a heartbeat gap, a stale book, or a processing backlog demotes READY → DEGRADED.
+ *
+ * PURE of sockets and timers. The only external it reads is an injected `now()` (monotonic ms),
+ * used solely to compare against the heartbeat/book age bounds; determinism is total.
+ */
+export interface MarketDataStateMachineOptions {
+  /** Whether market data is armed at all. When false the machine stays DISABLED. */
+  readonly enabled: boolean;
+  /** Monotonic clock (ms). Injected so tests are deterministic; defaults to Date.now. */
+  readonly now?: () => number;
+  /**
+   * Maximum age (ms) of the newest received frame before a connected feed is DEGRADED. This is the
+   * TRANSPORT-liveness bound (heartbeat/frame), distinct from book age. Default 5000.
+   */
+  readonly heartbeatMaxAgeMs?: number;
+  /**
+   * Maximum age (ms) a per-instrument usable book may reach before it stops counting as fresh for
+   * READY, degrading the machine. Mirrors the engine's quote/feed freshness discipline. Default
+   * 10000.
+   */
+  readonly bookMaxAgeMs?: number;
+}
+
+export class MarketDataStateMachine {
+  private current: MarketDataState;
+  private readonly enabledInitially: boolean;
+  private readonly nowFn: () => number;
+  private readonly heartbeatMaxAgeMs: number;
+  private readonly bookMaxAgeMs: number;
+
+  /** Connection generation; advanced on every (re)authentication. */
+  private gen = 0;
+  /** DESIRED traded instruments — what readiness is measured AGAINST. */
+  private desired = new Set<number>();
+  /** Per-instrument last usable-depth time, stamped with the generation it belongs to. */
+  private depthAt = new Map<number, { at: number; gen: number }>();
+  /** Subscriptions the feed has CONFIRMED on the wire this generation. */
+  private confirmed = new Set<number>();
+
+  /** Four distinct time facts (see class header). Null until first observed. */
+  private lastHeartbeatAt: number | null = null;
+  private lastFrameAt: number | null = null;
+  private lastDepthAt: number | null = null;
+  /** True while the application ingestion pipeline is backed up. */
+  private backlog = false;
+
+  constructor(opts: MarketDataStateMachineOptions) {
+    this.enabledInitially = opts.enabled;
+    this.nowFn = opts.now ?? Date.now;
+    this.heartbeatMaxAgeMs = Math.max(0, opts.heartbeatMaxAgeMs ?? 5_000);
+    this.bookMaxAgeMs = Math.max(0, opts.bookMaxAgeMs ?? 10_000);
+    this.current = opts.enabled ? "DISCONNECTED" : "DISABLED";
+  }
+
+  state(): MarketDataState {
+    return this.current;
+  }
+
+  generation(): number {
+    return this.gen;
+  }
+
+  permissions(): OperationPermissions {
+    return marketDataPermissions(this.current);
+  }
+
+  /** The desired instruments that currently have FRESH usable depth in the CURRENT generation. */
+  readyInstruments(): number[] {
+    const now = this.nowFn();
+    const out: number[] = [];
+    for (const token of this.desired) {
+      if (this.isInstrumentFresh(token, now)) out.push(token);
+    }
+    return out;
+  }
+
+  /** True when a specific instrument is executable: fresh usable depth THIS generation. */
+  isInstrumentReady(token: number): boolean {
+    return this.isInstrumentFresh(token, this.nowFn());
+  }
+
+  private isInstrumentFresh(token: number, now: number): boolean {
+    const d = this.depthAt.get(token);
+    if (!d || d.gen !== this.gen) return false;
+    return now - d.at <= this.bookMaxAgeMs;
+  }
+
+  /* ─────────────────────────── subscription intent (desired ≠ observed) ─────────────────────────── */
+
+  /**
+   * Declare the traded instruments readiness is measured against.
+   *
+   * DESIRED is intentionally separate from CONFIRMED (on the wire) and from OBSERVED (fresh depth).
+   * Narrowing the set can COMPLETE readiness — an instrument no longer traded stops being required —
+   * without ever inventing depth for it. Widening the set re-opens SYNCHRONIZING until the new
+   * instruments confirm.
+   */
+  setDesiredInstruments(tokens: Iterable<number>): void {
+    this.desired = new Set([...tokens].filter((t) => Number.isFinite(t) && t > 0));
+    this.reevaluate();
+  }
+
+  /** The feed confirmed these subscriptions on the wire (this generation). */
+  onSubscriptionsConfirmed(tokens: Iterable<number>): void {
+    if (this.current === "DISABLED" || this.current === "AUTH_EXPIRED") return;
+    for (const t of tokens) this.confirmed.add(t);
+    this.reevaluate();
+  }
+
+  /* ─────────────────────────── transport lifecycle → state ─────────────────────────── */
+
+  onConnecting(): void {
+    if (this.current === "DISABLED") return;
+    this.current = "CONNECTING";
+  }
+
+  /** Socket open — a route exists, nothing more. Never READY. */
+  onSocketOpen(): void {
+    if (this.current === "DISABLED" || this.current === "AUTH_EXPIRED") return;
+    this.current = "AUTHENTICATING";
+  }
+
+  /**
+   * Authenticated. Advances the generation and DROPS all prior per-instrument readiness and
+   * confirmations — a reconnect's books belong to a superseded socket. Enters SYNCHRONIZING; fresh
+   * depth per instrument is still owed before READY.
+   */
+  onAuthenticated(): void {
+    if (this.current === "DISABLED" || this.current === "AUTH_EXPIRED") return;
+    this.gen++;
+    this.confirmed.clear();
+    // Retain the map entries (cheap, bounded by desired set) but they no longer match this.gen,
+    // so isInstrumentFresh treats them as absent until re-observed under the new generation.
+    this.lastDepthAt = null;
+    this.backlog = false;
+    this.current = "SYNCHRONIZING";
+  }
+
+  /* ─────────────────────────── the four time facts ─────────────────────────── */
+
+  /** A transport heartbeat (the 1-byte keep-alive). Liveness only — NOT a depth update. */
+  onHeartbeat(at?: number): void {
+    const t = at ?? this.nowFn();
+    this.lastHeartbeatAt = t;
+    this.lastFrameAt = t;
+    this.reevaluate();
+  }
+
+  /** Any inbound frame arrived (tick or heartbeat). Liveness only. */
+  onFrame(at?: number): void {
+    this.lastFrameAt = at ?? this.nowFn();
+    this.reevaluate();
+  }
+
+  /**
+   * A usable two-sided book was observed for a specific instrument. THE ONLY event that makes an
+   * instrument fresh — and it also counts as a received frame. Stamped with the current generation.
+   */
+  onUsableDepth(token: number, at?: number): void {
+    if (this.current === "DISABLED" || this.current === "AUTH_EXPIRED") return;
+    const t = at ?? this.nowFn();
+    this.depthAt.set(token, { at: t, gen: this.gen });
+    this.confirmed.add(token);
+    this.lastDepthAt = t;
+    this.lastFrameAt = t;
+    this.reevaluate();
+  }
+
+  /** Signal that the application ingestion pipeline is (or is no longer) backed up. */
+  onProcessingBacklog(active: boolean): void {
+    this.backlog = active;
+    this.reevaluate();
+  }
+
+  onDisconnected(): void {
+    if (this.current === "DISABLED" || this.current === "AUTH_EXPIRED") return;
+    this.current = "DISCONNECTED";
+  }
+
+  onSessionLost(): void {
+    if (this.current === "DISABLED") return;
+    this.current = "AUTH_EXPIRED";
+  }
+
+  setEnabled(enabled: boolean): void {
+    if (!enabled) {
+      this.current = "DISABLED";
+      return;
+    }
+    if (this.current === "DISABLED") this.current = "DISCONNECTED";
+  }
+
+  /**
+   * Re-derive the state from current evidence. Exposed so a caller (or a timer) can force the
+   * age-based demotions that no discrete event would otherwise trigger — a heartbeat gap or a book
+   * that quietly aged past its bound produces no event at all, so a poll must notice it.
+   */
+  evaluate(): MarketDataState {
+    this.reevaluate();
+    return this.current;
+  }
+
+  private reevaluate(): void {
+    // Terminal / absent states are never promoted or demoted by evidence.
+    if (this.current === "DISABLED" || this.current === "AUTH_EXPIRED") return;
+    if (this.current === "CONNECTING" || this.current === "AUTHENTICATING") return;
+    if (this.current === "DISCONNECTED") return;
+
+    const now = this.nowFn();
+    const live = this.isTransportLive(now);
+    const allFresh = this.everyDesiredFresh(now);
+
+    if (!live || this.backlog || !allFresh) {
+      // Connected (SYNCHRONIZING/READY/DEGRADED) but the evidence does not support READY.
+      // Before first full readiness we are still SYNCHRONIZING; after it, a regression is DEGRADED.
+      if (this.current === "READY") {
+        this.current = "DEGRADED";
+      } else if (this.current === "DEGRADED") {
+        // stay DEGRADED
+      } else {
+        this.current = "SYNCHRONIZING";
+      }
+      return;
+    }
+    // live && no backlog && every desired instrument fresh ⇒ READY.
+    this.current = "READY";
+  }
+
+  private isTransportLive(now: number): boolean {
+    const frame = this.lastFrameAt;
+    if (frame === null) return false;
+    return now - frame <= this.heartbeatMaxAgeMs;
+  }
+
+  private everyDesiredFresh(now: number): boolean {
+    if (this.desired.size === 0) return false; // nothing to prove readiness against ⇒ not READY
+    for (const token of this.desired) {
+      if (!this.isInstrumentFresh(token, now)) return false;
+    }
+    return true;
+  }
+
+  diagnostics(): {
+    state: MarketDataState;
+    generation: number;
+    desired: number;
+    confirmed: number;
+    readyInstruments: number;
+    lastHeartbeatAt: number | null;
+    lastFrameAt: number | null;
+    lastDepthAt: number | null;
+    backlog: boolean;
+  } {
+    return {
+      state: this.current,
+      generation: this.gen,
+      desired: this.desired.size,
+      confirmed: this.confirmed.size,
+      readyInstruments: this.readyInstruments().length,
+      lastHeartbeatAt: this.lastHeartbeatAt,
+      lastFrameAt: this.lastFrameAt,
+      lastDepthAt: this.lastDepthAt,
+      backlog: this.backlog,
+    };
+  }
+}
