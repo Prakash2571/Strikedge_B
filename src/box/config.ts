@@ -528,6 +528,50 @@ export interface BoxConfig {
   liveFundsFreshnessMaxAgeMs: number;
   /** Max age (ms) for a planned-margin observation to count as fresh. Default 5000. */
   liveMarginFreshnessMaxAgeMs: number;
+  /**
+   * HARD per-read deadline (ms) for one funds/margin evidence read. Default 2500.
+   *
+   * A stalled broker endpoint must not be able to hold an entry decision open. On expiry the figure
+   * is reported UNAVAILABLE with the timeout named, which (with a control enabled) refuses the
+   * entry. This bounds the WAIT, not the underlying HTTP request — no broker facility here is
+   * cancellable — which is the property that matters for admission latency.
+   */
+  liveEvidenceReadTimeoutMs: number;
+  /**
+   * Tolerance (ms) for a broker/source timestamp being AHEAD of this host before the figure is
+   * called INVALID rather than fresh. Default 1000.
+   *
+   * Small skew between the broker's clock and ours is normal and harmless. A figure stamped
+   * materially in the future cannot be aged at all, so it is refused explicitly instead of being
+   * silently treated as age 0.
+   */
+  liveEvidenceFutureSkewGraceMs: number;
+  /**
+   * Fetch the funds and margin evidence CONCURRENTLY. Default false (serial).
+   *
+   * Two independent GETs are safe to overlap in principle, but the broker's rate limiter and this
+   * process's own pacing rules are the authority on whether they may be. Serial is the safe default;
+   * enable it only once the broker's documented read limits have been checked for the deployment.
+   */
+  liveEvidenceConcurrentReads: boolean;
+  /**
+   * Require EVERY stage of the real hedge-first sequence to have an establishable funding
+   * requirement before entry. Default false.
+   *
+   * When `true`, entry is refused unless the broker supplied BOTH the initial (no spread benefit)
+   * and final (with spread benefit) basket margins, the sequence is genuinely hedge-first, and every
+   * stage requirement could be computed. This is the control that stops the completed-basket `final`
+   * margin being used as proof that the account can fund the sequence which creates the box —
+   * Zerodha's own documented example has initial ₹96,504.98 against final ₹34,786.73.
+   *
+   * REQUIRED for the supervised one-shot live profile.
+   */
+  liveRequireStageFunding: boolean;
+  /**
+   * ₹ held back from the funding requirement so a recovery action (cancel, unwind, complete) is not
+   * blocked by having spent every available rupee on the entry. Default 0.
+   */
+  liveRecoveryReserveRupees: number;
 
   // ---- Strategy-level entry restrictions (apply to ENTRY only, never to reduction) ----
   /**
@@ -1126,6 +1170,11 @@ export function loadBoxConfig(): BoxConfig {
     liveRequireMarginEvidence: bool("BOX_LIVE_REQUIRE_MARGIN_EVIDENCE", false),
     liveFundsFreshnessMaxAgeMs: clampInt("BOX_LIVE_FUNDS_FRESHNESS_MAX_AGE_MS", 5_000, 250, 600_000),
     liveMarginFreshnessMaxAgeMs: clampInt("BOX_LIVE_MARGIN_FRESHNESS_MAX_AGE_MS", 5_000, 250, 600_000),
+    liveEvidenceReadTimeoutMs: clampInt("BOX_LIVE_EVIDENCE_READ_TIMEOUT_MS", 2_500, 100, 60_000),
+    liveEvidenceFutureSkewGraceMs: clampInt("BOX_LIVE_EVIDENCE_FUTURE_SKEW_GRACE_MS", 1_000, 0, 60_000),
+    liveEvidenceConcurrentReads: bool("BOX_LIVE_EVIDENCE_CONCURRENT_READS", false),
+    liveRequireStageFunding: bool("BOX_LIVE_REQUIRE_STAGE_FUNDING", false),
+    liveRecoveryReserveRupees: clampInt("BOX_LIVE_RECOVERY_RESERVE_RUPEES", 0, 0, 100_000_000),
 
     oneActiveBoxPerUnderlying: bool("BOX_ONE_ACTIVE_BOX_PER_UNDERLYING", false),
     sessionMaxCompletedTrades: clampInt("BOX_SESSION_MAX_COMPLETED_TRADES", 0, 0, 10_000),

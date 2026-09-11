@@ -49,6 +49,9 @@ import {
   type FillEventSource,
   type FillLedgerSnapshot,
 } from "./orderLifecycle.js";
+// SECTION 7: the published health carries the lifecycle it was derived from, so the governing
+// state and the reported state can never drift apart again. Type-only import — no cycle at runtime.
+import type { OrderStreamLifecycleState } from "./streamHealthPolicy.js";
 
 /**
  * The identity by which an observation is attributed to a registered order.
@@ -178,11 +181,33 @@ export type OrderStreamState =
   /** Connected and authorised; order updates will arrive here first. */
   | "LIVE"
   /**
+   * SECTION 7. Connected and authorised, but NOT DELIVERING — no usable event has arrived within
+   * the expected idle bound while a fill was actually expected.
+   *
+   * WHY THIS STATE HAD TO EXIST. Its absence was the whole of defect (a). The lifecycle machine
+   * (`OrderStreamStateMachine`) could reach DEGRADED from `onIdle`, but this — the state that is
+   * actually PUBLISHED to the operator — had no way to say "connected but not delivering", so it
+   * stayed `LIVE`. The dashboard therefore advertised the fast fill path at the exact moment the
+   * engine was refusing new entry because that same stream was degraded. A published truth that
+   * cannot represent a state the governing truth can reach is not a projection, it is a lie.
+   *
+   * It is NOT `DOWN`: the socket is up, so a reconnect is not what is owed — REST is carrying the
+   * fill observation until events resume.
+   */
+  | "DEGRADED"
+  /**
    * Was LIVE, then dropped. Fills may have occurred in the gap. Distinct from DOWN because
    * it MANDATES a REST reconciliation before the stream is trusted again — the gap must be
    * repaired from REST, never assumed empty.
    */
-  | "RECONNECTED_PENDING_RECONCILE";
+  | "RECONNECTED_PENDING_RECONCILE"
+  /**
+   * SECTION 7. The session/token backing the stream was rejected or expired. Distinct from DOWN
+   * because reconnecting with the same dead credential is pointless: the broker will refuse
+   * everything but a cancel. Reporting this as DOWN invited a futile reconnect loop and hid the
+   * one fact an operator must act on.
+   */
+  | "AUTH_EXPIRED";
 
 export interface OrderStreamHealth {
   readonly state: OrderStreamState;
@@ -196,6 +221,16 @@ export interface OrderStreamHealth {
   readonly reconcilePending: boolean;
   /** Human-readable, safe to display. */
   readonly detail: string;
+  /**
+   * SECTION 7 — THE AUTHORITATIVE LIFECYCLE THIS HEALTH WAS DERIVED FROM.
+   *
+   * `OrderStreamConsumer.health()` — the only producer whose output is published — sets this from
+   * the ONE lifecycle authority (`OrderStreamStateMachine`) and derives `state` from it, so the
+   * governing state and the published state cannot disagree. It is optional on the type only
+   * because the projection can be read directly in isolation (unit tests, a projection with no
+   * machine attached); every published payload carries it.
+   */
+  readonly lifecycle?: OrderStreamLifecycleState;
 }
 
 /**
@@ -425,6 +460,44 @@ export class OrderUpdateProjection {
   }
 
   /**
+   * SECTION 7 — THE ORDER STREAM IS CONNECTED BUT NOT DELIVERING.
+   *
+   * Called when the consumer's idle detector fires: the socket is up and authorised, a fill is
+   * actually EXPECTED (a working order exists), and no usable event has arrived within the
+   * expected idle bound. This is the transition whose ABSENCE was defect (a) — the lifecycle
+   * machine degraded while this projection went on publishing `LIVE`.
+   *
+   * FABRICATES NOTHING, exactly like {@link onStreamDisconnected}: no ledger is touched, no
+   * terminal state is invented, no missing event is read as a zero fill. It records only that the
+   * stream is no longer the thing observing fills, so REST remains authoritative. It does NOT
+   * count a disconnect (the socket never dropped) and it does NOT owe a reconnect reconciliation
+   * (there is no gap to repair yet — merely silence).
+   */
+  onStreamIdle(): void {
+    if (this.streamState === "DISABLED") return;
+    // Only a stream we believed was delivering can stop delivering. A DOWN/CONNECTING/expired
+    // stream is already reported as not-delivering, and must not be "promoted" to DEGRADED.
+    if (this.streamState === "LIVE" || this.streamState === "RECONNECTED_PENDING_RECONCILE") {
+      this.streamState = "DEGRADED";
+    }
+  }
+
+  /**
+   * SECTION 7 — the session/token behind the stream was rejected or expired.
+   *
+   * Distinct from {@link onStreamDisconnected}: reconnecting with a dead credential is pointless,
+   * so publishing this as `DOWN` (which invites a reconnect) hid the only fact an operator can act
+   * on. A gap still exists, so a reconciliation is still owed once a live session returns.
+   */
+  onStreamSessionLost(): void {
+    if (this.streamState === "DISABLED") return;
+    this.streamConnected = false;
+    this.streamAuthorised = false;
+    this.reconcileOwed = true;
+    this.streamState = "AUTH_EXPIRED";
+  }
+
+  /**
    * The order stream dropped.
    *
    * FABRICATES NOTHING. It does not touch any ledger, does not invent a terminal state, and
@@ -487,8 +560,19 @@ export class OrderUpdateProjection {
         return "Connecting to the order-update stream…";
       case "LIVE":
         return "Order-update stream live — fills observed here first, REST reconciles.";
+      case "DEGRADED":
+        return (
+          "Order-update stream connected but NOT delivering (no event within the expected idle " +
+          "bound while a fill is expected) — REST polling is observing fills. New entry is paused; " +
+          "exit, reduction and protective cancel continue."
+        );
       case "RECONNECTED_PENDING_RECONCILE":
         return "Order-update stream reconnected — a REST reconciliation is owed before it is trusted.";
+      case "AUTH_EXPIRED":
+        return (
+          "The session behind the order-update stream was rejected or expired — reconnecting with " +
+          "it is pointless. REST polling observes fills; the broker will refuse all but a cancel."
+        );
     }
   }
 

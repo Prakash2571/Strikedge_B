@@ -339,7 +339,7 @@ test("an EMERGENCY_RESIDUAL reduction proceeds while entry is fully locked down"
   assert.equal(stack.adapter.posts[0].purpose, "EMERGENCY_RESIDUAL");
   // And the guard was never even consulted on this path.
   assert.deepEqual(stack.manager.entryGuardDiagnostics(), {
-    pre_build: 0, pre_enqueue: 0, dequeue: 0, post_persist: 0, pre_post: 0,
+    pre_build: 0, post_evidence: 0, pre_enqueue: 0, dequeue: 0, post_persist: 0, pre_post: 0,
   });
 });
 

@@ -50,6 +50,8 @@ import { ActiveBrokerManager } from "./brokers/registry.js";
 import type { BrokerId } from "./brokers/types.js";
 import { LocalChargeCalculator } from "./box/localCharges.js";
 import { registerBoxModule, type BoxModule } from "./box/index.js";
+// SECTION 7: the shape of the readiness evidence this module injects into the ONE decision.
+import type { ReadinessBlocker } from "./box/operationalReadiness.js";
 import { countUnresolvedBoxOrderIntentsForBroker } from "./box/repository.js";
 import {
   deriveFnoBoard,
@@ -320,6 +322,21 @@ const boxModule: BoxModule = registerBoxModule(app, {
   // Stamped onto every durable instrument reservation and re-checked before
   // execution, so a lease taken under a superseded broker cannot authorise a trade.
   brokerGeneration: () => brokerManager.generation,
+  /**
+   * SECTION 7 — the NON-SECRET account reference behind the MASKED identity in the readiness
+   * decision (and the existing `account_ref` on economic evidence).
+   *
+   * Without this the decision's `identity.account_masked` published null forever: the masking path
+   * existed and was tested, but nothing fed it — which is precisely the "built, tested and never
+   * called" failure this section is about. An operator could not tell WHICH account a live verdict
+   * was computed for.
+   *
+   * `sessionFor().client_id` is an account IDENTIFIER, never a token, and it is masked again in
+   * `buildOperationalReadiness` before it reaches the wire. Zerodha does not track a client id here,
+   * so it is honestly null there and the decision reports `account_present: false` rather than
+   * inventing a placeholder. Read fresh on every call so a broker switch or re-login is reflected.
+   */
+  brokerAccountRef: () => brokerManager.sessionFor(brokerManager.activeBroker).client_id ?? null,
   marketData: brokerManager.marketData(),
   margins: brokerManager.margins(),
   feed: {
@@ -571,6 +588,84 @@ const tokenService = new BrokerTokenAcquisitionService({
 
 let migrationState = { applied: 0, pending: 0 };
 
+/**
+ * SECTION 7 — FEED THE ENGINE THE READINESS EVIDENCE ONLY THIS MODULE CAN SEE.
+ *
+ * Env gates, PostgreSQL availability, migration state and per-broker token readiness are owned here,
+ * not by the engine. Registering them as a blocker SOURCE (rather than computing a second verdict
+ * from them, as `getRuntimeStatus` used to) is what collapses three disagreeing readiness answers
+ * into one: the engine's decision now scores the transports AND these facts together, and both the
+ * dashboard payload and `GET /api/runtime/status` are projections of that single decision.
+ *
+ * EVERY blocker here is `scope: "entry"`. That is deliberate and load-bearing: none of these facts
+ * is a reason to refuse a REDUCTION of exposure already owned. A stopped scanner, an unarmed live
+ * gate or an unready token must never strand a live position — reduction has its own requirements,
+ * checked separately, and an expired session is the only thing that genuinely refuses it.
+ *
+ * NO SECRETS: only states, booleans and counts. Never a token, never a passcode.
+ */
+boxModule.engine.setExternalReadinessBlockers(() => {
+  const blockers: ReadinessBlocker[] = [];
+  const tokenStatus = tokenService.status();
+  const active = brokerManager.activeBroker;
+
+  if (boxExecutionMode !== "live") {
+    blockers.push({
+      code: `execution_mode_${boxExecutionMode}`,
+      scope: "entry",
+      detail: `The deployment is running in ${boxExecutionMode} mode, so no live entry is possible.`,
+    });
+  }
+  if (!boxLiveTradingEnabled) {
+    blockers.push({
+      code: "box_live_trading_disabled",
+      scope: "entry",
+      detail: "BOX_LIVE_TRADING_ENABLED is not armed for this deployment.",
+    });
+  }
+  if (active === "zerodha" && !zerodhaLiveTradingEnabled) {
+    blockers.push({
+      code: "zerodha_live_trading_disabled",
+      scope: "entry",
+      detail: "ZERODHA_LIVE_TRADING_ENABLED is not armed, so Zerodha will take no new entry.",
+    });
+  }
+  if (active === "dhan" && !dhanLiveTradingEnabled) {
+    blockers.push({
+      code: "dhan_live_trading_disabled",
+      scope: "entry",
+      detail: "DHAN_LIVE_TRADING_ENABLED is not armed, so Dhan will take no new entry.",
+    });
+  }
+  if (!isPgReady()) {
+    blockers.push({
+      code: "postgres_unavailable",
+      scope: "entry",
+      detail:
+        "PostgreSQL — the authoritative store — is unavailable, so durable intent cannot be persisted " +
+        "before a POST. No entry is attempted without it.",
+    });
+  }
+  if (migrationState.pending > 0) {
+    blockers.push({
+      code: "migrations_pending",
+      scope: "entry",
+      detail: `${migrationState.pending} database migration(s) are still pending.`,
+    });
+  }
+  const activeToken = [tokenStatus.zerodha, tokenStatus.dhan].find((t) => t.broker === active);
+  if (!activeToken || activeToken.state !== "ready") {
+    blockers.push({
+      code: "active_broker_token_not_ready",
+      scope: "entry",
+      detail:
+        `The ${active} session token is ${activeToken?.state ?? "unavailable"}. Without a ready token ` +
+        `the broker refuses orders, so entry is refused locally rather than optimistically attempted.`,
+    });
+  }
+  return blockers;
+});
+
 registerRuntimeStatusRoutes(app, {
   requireOperator,
   runtime: {
@@ -578,19 +673,19 @@ registerRuntimeStatusRoutes(app, {
       const exposure = boxModule.engine.exposureSummary();
       const tokenStatus = tokenService.status();
       const tokens = [tokenStatus.zerodha, tokenStatus.dhan];
-      const reasons: string[] = [];
-      if (boxExecutionMode !== "live") reasons.push(`execution_mode_${boxExecutionMode}`);
-      if (!boxLiveTradingEnabled) reasons.push("box_live_trading_disabled");
-      if (brokerManager.activeBroker === "zerodha" && !zerodhaLiveTradingEnabled) {
-        reasons.push("zerodha_live_trading_disabled");
-      }
-      if (brokerManager.activeBroker === "dhan" && !dhanLiveTradingEnabled) {
-        reasons.push("dhan_live_trading_disabled");
-      }
-      if (!isPgReady()) reasons.push("postgres_unavailable");
-      if (!exposure.reconciliationComplete) reasons.push("reconciliation_incomplete");
-      const activeToken = tokens.find((t) => t.broker === brokerManager.activeBroker);
-      if (!activeToken || activeToken.state !== "ready") reasons.push("active_broker_token_not_ready");
+      /**
+       * SECTION 7 — `live_entry` IS NOW A PROJECTION OF THE ONE READINESS DECISION.
+       *
+       * It used to be computed HERE from env gates, PostgreSQL, token state and reconciliation —
+       * facts that did not include EITHER transport lifecycle. So this endpoint could report entry
+       * unblocked while the engine refused every entry because the market-data feed was DEGRADED or
+       * the order stream had not reconciled. Two answers to one question.
+       *
+       * The env/DB/token facts this module owns are now injected INTO the engine's decision (see
+       * `setExternalReadinessBlockers` below), and the verdict is read back out of it. One decision,
+       * two projections, no possible disagreement.
+       */
+      const readiness = boxModule.engine.operationalReadiness();
       return {
         brokers: tokens.map((t) => ({
           broker: t.broker,
@@ -609,7 +704,13 @@ registerRuntimeStatusRoutes(app, {
         pg_ready: isPgReady(),
         migration_state: migrationState,
         recovery_ready: exposure.reconciliationComplete,
-        live_entry: { blocked: reasons.length > 0, reasons },
+        // The SAME verdict the dashboard renders. `reasons` keeps its established shape (a list of
+        // stable snake_case codes) so no existing consumer breaks; the human sentences live in the
+        // decision's own `entry.reasons`.
+        live_entry: {
+          blocked: !readiness.entry.permitted,
+          reasons: readiness.entry.reasons.map((r) => r.code),
+        },
         recovery_pending: exposure.unknownOrders > 0,
         residual_exposure: exposure.residualLegs > 0,
       };

@@ -122,6 +122,13 @@ import { exactEntryFillViolation, singleLotCandidateViolation, singleLotPosition
 import { BoxPositionMonitor } from "./positionMonitor.js";
 import { BoxQuoteStore, SpotStore } from "./quotes.js";
 import { orderStreamStatus } from "./orderStreamStatus.js";
+// SECTION 7: the ONE authoritative readiness decision, shared by getStatus() and the operator
+// runtime-status endpoint so the two can never publish disagreeing verdicts.
+import {
+  buildOperationalReadiness,
+  type OperationalReadinessDecision,
+  type ReadinessBlocker,
+} from "./operationalReadiness.js";
 import type { OrderStreamHealth } from "./orderUpdateProjection.js";
 import { OrderStreamConsumer } from "./orderStreamConsumer.js";
 import { MarketDataStateMachine, marketDataPermissions, entryPermittedFromStreams, type MarketDataState, type OrderStreamLifecycleState } from "./streamHealthPolicy.js";
@@ -243,6 +250,12 @@ export interface BoxEngineDeps {
    * exactly as before.
    */
   brokerGeneration?: () => number;
+  /**
+   * A NON-SECRET reference to the authenticated broker account (masked id / hash, never a token).
+   * Binds funds/margin evidence to the account it was read for. Absent ⇒ null ⇒ the account half of
+   * the identity check is skipped, and unknown is never treated as a mismatch.
+   */
+  brokerAccountRef?: () => string | null;
   /**
    * The ACTIVE broker's live feed. Not a TickerHub: the engine must not be able to
    * reach a specific broker's socket (see brokerContext.ts).
@@ -951,6 +964,8 @@ export class BoxEngine {
         if (!adapter?.margins) return null;
         const m = await adapter.margins().catch(() => null);
         if (!m || typeof m.available !== "number" || !Number.isFinite(m.available)) return null;
+        // `observedAt` is stamped HERE, when the broker answer is in hand. The gateway captures its
+        // evaluation instant AFTER every read has settled, so this can never produce a negative age.
         return { availableRupees: m.available, observedAt: Date.now() };
       },
       plannedMargin: async (requests) => {
@@ -971,8 +986,34 @@ export class BoxEngine {
         if (!basket || basket.source === "unavailable" || !Number.isFinite(basket.total)) {
           return { marginRupees: null, observedAt: Date.now() };
         }
-        return { marginRupees: basket.total, observedAt: Date.now() };
+        // SECTION 8. `initial` and `final` are passed through SEPARATELY and are never collapsed
+        // here. Kite documents `initial` as "Total margins required to execute the orders" and
+        // `final` as "Total margins with the spread benefit"; the stage model needs both, because
+        // while legging the spread benefit does not exist yet. `total` is retained for the existing
+        // single-figure margin control, unchanged.
+        return {
+          marginRupees: basket.total,
+          observedAt: Date.now(),
+          initialMarginRupees: Number.isFinite(basket.initial) ? basket.initial : null,
+          finalMarginRupees: Number.isFinite(basket.final) ? basket.final : null,
+          // Not observable from the basket endpoint. NULL means UNKNOWN — with the stage-funding
+          // control enabled this refuses, rather than assuming nothing else is blocked on the
+          // account. Other applications trading the same account are exactly this hazard.
+          encumbranceRupees: null,
+        };
       },
+      // MONOTONIC clock for evidence aging and read deadlines, separate from the wall clock used
+      // for audit stamps. An NTP correction must not be able to fabricate or erase staleness.
+      monotonicNow: () => performance.now(),
+      // WHO the economic evidence is about. Read before AND after the asynchronous broker reads, so
+      // a broker switch or a token rotation onto a different account in flight invalidates the
+      // evidence instead of admitting an entry against the wrong account. Non-secret by
+      // construction: the account reference is whatever masked id the broker state exposes.
+      evidenceContext: () => ({
+        broker: this.deps.activeBroker(),
+        account_ref: this.deps.brokerAccountRef?.() ?? null,
+        session_id: this.deps.brokerGeneration ? String(this.deps.brokerGeneration()) : null,
+      }),
     });
     // Contract-level exclusion wraps the gateway rather than living inside it, so it
     // sits ABOVE the paper/live branch: paper gets no shortcut around coordination,
@@ -5271,6 +5312,21 @@ export class BoxEngine {
       market_data_state: this.marketDataState(),
       market_data_health: this.marketDataMachine.diagnostics(),
       /**
+       * SECTION 7 — THE ONE AUTHORITATIVE READINESS DECISION.
+       *
+       * The two blocks above (`market_data_state`, `order_stream`) are RAW FACTS about two
+       * independent transports. This is the single VERDICT derived from them, and it is the field a
+       * client must render rather than recombining the facts itself.
+       *
+       * It exists because readiness was previously answered in three places that did not agree: here
+       * (raw transports), `GET /api/runtime/status` (`live_entry.blocked`, computed from env/DB/token
+       * facts that did not include either transport), and the frontend (its own matrix, derived from
+       * market-data readiness plus one reconcile flag). Both HTTP surfaces are now projections of
+       * THIS decision, and it carries its own generation/version/timestamp so a client can detect a
+       * stale or out-of-order response instead of rendering it as current.
+       */
+      operational_readiness: this.operationalReadiness(),
+      /**
        * APPROXIMATE lag behind the exchange, from Kite's second-resolution
        * exchange_timestamp. Distinct from feed_age_ms (a liveness heartbeat):
        * this estimates how stale the data itself is versus NSE. null until a
@@ -5514,6 +5570,171 @@ export class BoxEngine {
     const consumer = this.orderStreamConsumer;
     if (consumer) this.orderStreamConsumers.set(this.deps.activeBroker(), consumer.health());
     return this.orderStreamConsumers;
+  }
+
+  /* ═════════════════════ SECTION 7: THE ONE AUTHORITATIVE READINESS DECISION ═════════════════════ */
+
+  /**
+   * SECTION 7 — the source of blockers the ENGINE cannot see for itself.
+   *
+   * Env gates, PostgreSQL availability, migration state and per-broker token readiness live in
+   * `src/index.ts`, not in the engine. Before this seam existed, `GET /api/runtime/status` combined
+   * THOSE facts into its own `live_entry.blocked` while the engine combined the TRANSPORT facts into
+   * its own entry gate — two verdicts on one question, each blind to half the evidence. Injecting
+   * them here means both surfaces are projections of ONE decision.
+   *
+   * Fail-safe by design: a throwing provider yields a BLOCKER, never silence. "We could not check"
+   * must never render as "nothing is wrong".
+   */
+  private externalReadinessBlockers: (() => readonly ReadinessBlocker[]) | null = null;
+
+  /** Monotonic per-decision counter, so a client can discard an out-of-order response. */
+  private readinessDecisionGeneration = 0;
+
+  /**
+   * Register the external blocker source. Called once during boot from `src/index.ts`.
+   *
+   * Deliberately a setter rather than a constructor dependency: the engine is constructed before the
+   * token service and the pool are known, and a required constructor dep would have forced a
+   * placeholder that silently reported "no blockers" for the whole of boot.
+   */
+  setExternalReadinessBlockers(source: () => readonly ReadinessBlocker[]): void {
+    this.externalReadinessBlockers = source;
+  }
+
+  /**
+   * THE ONE READINESS DECISION — consumed by `getStatus()` (the dashboard/SSE) AND by
+   * `GET /api/runtime/status` (the operator endpoint), so the two cannot disagree.
+   *
+   * It reads the SAME `marketDataState()` and `orderStreamState()` the live-entry checkpoint reads,
+   * and scores them through the SAME `combinedPermissions` table, so the published permission is the
+   * permission actually enforced. Note the ORDER of the reads: `orderStreamState()` drives the
+   * idleness clock, so it must be called BEFORE the consumer's health is snapshotted — otherwise the
+   * decision could carry a lifecycle one poll staler than the health beside it.
+   */
+  operationalReadiness(): OperationalReadinessDecision {
+    // Drive both machines' age-based demotions FIRST, then read everything from the settled states.
+    const marketDataState = this.marketDataState();
+    const orderStreamLifecycle = this.orderStreamState();
+    const consumer = this.orderStreamConsumer;
+    const health = consumer?.health() ?? null;
+    const mdDiag = this.marketDataMachine.diagnostics();
+    const live = this.orderManager?.status() ?? null;
+    const activeBroker = this.deps.activeBroker();
+
+    // The published order-stream snapshot for the ACTIVE broker, so the decision's fill-observation
+    // mechanism is literally the same value the `order_stream` block publishes.
+    const published = orderStreamStatus({
+      brokers: [activeBroker],
+      gateEnabled: (broker) =>
+        broker === "zerodha" ? zerodhaOrderStreamEnabledFromEnv() : dhanOrderStreamEnabledFromEnv(),
+      consumers: this.refreshOrderStreamConsumerHealth(),
+    }).brokers[0];
+
+    // External blockers, fail-safe: an unavailable provider is a BLOCKER, never an all-clear.
+    let external: readonly ReadinessBlocker[] = [];
+    if (this.externalReadinessBlockers) {
+      try {
+        external = this.externalReadinessBlockers();
+      } catch {
+        external = [
+          {
+            code: "readiness_evidence_unavailable",
+            scope: "entry",
+            detail:
+              "The runtime readiness evidence (token, database, migration and gate state) could not " +
+              "be read. Entry is refused because unverified is not the same as verified.",
+          },
+        ];
+      }
+    }
+
+    // Blockers the ENGINE itself owns and the runtime endpoint never saw.
+    const engineBlockers: ReadinessBlocker[] = [];
+    if (!this.running) {
+      engineBlockers.push({
+        code: "scanner_stopped",
+        scope: "entry",
+        detail:
+          "The scanner is STOPPED, so no new box will be entered. Existing positions continue to be " +
+          "monitored and can still be exited, reduced and protectively cancelled.",
+      });
+    }
+    if (!this.marketOpen) {
+      engineBlockers.push({
+        code: "market_closed",
+        scope: "entry",
+        detail: "The exchange is closed: prices shown are last-close and nothing can be entered.",
+      });
+    }
+    if (live && !live.controls.entryEnabled) {
+      engineBlockers.push({
+        code: "entry_disabled",
+        scope: "entry",
+        detail: "The live ENTRY control is disarmed. Exposure management is unaffected by it.",
+      });
+    }
+    if (live?.recoveryActive) {
+      engineBlockers.push({
+        code: "recovery_active",
+        scope: "entry",
+        detail:
+          "A crash-recovery pass is still resolving previously-unknown orders. New entry waits until " +
+          "the picture is whole; reduction of known exposure does not.",
+      });
+    }
+    if ((live?.unknownOrders ?? 0) > 0) {
+      engineBlockers.push({
+        code: "reconciliation_incomplete",
+        scope: "entry",
+        detail:
+          `${live?.unknownOrders} order(s) are not yet reconciled with the broker. Their fills are ` +
+          `unknown, not zero, so no new exposure is taken on top of them.`,
+      });
+    }
+
+    return buildOperationalReadiness({
+      now: this.executionClock.wall(),
+      decisionGeneration: ++this.readinessDecisionGeneration,
+      identity: {
+        broker: activeBroker,
+        // `brokerAccountRef` is already documented as a NON-SECRET reference (masked id / hash,
+        // never a token). It is masked AGAIN inside the builder so there is exactly one masking rule
+        // for the wire, and so a future provider that returns something less redacted cannot leak.
+        account: this.deps.brokerAccountRef?.() ?? null,
+        executionMode: this.cfg.executionMode,
+        liveRuntimeArmed: live ? live.controls.entryEnabled || live.controls.liveOrderEnabled : false,
+        deploymentLiveCapable: this.cfg.executionMode === "live",
+      },
+      marketData: {
+        state: marketDataState,
+        generation: mdDiag.generation,
+        desiredInstruments: mdDiag.desired,
+        readyInstruments: mdDiag.readyInstruments,
+        lastFrameAt: mdDiag.lastFrameAt,
+        lastHeartbeatAt: mdDiag.lastHeartbeatAt,
+        lastDepthAt: mdDiag.lastDepthAt,
+        backlog: mdDiag.backlog,
+      },
+      orderStream: {
+        lifecycle: orderStreamLifecycle,
+        publishedState: health?.state ?? "DISABLED",
+        wiring: published?.wiring ?? "not_wired",
+        gateEnabled: published?.gate_enabled ?? false,
+        connected: health?.connected ?? false,
+        authorised: health?.authorised ?? false,
+        lastEventAt: health?.lastEventAt ?? null,
+        disconnects: health?.disconnects ?? 0,
+        reconcilePending: consumer?.reconcilePending() ?? false,
+        fillsObservedBy: published?.fills_observed_by ?? "rest_polling_only",
+      },
+      blockers: [...engineBlockers, ...external],
+      openExposure: {
+        openPositions: this.positions.size,
+        residualLegs: this.residualLegCount(),
+        workingOrders: consumer?.workingOrderCount() ?? 0,
+      },
+    });
   }
 
   /**

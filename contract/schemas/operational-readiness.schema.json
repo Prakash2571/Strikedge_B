@@ -1,0 +1,226 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "operational-readiness.schema.json",
+  "title": "THE ONE authoritative readiness decision (box-status.operational_readiness)",
+  "description": "SECTION 7. Source: src/box/operationalReadiness.ts buildOperationalReadiness(), driven by src/box/engine.ts operationalReadiness(). The SINGLE verdict a client must render instead of recombining raw facts. Readiness was previously answered in three disagreeing places: box-status (raw transports), GET /api/runtime/status (live_entry.blocked, computed from env/DB/token facts that included NEITHER transport lifecycle), and the frontend (its own matrix from market-data readiness plus one reconcile flag). Both HTTP surfaces are now projections of THIS decision. Entry and exposure permissions come from the SAME streamHealthPolicy combinedPermissions table the live-entry checkpoint enforces. NO SECRETS: states, counts, ages, booleans, bounded sentences and a MASKED account reference only — never a token, a passcode or a full account id. It promises nothing about fills, four-leg atomicity or maximum loss; entry.permitted means only that every observable precondition is currently satisfied.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "decision_generation",
+    "decision_version",
+    "decided_at",
+    "identity",
+    "market_data",
+    "order_stream",
+    "fill_observation",
+    "evidence",
+    "reconciliation",
+    "entry",
+    "exposure_management"
+  ],
+  "properties": {
+    "decision_generation": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Monotonic per-decision counter. A response carrying a LOWER value than one already rendered is STALE and must be IGNORED, never allowed to overwrite newer state."
+    },
+    "decision_version": {
+      "type": "string",
+      "description": "The version of this decision shape. A client that does not recognise it must degrade to 'unknown', never to a green light."
+    },
+    "decided_at": {
+      "type": "integer",
+      "description": "Wall-clock ms at which the decision was evaluated. With decision_generation this is how a client tells current from stale."
+    },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "broker",
+        "account_masked",
+        "account_present",
+        "execution_mode",
+        "live_runtime_armed",
+        "deployment_live_capable"
+      ],
+      "properties": {
+        "broker": { "type": ["string", "null"], "enum": ["zerodha", "dhan", null] },
+        "account_masked": {
+          "type": ["string", "null"],
+          "description": "MASKED account reference, e.g. \"AB••34\". Never the raw id. Null when no account is bound."
+        },
+        "account_present": {
+          "type": "boolean",
+          "description": "Whether an account is bound at all — deliberately distinct from 'the id is hidden'."
+        },
+        "execution_mode": { "type": "string" },
+        "live_runtime_armed": { "type": "boolean" },
+        "deployment_live_capable": { "type": "boolean" }
+      }
+    },
+    "market_data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "generation",
+        "desired_instruments",
+        "ready_instruments",
+        "backlog",
+        "usable_for_entry"
+      ],
+      "properties": {
+        "state": {
+          "enum": [
+            "DISABLED",
+            "CONNECTING",
+            "AUTHENTICATING",
+            "SYNCHRONIZING",
+            "READY",
+            "DEGRADED",
+            "DISCONNECTED",
+            "AUTH_EXPIRED"
+          ],
+          "description": "The ACTUAL market-data lifecycle from the driven MarketDataStateMachine — not a feed_healthy boolean."
+        },
+        "generation": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Feed/session generation. Advances on every (re)authentication; a book observed under a superseded socket is not evidence for the new one."
+        },
+        "desired_instruments": { "type": "integer", "minimum": 0 },
+        "ready_instruments": { "type": "integer", "minimum": 0 },
+        "backlog": { "type": "boolean" },
+        "usable_for_entry": {
+          "type": "boolean",
+          "description": "True ONLY in READY: fresh usable depth per traded instrument in the current generation."
+        }
+      }
+    },
+    "order_stream": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lifecycle",
+        "published_state",
+        "wiring",
+        "gate_enabled",
+        "connected",
+        "authorised",
+        "disconnects"
+      ],
+      "properties": {
+        "lifecycle": {
+          "enum": [
+            "DISABLED",
+            "CONNECTING",
+            "AUTHENTICATING",
+            "RECONCILING",
+            "READY",
+            "DEGRADED",
+            "DISCONNECTED",
+            "AUTH_EXPIRED"
+          ],
+          "description": "The AUTHORITATIVE order-stream lifecycle the entry gate scored. Defect (a) was that this could be DEGRADED while the published health said LIVE."
+        },
+        "published_state": {
+          "enum": [
+            "DISABLED",
+            "DOWN",
+            "CONNECTING",
+            "LIVE",
+            "DEGRADED",
+            "RECONNECTED_PENDING_RECONCILE",
+            "AUTH_EXPIRED"
+          ],
+          "description": "The same fact as published in order_stream.brokers[].health.state, DERIVED from the lifecycle above so the two cannot disagree."
+        },
+        "wiring": { "enum": ["not_built", "not_wired", "gated_off", "armed"] },
+        "gate_enabled": { "type": "boolean" },
+        "connected": { "type": "boolean" },
+        "authorised": { "type": "boolean" },
+        "disconnects": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "fill_observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mechanism", "stream_assisted", "detail"],
+      "description": "The mechanism ACTUALLY responsible for observing a fill right now.",
+      "properties": {
+        "mechanism": { "enum": ["rest_polling_only", "stream_primary_rest_reconcile"] },
+        "stream_assisted": { "type": "boolean" },
+        "detail": { "type": "string" }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "market_data_frame_age_ms",
+        "market_data_heartbeat_age_ms",
+        "market_data_depth_age_ms",
+        "order_stream_event_age_ms"
+      ],
+      "description": "How old the evidence behind this decision is. NULL means NEVER OBSERVED — it must never render as a fresh 0. The four time facts are kept distinct: a heartbeat is not a depth update.",
+      "properties": {
+        "market_data_frame_age_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "market_data_heartbeat_age_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "market_data_depth_age_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "order_stream_event_age_ms": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "reconciliation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pending", "blockers"],
+      "properties": {
+        "pending": {
+          "type": "boolean",
+          "description": "True while a REST gap repair is owed. A gap is NEVER assumed empty; missing events are not zero fills."
+        },
+        "blockers": { "type": "array", "items": { "$ref": "readiness-blocker.schema.json" } }
+      }
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["permitted", "reasons"],
+      "description": "NEW ENTRY: the single verdict, plus every reason it was refused. A client MUST NOT show a permitted state when this is false.",
+      "properties": {
+        "permitted": { "type": "boolean" },
+        "reasons": { "type": "array", "items": { "$ref": "readiness-blocker.schema.json" } }
+      }
+    },
+    "exposure_management": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "exit_and_reduce",
+        "protective_cancel",
+        "manage_working_orders",
+        "blocked_reasons",
+        "limitations",
+        "open_positions",
+        "residual_legs",
+        "working_orders"
+      ],
+      "description": "REDUCING exposure, computed from reduction-scoped facts ONLY. THE INVARIANT: an entry-scoped restriction (stopped scanner, entry disabled, spent session budget, entry capital cap, one-active-underlying, unavailable reservations, entry-only market-data requirements, an unrelated symbol's stale book) can NEVER appear here and can never independently block a reduction. Reduction keeps its own genuine requirements — an expired session or an unpriceable book still refuses it, and says so.",
+      "properties": {
+        "exit_and_reduce": { "type": "boolean" },
+        "protective_cancel": { "type": "boolean" },
+        "manage_working_orders": { "type": "boolean" },
+        "blocked_reasons": { "type": "array", "items": { "$ref": "readiness-blocker.schema.json" } },
+        "limitations": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" },
+          "description": "What reduction cannot promise even when permitted. Always non-empty: permission is not a fill, four-leg atomicity is unavailable, and an unpriceable leg cannot be reduced on a limit price."
+        },
+        "open_positions": { "type": "integer", "minimum": 0 },
+        "residual_legs": { "type": "integer", "minimum": 0 },
+        "working_orders": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

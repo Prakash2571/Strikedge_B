@@ -20,7 +20,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["broker", "wiring", "gate_env_var", "gate_enabled", "health", "fills_observed_by", "detail"],
+        "required": ["broker", "wiring", "gate_env_var", "gate_enabled", "health", "lifecycle", "fills_observed_by", "detail"],
         "properties": {
           "broker": { "enum": ["zerodha", "dhan"] },
           "wiring": {
@@ -32,22 +32,50 @@
             "description": "Name of the env switch, so an operator can find it. NAME only, never a value."
           },
           "gate_enabled": { "type": "boolean" },
+          "lifecycle": {
+            "type": ["string", "null"],
+            "enum": [
+              "DISABLED",
+              "CONNECTING",
+              "AUTHENTICATING",
+              "RECONCILING",
+              "READY",
+              "DEGRADED",
+              "DISCONNECTED",
+              "AUTH_EXPIRED",
+              null
+            ],
+            "description": "SECTION 7. The AUTHORITATIVE order-stream lifecycle that decided fills_observed_by — the SAME value the live-entry gate scores. Null when nothing consumes the stream. Published here because defect (a) was precisely a lifecycle of DEGRADED sitting behind a health.state of LIVE and a fills_observed_by of stream_primary_rest_reconcile: the operator was shown the fast fill path at the moment entry was being refused for the opposite reason."
+          },
           "health": {
             "type": ["object", "null"],
             "additionalProperties": false,
-            "required": ["state", "connected", "authorised", "lastEventAt", "disconnects", "reconcilePending", "detail"],
-            "description": "Live projection health, or null when nothing consumes the stream.",
+            "required": ["state", "connected", "authorised", "lastEventAt", "disconnects", "reconcilePending", "detail", "lifecycle"],
+            "description": "Live projection health, or null when nothing consumes the stream. `state` is DERIVED from `lifecycle` (see src/box/orderStreamConsumer.ts publishedStateForLifecycle), so the state that governs entry and the state the operator reads cannot disagree.",
             "properties": {
               "state": {
-                "enum": ["DISABLED", "DOWN", "CONNECTING", "LIVE", "RECONNECTED_PENDING_RECONCILE"],
-                "description": "RECONNECTED_PENDING_RECONCILE mandates a REST reconciliation before the stream is trusted again; the gap must be repaired, never assumed empty."
+                "enum": ["DISABLED", "DOWN", "CONNECTING", "LIVE", "DEGRADED", "RECONNECTED_PENDING_RECONCILE", "AUTH_EXPIRED"],
+                "description": "RECONNECTED_PENDING_RECONCILE mandates a REST reconciliation before the stream is trusted again; the gap must be repaired, never assumed empty. DEGRADED (SECTION 7) means connected but NOT delivering while a fill is expected — its absence was defect (a), because the state that is published had no way to express what the governing lifecycle could already reach. AUTH_EXPIRED (SECTION 7) is distinct from DOWN: reconnecting with a rejected credential is pointless."
               },
               "connected": { "type": "boolean" },
               "authorised": { "type": "boolean" },
               "lastEventAt": { "type": ["integer", "null"] },
               "disconnects": { "type": "integer", "minimum": 0 },
               "reconcilePending": { "type": "boolean" },
-              "detail": { "type": "string" }
+              "detail": { "type": "string" },
+              "lifecycle": {
+                "enum": [
+                  "DISABLED",
+                  "CONNECTING",
+                  "AUTHENTICATING",
+                  "RECONCILING",
+                  "READY",
+                  "DEGRADED",
+                  "DISCONNECTED",
+                  "AUTH_EXPIRED"
+                ],
+                "description": "The single lifecycle authority `state` was derived from, carried verbatim so a reader is never left inferring it."
+              }
             }
           },
           "fills_observed_by": {
