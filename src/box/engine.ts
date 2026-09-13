@@ -132,6 +132,10 @@ import {
 import type { OrderStreamHealth } from "./orderUpdateProjection.js";
 import { OrderStreamConsumer } from "./orderStreamConsumer.js";
 import { createDhanOrderStreamHandlers } from "./dhanOrderStreamWiring.js";
+import {
+  describeCandidateMarketDataVerdict,
+  evaluateCandidateMarketData,
+} from "./candidateMarketData.js";
 import { MarketDataStateMachine, marketDataPermissions, entryPermittedFromStreams, type MarketDataState, type OrderStreamLifecycleState } from "./streamHealthPolicy.js";
 import { StagePipeline } from "./boundedQueue.js";
 import { parseKiteOrderFrame, zerodhaOrderStreamEnabledFromEnv, zerodhaTextFramesConsumed } from "../brokers/zerodha/orderUpdates.js";
@@ -1020,6 +1024,41 @@ export class BoxEngine {
                   ? `order-stream ${orderStream}`
                   : state;
               return { permitted, state: reason };
+            },
+            // CANDIDATE-SCOPED MARKET-DATA ADMISSION. The transport gate above is deliberately a
+            // SHARED verdict; the per-instrument strictness that used to live (wrongly) inside it —
+            // where it was applied to the ENTIRE streamed option universe, so one illiquid unrelated
+            // strike refused every box — is applied here to exactly the four legs being entered.
+            //
+            // Every input is read LIVE at call time (socket generation, feed generation, subscription
+            // intent, each leg's book), so there is no cached candidate readiness that could survive a
+            // candidate switch, a reconnect or a subscription change. See box/candidateMarketData.ts.
+            candidateMarketDataAdmissible: (candidate) => {
+              const verdict = evaluateCandidateMarketData(candidate, {
+                transportState: this.marketDataState(),
+                generation: this.marketDataMachine.generation(),
+                isInstrumentReady: (token) => this.marketDataMachine.isInstrumentReady(token),
+                isSubscribed: (token) => this.marketDataMachine.isSubscribed(token),
+                isTokenWarm: (token) => this.tokenFeedGeneration.get(token) === this.feedGeneration,
+                quote: (token) => this.quotes.get(token),
+                now: () => this.executionClock.wall(),
+                quoteMaxAgeMs: this.cfg.quoteMaxAgeMs,
+                // Only bound the SOURCE timestamp when the feed actually supplies one; the helper
+                // skips the check for a book with no exchange timestamp rather than faking freshness.
+                sourceMaxAgeMs: this.cfg.quoteMaxAgeMs,
+                // ONE LOT PER LEG — the same quantity executionGateway.request() actually sends
+                // (`quantity: args.candidate.lot_size`), so the depth requirement checked here is the
+                // depth the order will really need rather than a guess.
+                requiredQuantity: candidate.lot_size,
+                sideForRole: (role) => entrySideFor(role, candidate.direction),
+                tradingDayStartMs: istDayStartMs(this.deps.istDayKey()),
+                defaultTickSize: this.cfg.defaultTickSize,
+              });
+              return {
+                permitted: verdict.eligible,
+                reason: describeCandidateMarketDataVerdict(verdict),
+                sharedFailure: verdict.sharedFailure,
+              };
             },
           }
         : {}),

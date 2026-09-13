@@ -219,6 +219,23 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
      * older single-broker wiring) ⇒ no additional gate, preserving prior behaviour exactly.
      */
     marketDataEntryPermitted?: () => { permitted: boolean; state: string };
+    /**
+     * CANDIDATE-SCOPED market-data admission for THIS box's four instruments.
+     *
+     * Separate from `marketDataEntryPermitted` on purpose. That one answers "is the transport
+     * healthy?" — a shared condition. This one answers "do these four legs have admissible evidence
+     * right now?" — and it is the check that used to be missing, which is why the transport gate had
+     * been quietly overloaded into a universe-wide per-instrument gate that one unrelated stale
+     * strike could fail. See box/candidateMarketData.ts.
+     *
+     * Consulted at the entry checkpoint AND again immediately before exposure-increasing submission,
+     * because everything in between takes real time.
+     */
+    candidateMarketDataAdmissible?: (candidate: BoxCandidate) => {
+      permitted: boolean;
+      reason: string;
+      sharedFailure: boolean;
+    };
     now?: () => number;
     /**
      * Total charges (₹) for a set of orders, from the LOCAL fee calculator.
@@ -345,8 +362,34 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
         submittedAt,
         [],
         "feed_unhealthy",
-        `market-data not READY for new entry (state ${mdGate.state}); ` +
-          `entry requires fresh usable depth per leg in the current connection generation`,
+        `market-data/order-stream transport does not license new entry (state ${mdGate.state})`,
+        this.deps.cfg,
+        tradeId,
+      );
+    }
+
+    // ── CANDIDATE-SCOPED MARKET-DATA EVIDENCE ──────────────────────────────────────────────
+    //
+    // The transport gate above is a SHARED condition: it says the socket is authenticated, live,
+    // un-backlogged and delivering depth. It deliberately no longer asserts anything about a
+    // PARTICULAR instrument, because it used to be handed the entire streamed option universe as its
+    // "desired" set and one illiquid strike in an unrelated underlying therefore refused every box.
+    //
+    // The per-instrument strictness lives here instead, scoped to the four legs actually being
+    // entered: each leg subscribed, each leg with fresh usable depth in the CURRENT generation, each
+    // leg's book present and within both the locally-measured and source freshness bounds, executable
+    // -side price and depth for the quantity we intend to send, a coherent (uncrossed) snapshot, lot
+    // and tick conformance, and an unexpired contract. An unrelated stale token cannot fail this; a
+    // genuinely shared transport failure already failed above.
+    const candidateGate = this.deps.candidateMarketDataAdmissible?.(args.candidate);
+    if (candidateGate && !candidateGate.permitted) {
+      return liveEntryFailure(
+        args.candidate,
+        args.detection.at,
+        submittedAt,
+        [],
+        "feed_unhealthy",
+        candidateGate.reason,
         this.deps.cfg,
         tradeId,
       );
@@ -531,6 +574,17 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
           // books, the socket generation and the configured policy. The manager decides WHEN to
           // honour it (no exposure ⇒ refuse; exposure taken ⇒ complete and record).
           sendBoundaryCoherence: () => {
+            // RE-ASK THE CANDIDATE-SCOPED MARKET-DATA QUESTION AT THE SEND BOUNDARY.
+            //
+            // The checkpoint version of this ran before requests were built, before queueing, and
+            // before the funding and economics work — all of which takes real time. A socket can die,
+            // a generation can advance, a leg's book can go stale or lose its executable side in that
+            // window, and the whole point of the send boundary is that exposure-increasing orders are
+            // authorised by evidence that is current AT THE MOMENT OF THE POST, not by evidence that
+            // was current when the opportunity was scored. A frontend opportunity card, and equally a
+            // checkpoint verdict from 300ms ago, is not admission authority.
+            const md = this.deps.candidateMarketDataAdmissible?.(args.candidate);
+            if (md && !md.permitted) return `[feed_unhealthy] ${md.reason}`;
             const verdict = this.recheckEntryCoherence(args.candidate, this.now());
             return verdict.admit
               ? null

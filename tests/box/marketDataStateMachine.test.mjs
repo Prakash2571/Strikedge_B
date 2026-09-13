@@ -95,7 +95,21 @@ test("a socket that opens but supplies no usable data is never READY", () => {
   assert.equal(marketDataPermissions(machine.state()).newEntry, false);
 });
 
-test("partial subscription recovery keeps the machine SYNCHRONIZING until the last instrument confirms", () => {
+test("partial subscription recovery is READY as a TRANSPORT but reports the missing coverage", () => {
+  // CHANGED DELIBERATELY, and the change is a fix rather than a relaxation.
+  //
+  // This used to assert SYNCHRONIZING while 2 of 3 instruments were restored, encoding the rule that
+  // EVERY desired instrument must be fresh before READY. In production the desired set is the whole
+  // streamed option universe (engine.subscribedOptionTokens), so that rule meant one illiquid strike
+  // in an unrelated underlying held the machine below READY — and READY is the only market-data state
+  // that licenses new entry, so EVERY box was refused with `feed_unhealthy`, including boxes whose own
+  // four books were fresh and executable.
+  //
+  // READY is a TRANSPORT verdict: authenticated, live, un-backlogged, and demonstrably delivering
+  // depth. The per-instrument requirement did not disappear — it moved to where it can be asked about
+  // the right instruments, in candidateMarketData.ts, which requires ALL FOUR of a candidate's legs to
+  // be subscribed and fresh in the current generation (see tests/box/candidateMarketData.test.mjs).
+  // Coverage over the whole desired set remains reported, as observability rather than a hidden gate.
   const { machine } = makeMachine([1, 2, 3]);
   machine.onConnecting();
   machine.onSocketOpen();
@@ -103,11 +117,24 @@ test("partial subscription recovery keeps the machine SYNCHRONIZING until the la
   machine.onSubscriptionsConfirmed([1, 2]); // only 2 of 3 restored
   machine.onUsableDepth(1);
   machine.onUsableDepth(2);
-  assert.equal(machine.state(), "SYNCHRONIZING", "instrument 3 never subscribed/observed ⇒ not READY");
-  // Now 3 comes in.
+
+  assert.equal(machine.state(), "READY", "the transport is genuinely delivering depth");
+  const cov = machine.coverage();
+  assert.equal(cov.desired, 3);
+  assert.equal(cov.fresh, 2);
+  assert.equal(cov.missing, 1, "and the missing instrument is reported, not hidden");
+  assert.deepEqual(cov.missingSample, [3]);
+  // The instrument that never confirmed is still individually NOT ready, which is what a
+  // candidate-scoped gate consults.
+  assert.equal(machine.isInstrumentReady(3), false, "instrument 3 is not admissible for a candidate");
+  assert.equal(machine.isInstrumentReady(1), true);
+
+  // Now 3 comes in: full coverage.
   machine.onSubscriptionsConfirmed([3]);
   machine.onUsableDepth(3);
   assert.equal(machine.state(), "READY");
+  assert.equal(machine.coverage().missing, 0);
+  assert.equal(machine.isInstrumentReady(3), true);
 });
 
 test("reconnect advances the generation and drops prior-generation readiness", () => {
@@ -256,7 +283,10 @@ test("DISABLED permits nothing and ignores lifecycle events", () => {
   assert.equal(perms.protectiveCancel, false);
 });
 
-test("desired instruments are separate from observed readiness; shrinking the set can complete readiness", () => {
+test("desired instruments are separate from observed readiness, and narrowing the set narrows COVERAGE", () => {
+  // Also changed deliberately: the state no longer swings on whether ONE unobserved instrument is in
+  // the desired set, because a universe-wide universal quantifier is the defect. What narrowing the
+  // set changes is COVERAGE and per-instrument readiness, which is what callers actually need.
   const { machine } = makeMachine([1, 2, 3]);
   machine.onConnecting();
   machine.onSocketOpen();
@@ -264,11 +294,17 @@ test("desired instruments are separate from observed readiness; shrinking the se
   machine.onSubscriptionsConfirmed([1, 2, 3]);
   machine.onUsableDepth(1);
   machine.onUsableDepth(2);
-  assert.equal(machine.state(), "SYNCHRONIZING", "3 still unobserved");
-  // Instrument 3 is dropped from the DESIRED set (no longer traded). Readiness now completes on
-  // the remaining two without inventing depth for 3.
+  assert.equal(machine.state(), "READY", "the transport is delivering; instrument 3 is a coverage gap");
+  assert.equal(machine.coverage().missing, 1);
+  assert.deepEqual(machine.readyInstruments().sort(), [1, 2]);
+  assert.equal(machine.isSubscribed(3), true);
+
+  // Instrument 3 is dropped from the DESIRED set (no longer traded). Coverage completes on the
+  // remaining two without inventing depth for 3.
   machine.setDesiredInstruments([1, 2]);
   machine.evaluate();
   assert.equal(machine.state(), "READY");
+  assert.equal(machine.coverage().missing, 0, "coverage is complete over the NARROWED set");
+  assert.equal(machine.isSubscribed(3), false, "and 3 is no longer part of the subscription intent");
   assert.deepEqual(machine.readyInstruments().sort(), [1, 2]);
 });

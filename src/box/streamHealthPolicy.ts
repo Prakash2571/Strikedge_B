@@ -797,9 +797,43 @@ export class MarketDataStateMachine {
 
     const now = this.nowFn();
     const live = this.isTransportLive(now);
-    const allFresh = this.everyDesiredFresh(now);
+    /*
+     * READY IS A TRANSPORT VERDICT, NOT A UNIVERSE-WIDE ONE.
+     *
+     * This used to require `everyDesiredFresh(now)` — EVERY desired instrument fresh. The engine
+     * supplies `subscribedOptionTokens` as the desired set: the entire streamed option universe,
+     * every leg of every ATM±3 window across every streaming underlying. READY is the only
+     * market-data state whose permission licenses new entry, so ONE illiquid strike in an unrelated
+     * underlying that never ticked held the whole machine below READY and the live entry checkpoint
+     * refused EVERY box with `feed_unhealthy` — including boxes whose own four books were fresh,
+     * executable and same-generation.
+     *
+     * The universal quantifier was answering the wrong question. "Is the feed healthy?" and "does
+     * THIS candidate have admissible evidence?" are different questions with different scopes, and
+     * only the second one may be allowed to depend on a specific instrument.
+     *
+     * So READY now means what its name says and what the permission table needs it to mean: the
+     * session is authenticated, the transport is live, ingestion is not backlogged, and the depth
+     * pipeline is genuinely delivering — evidenced by at least one desired instrument having fresh
+     * usable depth in the CURRENT generation. That last clause is what keeps this honest: a socket
+     * that is open and heart-beating but delivering no depth at all is NOT ready, so the case the
+     * original code was defending against (a reconnect that restored the socket but not the data) is
+     * still caught.
+     *
+     * WHAT REPLACED THE PER-INSTRUMENT STRICTNESS. It moved to where it belongs, scoped to the
+     * candidate being admitted: `candidateMarketData.ts` requires ALL FOUR of a candidate's legs to
+     * have fresh usable depth in the current generation, plus subscription coverage, executable-side
+     * price and depth, coherence, lot/tick conformance and expiry — and it treats a transport-level
+     * failure as a SHARED failure that blocks regardless of how fresh the cached books look. The net
+     * effect for the candidate actually being entered is stricter, not weaker; what changed is that
+     * an unrelated instrument no longer votes.
+     *
+     * Coverage over the whole desired set is still tracked and still published — as the
+     * observability figure it always was (see `coverage()`), not as a hidden global gate.
+     */
+    const delivering = this.anyDesiredFresh(now);
 
-    if (!live || this.backlog || !allFresh) {
+    if (!live || this.backlog || !delivering) {
       // Connected (SYNCHRONIZING/READY/DEGRADED) but the evidence does not support READY.
       // Before first full readiness we are still SYNCHRONIZING; after it, a regression is DEGRADED.
       if (this.current === "READY") {
@@ -811,7 +845,7 @@ export class MarketDataStateMachine {
       }
       return;
     }
-    // live && no backlog && every desired instrument fresh ⇒ READY.
+    // live && no backlog && the depth pipeline is genuinely delivering ⇒ READY.
     this.current = "READY";
   }
 
@@ -821,12 +855,55 @@ export class MarketDataStateMachine {
     return now - frame <= this.heartbeatMaxAgeMs;
   }
 
-  private everyDesiredFresh(now: number): boolean {
+  /**
+   * Is the depth pipeline actually DELIVERING in this generation?
+   *
+   * An existential, not a universal: at least one desired instrument must have fresh usable depth.
+   * That is enough to prove the end-to-end path works right now (socket → parse → book → freshness),
+   * which is the only thing a TRANSPORT verdict can honestly claim. Whether a PARTICULAR instrument
+   * is usable is a per-candidate question, answered per candidate in `candidateMarketData.ts`.
+   *
+   * `desired.size === 0` still yields false: with nothing subscribed there is no evidence the
+   * pipeline works at all, so claiming READY would be claiming readiness from silence.
+   */
+  private anyDesiredFresh(now: number): boolean {
     if (this.desired.size === 0) return false; // nothing to prove readiness against ⇒ not READY
     for (const token of this.desired) {
-      if (!this.isInstrumentFresh(token, now)) return false;
+      if (this.isInstrumentFresh(token, now)) return true;
     }
-    return true;
+    return false;
+  }
+
+  /**
+   * SUBSCRIPTION / SCANNER COVERAGE — how much of the desired universe currently has fresh depth.
+   *
+   * This is the figure that tells an operator "the scanner is running blind on N instruments". It is
+   * reported accurately and is deliberately NOT a gate: gating entry on it is what made one unrelated
+   * stale strike refuse every box. `missingSample` is bounded so a universe-sized set cannot produce
+   * an unbounded diagnostic payload.
+   */
+  coverage(sampleLimit = 10): {
+    desired: number;
+    fresh: number;
+    missing: number;
+    missingSample: number[];
+  } {
+    const now = this.nowFn();
+    const missingSample: number[] = [];
+    let fresh = 0;
+    for (const token of this.desired) {
+      if (this.isInstrumentFresh(token, now)) {
+        fresh++;
+      } else if (missingSample.length < Math.max(0, sampleLimit)) {
+        missingSample.push(token);
+      }
+    }
+    return { desired: this.desired.size, fresh, missing: this.desired.size - fresh, missingSample };
+  }
+
+  /** Whether an instrument is in the current subscription intent. Used by candidate admission. */
+  isSubscribed(token: number): boolean {
+    return this.desired.has(token);
   }
 
   diagnostics(): {
