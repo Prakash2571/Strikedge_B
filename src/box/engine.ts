@@ -132,6 +132,7 @@ import {
 import type { OrderStreamHealth } from "./orderUpdateProjection.js";
 import { OrderStreamConsumer } from "./orderStreamConsumer.js";
 import { createDhanOrderStreamHandlers } from "./dhanOrderStreamWiring.js";
+import { BackendInstance } from "./backendInstance.js";
 import {
   describeCandidateMarketDataVerdict,
   evaluateCandidateMarketData,
@@ -1832,6 +1833,13 @@ export class BoxEngine {
     this.running = true;
     this.startedAt = Date.now();
     this.lastError = null;
+    // CLAIM THIS BOOT'S DURABLE ORDINAL, so readiness decisions from this process can be ordered
+    // against a PREVIOUS process. Reached only after the PostgreSQL readiness check above, so the
+    // authority is known to be up. Not awaited: readiness must be publishable immediately, and until
+    // the ordinal lands the decision honestly reports a null ordinal (which a client treats as
+    // unorderable and therefore refuses to act on). Idempotent per process — it can never consume a
+    // second ordinal and make this process look newer than itself.
+    void this.backendInstance.resolveBootOrdinal();
     // Event-loop / process diagnostics. Idempotent and fail-open: if it cannot attach it reports
     // `enabled: false` and the engine carries on regardless.
     this.environmentMonitor.start();
@@ -5730,6 +5738,15 @@ export class BoxEngine {
 
   /** Monotonic per-decision counter, so a client can discard an out-of-order response. */
   private readinessDecisionGeneration = 0;
+  /**
+   * WHICH PROCESS this is, and where it sits in the restart order.
+   *
+   * `readinessDecisionGeneration` above is process-local and resets on restart, so on its own it
+   * cannot order readiness decisions across one — a browser holding generation 5000 rejected a
+   * restarted backend's generation 1 indefinitely. The instance carries a restart-durable ordinal
+   * minted by PostgreSQL, which is what makes "newer" mean something. See box/backendInstance.ts.
+   */
+  private readonly backendInstance = new BackendInstance();
 
   /**
    * Register the external blocker source. Called once during boot from `src/index.ts`.
@@ -5791,6 +5808,24 @@ export class BoxEngine {
 
     // Blockers the ENGINE itself owns and the runtime endpoint never saw.
     const engineBlockers: ReadinessBlocker[] = [];
+    // A DECISION THAT CANNOT BE ORDERED IS NOT A PERMISSION.
+    //
+    // Without a durable boot ordinal, no client can tell this process's verdict from a superseded
+    // process's verdict, so "entry permitted" from here is unverifiable. Rather than rely on every
+    // client to notice the null and refuse it — which would make safety depend on the frontend
+    // getting it right — the SERVER refuses entry itself, which is the only place the refusal is
+    // authoritative. Exposure management is untouched: not being able to ORDER a verdict is no reason
+    // to stop reducing risk.
+    if (!this.backendInstance.hasOrdinal()) {
+      engineBlockers.push({
+        code: "instance_epoch_unknown",
+        scope: "entry",
+        detail:
+          "This backend process has no durable boot ordinal, so its readiness decisions cannot be " +
+          "ordered against a previous process and a client cannot tell this verdict from a stale one. " +
+          `New entry is refused until it is established. ${this.backendInstance.ordinalError() ?? "It has not been claimed yet."}`,
+      });
+    }
     if (!this.running) {
       engineBlockers.push({
         code: "scanner_stopped",
@@ -5836,6 +5871,9 @@ export class BoxEngine {
     return buildOperationalReadiness({
       now: this.executionClock.wall(),
       decisionGeneration: ++this.readinessDecisionGeneration,
+      // The ordering identity travels WITH the decision it orders, so a client never has to
+      // correlate two responses to work out which process spoke.
+      instance: this.backendInstance.identity(),
       identity: {
         broker: activeBroker,
         // `brokerAccountRef` is already documented as a NON-SECRET reference (masked id / hash,

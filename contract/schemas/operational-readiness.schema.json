@@ -7,6 +7,7 @@
   "additionalProperties": false,
   "required": [
     "decision_generation",
+    "instance",
     "decision_version",
     "decided_at",
     "identity",
@@ -22,7 +23,28 @@
     "decision_generation": {
       "type": "integer",
       "minimum": 0,
-      "description": "Monotonic per-decision counter. A response carrying a LOWER value than one already rendered is STALE and must be IGNORED, never allowed to overwrite newer state."
+      "description": "Monotonic per-decision counter, SCOPED TO instance.instance_id. A response carrying a LOWER value than one already rendered FROM THE SAME INSTANCE is stale and must be IGNORED. It is PROCESS-LOCAL and resets to 0 on restart, so it must NOT be compared across instances: doing so left a browser holding generation 5000 rejecting a restarted backend's generation 1 indefinitely. Use instance.boot_ordinal to order across a restart."
+    },
+    "instance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["instance_id", "boot_ordinal", "started_at"],
+      "description": "WHICH backend process decided this, and where it sits in the restart order. Source: src/box/backendInstance.ts. A decision is ordered by the pair (boot_ordinal, decision_generation) compared lexicographically; instance_id only tells a client whether it is still the same process. The shared ordering rule is orderReadinessDecision() in that module, which the frontend vendors rather than reimplementing — two implementations of an ordering protocol is how the two sides come to disagree about which verdict is current.",
+      "properties": {
+        "instance_id": {
+          "type": ["string", "null"],
+          "description": "Identifies THIS process. Random and non-secret. Carries NO ordering: a random value cannot express 'newer', so a client must never treat an unfamiliar id as automatically newer. Null only for a backend predating this contract, which is then unorderable."
+        },
+        "boot_ordinal": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Restart-durable, strictly increasing ordinal for this boot, minted atomically by PostgreSQL (migration 009_backend_instance_epoch.sql). NOT a clock: an NTP step, a VM snapshot restore or a skewed container clock must not be able to make an older instance look newer. NULL means the backend could not establish it because its authoritative store was unreachable at boot; the decision is then UNORDERABLE and a client MUST NOT let it overwrite an ordered decision and MUST disable new entry. The server independently refuses entry in that state too (blocker code instance_epoch_unknown), so safety does not depend on the client noticing."
+        },
+        "started_at": {
+          "type": ["integer", "null"],
+          "description": "Wall-clock ms this process started. AUDIT ONLY — never used for ordering, because a wall clock cannot order instances correctly."
+        }
+      }
     },
     "decision_version": {
       "type": "string",

@@ -60,6 +60,7 @@ import {
 import type { FillObservationMechanism, OrderStreamWiring } from "./orderStreamStatus.js";
 import type { OrderStreamState } from "./orderUpdateProjection.js";
 import type { BrokerId } from "./latencyModel.js";
+import type { BackendInstanceIdentity } from "./backendInstance.js";
 
 /**
  * The version of THIS decision shape.
@@ -68,7 +69,7 @@ import type { BrokerId } from "./latencyModel.js";
  * understands. Bumped with the wire contract; a frontend that does not recognise it must degrade to
  * "unknown", never to a green light.
  */
-export const OPERATIONAL_READINESS_VERSION = "1.6.0";
+export const OPERATIONAL_READINESS_VERSION = "1.7.0";
 
 /* ─────────────────────────── blockers: scope is the whole point ─────────────────────────── */
 
@@ -150,8 +151,22 @@ export interface ReadinessExposureInput {
 export interface OperationalReadinessInput {
   /** The instant this decision was evaluated. Passed in so the module stays pure. */
   readonly now: number;
-  /** Monotonic counter, incremented once per decision, so a stale response is detectable. */
+  /**
+   * Monotonic counter, incremented once per decision, SCOPED TO THIS PROCESS.
+   *
+   * It orders concurrent responses from one instance and nothing more. It resets on restart, so it
+   * cannot order across one — that is what `instance` below is for, and treating this counter as
+   * globally monotonic is precisely the defect that left a browser holding generation 5000 rejecting
+   * a restarted backend's generation 1 forever.
+   */
   readonly decisionGeneration: number;
+  /**
+   * WHICH BACKEND PROCESS decided this, and where that process sits in the restart order.
+   *
+   * Absent only for a deployment that predates the instance-aware contract; a client that receives no
+   * instance cannot order across a restart and must degrade to unknown rather than to a green light.
+   */
+  readonly instance?: BackendInstanceIdentity;
   readonly identity: ReadinessIdentityInput;
   readonly marketData: ReadinessMarketDataInput;
   readonly orderStream: ReadinessOrderStreamInput;
@@ -167,8 +182,29 @@ export interface OperationalReadinessInput {
 /* ─────────────────────────── the published decision ─────────────────────────── */
 
 export interface OperationalReadinessDecision {
-  /** Monotonic per-response counter. A response with a LOWER value is stale — ignore it. */
+  /**
+   * Monotonic per-response counter, SCOPED TO `instance.instance_id`. A response with a LOWER value
+   * from the SAME instance is stale — ignore it. Across instances this counter means nothing; use
+   * `instance.boot_ordinal`.
+   */
   readonly decision_generation: number;
+  /**
+   * THE BACKEND PROCESS THIS DECISION CAME FROM, and its place in the restart order.
+   *
+   * `boot_ordinal` is a restart-durable, strictly increasing integer minted by PostgreSQL — not a
+   * clock, and not a random id, because neither can express "newer". `null` means the backend could
+   * not establish it (its authoritative store was unreachable at boot), in which case the decision is
+   * UNORDERABLE: a client must not let it overwrite an ordered decision, and must disable new entry.
+   *
+   * See src/box/backendInstance.ts for the full ordering protocol; `orderReadinessDecision()` there is
+   * the shared rule the frontend vendors rather than reimplementing.
+   */
+  readonly instance: {
+    readonly instance_id: string | null;
+    readonly boot_ordinal: number | null;
+    /** AUDIT ONLY. Never used for ordering — a wall clock cannot order instances correctly. */
+    readonly started_at: number | null;
+  };
   /** The shape version, so an unfamiliar frontend degrades to "unknown", never to green. */
   readonly decision_version: string;
   /** When this decision was evaluated (wall ms). */
@@ -518,6 +554,13 @@ export function buildOperationalReadiness(
 
   return {
     decision_generation: input.decisionGeneration,
+    // Published even when unknown, and published as EXPLICIT NULLS rather than omitted, so a client
+    // can tell "this backend cannot be ordered" from "this field was dropped in transit".
+    instance: {
+      instance_id: input.instance?.instance_id ?? null,
+      boot_ordinal: input.instance?.boot_ordinal ?? null,
+      started_at: input.instance?.started_at ?? null,
+    },
     decision_version: OPERATIONAL_READINESS_VERSION,
     decided_at: now,
 
