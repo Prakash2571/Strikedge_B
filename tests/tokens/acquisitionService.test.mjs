@@ -116,6 +116,38 @@ async function settle(ms = 60) {
   await new Promise((r) => setTimeout(r, ms));
 }
 
+/**
+ * Wait until `predicate()` holds, or fail with `what` after `timeoutMs`.
+ *
+ * WHY THIS EXISTS. `settle()` is a FIXED real-time sleep, and several tests below used it as if it
+ * were a barrier: sleep 60ms, then assert the acquisition reached `ready`. But the service does real
+ * asynchronous work in between — a loopback HTTP round trip to the mock token server and a WebSocket
+ * open — and on a loaded CI runner that does not always finish inside 60ms. The result was an
+ * intermittently red build with a DIFFERENT test failing each time ('polling' !== 'ready' in one run,
+ * the WebSocket assertion in the next), which is the signature of a timing race rather than a defect.
+ *
+ * A flaky suite is worse than a slow one: it trains everyone to re-run instead of read. So the waiting
+ * is now condition-based with a generous ceiling. NO ASSERTION IS WEAKENED — the expected end state is
+ * exactly what it was, and a genuine failure to reach it still fails, just after a bounded wait
+ * instead of a fixed one. If the condition never holds, the message names what was being waited for.
+ */
+async function waitFor(predicate, what, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    let ok = false;
+    try {
+      ok = Boolean(await predicate());
+    } catch {
+      ok = false;
+    }
+    if (ok) return;
+    if (Date.now() >= deadline) {
+      assert.fail(`timed out after ${timeoutMs}ms waiting for: ${what}`);
+    }
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
 test("no polling before 09:00 IST — the first attempt is scheduled, not fired", async () => {
   const clock = makeFakeClock(istInstant("2026-09-08", "08:20"));
   mock.setResponder("zerodha", zSuccess);
@@ -137,7 +169,10 @@ test("both token requests start when started after 09:00 (immediate) and can run
   mock.setResponder("dhan", dSuccess);
   const { svc, record } = makeService(clock, "zerodha");
   await svc.start();
-  await settle();
+  await waitFor(
+    () => svc.status().zerodha.state === "ready" && svc.status().dhan.state === "ready",
+    "both brokers to finish their immediate acquisition",
+  );
   assert.ok(mock.state.zerodha.count >= 1, "zerodha polled immediately after 09:00");
   assert.ok(mock.state.dhan.count >= 1, "dhan polled immediately after 09:00");
   assert.equal(svc.status().zerodha.state, "ready");
@@ -153,7 +188,7 @@ test("successful acquisition opens ONLY the active broker's WebSocket (Dhan acti
   mock.setResponder("dhan", dSuccess);
   const { svc, record } = makeService(clock, "dhan");
   await svc.start();
-  await settle();
+  await waitFor(() => record.wsOpened.length > 0, "the active broker's WebSocket to open");
   assert.deepEqual(record.wsOpened, ["dhan"], "standby Zerodha must not open a socket");
   svc.stop();
 });
@@ -178,7 +213,7 @@ test("Zerodha success does not stop Dhan polling, and vice versa", async () => {
   mock.setResponder("dhan", () => ({ status: 409, body: {} })); // keeps polling
   const { svc } = makeService(clock, "zerodha");
   await svc.start();
-  await settle();
+  await waitFor(() => svc.status().zerodha.state === "ready", "Zerodha to succeed");
   assert.equal(svc.status().zerodha.state, "ready");
   assert.equal(svc.status().dhan.state, "polling", "Dhan keeps polling while Zerodha is done");
   // Zerodha did not re-poll after success.
@@ -226,7 +261,7 @@ test("one provider's network timeout does not block the other broker", async () 
   mock.setResponder("dhan", dSuccess);
   const { svc } = makeService(clock, "dhan");
   await svc.start();
-  await settle(120);
+  await waitFor(() => svc.status().dhan.state === "ready", "Dhan to complete while Zerodha hangs");
   // Dhan completed despite Zerodha still hanging.
   assert.equal(svc.status().dhan.state, "ready");
   svc.stop();
@@ -238,7 +273,10 @@ test("success stops polling for that IST day and the status is safe (no token, n
   mock.setResponder("dhan", dSuccess);
   const { svc } = makeService(clock, "zerodha");
   await svc.start();
-  await settle();
+  await waitFor(
+    () => svc.status().zerodha.state === "ready" && svc.status().dhan.state === "ready",
+    "both brokers to finish so the terminal status can be inspected",
+  );
   const st = svc.status();
   const serialized = JSON.stringify(st);
   assert.equal(serialized.includes("ztok"), false, "no access token in status");
@@ -318,7 +356,7 @@ test("an unexpected throw inside an attempt reschedules instead of stranding the
 
     // The reschedule: a retry was armed, so another provider request must follow.
     const before = mock.state.zerodha.count;
-    await settle(150);
+    await waitFor(() => mock.state.zerodha.count > before, "the armed retry to fire another request");
     assert.ok(
       mock.state.zerodha.count > before,
       "a retry must actually fire — a stranded broker would never request again",
