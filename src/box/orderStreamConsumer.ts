@@ -268,6 +268,12 @@ export class OrderStreamConsumer {
    * their own — which would multiply REST load on exactly the path that also has to serve recovery.
    */
   private sweepInFlight: Promise<void> | null = null;
+  /**
+   * The connection epoch the in-flight sweep was started under. Coalescing is scoped to this: joining
+   * a sweep from a SUPERSEDED connection would leave the current connection reconciled by nothing,
+   * because that sweep's result is going to be discarded.
+   */
+  private sweepInFlightGeneration: number | null = null;
   /** Consecutive failed/inconsistent sweeps, driving the bounded exponential backoff. */
   private sweepAttempts = 0;
   /** Earliest wall time at which another sweep may be attempted. Null ⇒ no restriction. */
@@ -523,13 +529,23 @@ export class OrderStreamConsumer {
    * Idempotent and safe to poll: it is a no-op unless a reconciliation is actually owed.
    */
   async runReconnectReconciliation(): Promise<void> {
-    // COALESCE DUPLICATE CONNECTION CALLBACKS INTO BOUNDED WORK. A transport may report the same
-    // connection more than once (Dhan's onopen fires per socket, and the engine also polls this from
-    // the status path). Every one of those callers must be able to call this unconditionally, so the
-    // second and subsequent callers join the sweep already running instead of starting another one
-    // against the same broker account.
+    // COALESCE DUPLICATE CONNECTION CALLBACKS INTO BOUNDED WORK — BUT ONLY WITHIN ONE EPOCH.
+    //
+    // A transport may report the SAME connection more than once (Dhan's onopen fires per socket, and
+    // the engine also polls this from the status path), so those callers must join the sweep already
+    // running rather than each starting their own against the same account.
+    //
+    // Coalescing must NOT cross a connection boundary, though. A sweep for a connection that has since
+    // dropped is going to be DISCARDED by the stale-epoch guard, so joining it would leave the NEW
+    // connection with no sweep of its own — reconciled by nothing, waiting on a result that can never
+    // apply to it. That is the opposite of the fix. So a caller whose epoch differs from the in-flight
+    // sweep's starts a fresh sweep for its own epoch; the superseded one still resolves and is still
+    // discarded. Concurrent REST load stays bounded at one sweep per live epoch, and the order
+    // manager's own `reconcile()` coalescing collapses the overlap anyway.
     const inFlight = this.sweepInFlight;
-    if (inFlight) return inFlight;
+    if (inFlight !== null && this.sweepInFlightGeneration === this.machine.generation()) {
+      return inFlight;
+    }
     if (!this.reconcilePending()) return;
     const sweep = this.opts.reconcileSweep;
     if (!sweep) {
@@ -553,10 +569,16 @@ export class OrderStreamConsumer {
       release = resolve;
     });
     this.sweepInFlight = barrier;
+    this.sweepInFlightGeneration = startedAtGeneration;
     try {
       await this.executeSweep(sweep, startedAtGeneration);
     } finally {
-      if (this.sweepInFlight === barrier) this.sweepInFlight = null;
+      // Only clear if this sweep is still the registered one: a newer epoch's sweep may have replaced
+      // it while this one was resolving, and clearing then would drop the newer sweep's guard.
+      if (this.sweepInFlight === barrier) {
+        this.sweepInFlight = null;
+        this.sweepInFlightGeneration = null;
+      }
       release();
     }
   }
@@ -653,7 +675,10 @@ export class OrderStreamConsumer {
    */
   ensureReconciled(nowWall?: number): void {
     if (!this.reconcilePending()) return;
-    if (this.sweepInFlight) return;
+    // Epoch-scoped, for the same reason the coalescing above is: a sweep still resolving for a
+    // SUPERSEDED connection must not stop the CURRENT connection from starting the sweep that will
+    // actually be allowed to promote it.
+    if (this.sweepInFlight !== null && this.sweepInFlightGeneration === this.machine.generation()) return;
     if (!this.opts.reconcileSweep) return;
     const state = this.machine.state();
     // Only a live, authorised connection can be synchronized. DISCONNECTED/AUTH_EXPIRED/DISABLED all
