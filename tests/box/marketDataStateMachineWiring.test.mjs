@@ -86,3 +86,77 @@ test("the registry forwards a box-lane session loss to the engine", () => {
     "index.ts must wire the box-lane session loss into the engine",
   );
 });
+
+
+/* ─────────── CANDIDATE-SCOPED admission is WIRED, and the global gate is not overloaded ─────────── */
+
+test("the transport READY test is EXISTENTIAL, not a universe-wide universal quantifier", () => {
+  // THE DEFECT: reevaluate() required `everyDesiredFresh(now)` — every desired instrument fresh —
+  // while the engine supplied subscribedOptionTokens, the ENTIRE streamed option universe. READY is
+  // the only market-data state that licenses new entry, so one illiquid unrelated strike refused
+  // every box with feed_unhealthy. If `everyDesiredFresh` ever comes back as the READY predicate,
+  // that outage comes back with it.
+  const policy = code("streamHealthPolicy.ts");
+  assert.ok(
+    !policy.includes("everyDesiredFresh"),
+    "the universe-wide universal quantifier must not gate READY again",
+  );
+  assert.ok(
+    policy.includes("anyDesiredFresh"),
+    "READY must be an EXISTENTIAL test: the depth pipeline is demonstrably delivering",
+  );
+  // And the case the universal quantifier was defending against must still be caught.
+  assert.ok(
+    policy.includes("if (this.desired.size === 0) return false"),
+    "an empty subscription set must never read READY — readiness is not claimed from silence",
+  );
+});
+
+test("the engine supplies CANDIDATE-SCOPED market-data admission to the execution gateway", () => {
+  const engine = code("engine.ts");
+  assert.ok(
+    engine.includes("candidateMarketDataAdmissible:"),
+    "the engine must supply the candidate-scoped gate, not only the transport gate",
+  );
+  assert.ok(
+    engine.includes("evaluateCandidateMarketData("),
+    "and it must be evaluated from the real per-candidate helper",
+  );
+  // Every input must be read LIVE, so no cached verdict can survive a candidate switch or reconnect.
+  assert.ok(
+    engine.includes("isInstrumentReady: (token) => this.marketDataMachine.isInstrumentReady(token)"),
+    "per-leg readiness must come from the machine's per-instrument generation-scoped freshness",
+  );
+  assert.ok(
+    engine.includes("isSubscribed: (token) => this.marketDataMachine.isSubscribed(token)"),
+    "per-leg subscription coverage must be consulted",
+  );
+});
+
+test("the execution gateway enforces the candidate gate at the checkpoint AND at the send boundary", () => {
+  const gateway = code("executionGateway.ts");
+  const uses = gateway.split("this.deps.candidateMarketDataAdmissible?.(").length - 1;
+  assert.ok(
+    uses >= 2,
+    `the candidate gate must be re-asked immediately before submission, not only at the checkpoint (found ${uses} call sites)`,
+  );
+  // The send-boundary hook is the one that runs immediately before the broker POST.
+  const sendBoundary = gateway.slice(gateway.indexOf("sendBoundaryCoherence: () =>"));
+  assert.ok(
+    sendBoundary.slice(0, 900).includes("candidateMarketDataAdmissible"),
+    "the send-boundary hook must re-check the candidate's market-data evidence",
+  );
+});
+
+test("the per-instrument accessors the candidate gate needs are actually reachable", () => {
+  // isInstrumentReady()/readyInstruments() existed for a long time with NO production caller, which
+  // is how the per-leg intent stayed unimplemented while the transport gate was overloaded instead.
+  const policy = code("streamHealthPolicy.ts");
+  for (const fn of ["isInstrumentReady(", "isSubscribed(", "coverage("]) {
+    assert.ok(policy.includes(fn), `${fn} must exist on the machine`);
+  }
+  const engine = code("engine.ts");
+  for (const fn of ["isInstrumentReady(", "isSubscribed("]) {
+    assert.ok(engine.includes(`this.marketDataMachine.${fn}`), `${fn} must have a PRODUCTION caller`);
+  }
+});
