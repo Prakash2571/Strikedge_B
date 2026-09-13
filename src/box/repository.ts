@@ -2963,6 +2963,12 @@ export async function loadBoxTradingSession(): Promise<
 }
 
 /** Persist the trading-session record. THROWS on failure, deliberately. */
+/** A non-negative integer, defaulting a missing/hostile value to 0. Never NaN, never null. */
+function nonNegativeInt(value: unknown): number {
+  const n = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+}
+
 export async function saveBoxTradingSession(record: BoxSessionRecord): Promise<void> {
   if (!isBoxDbEnabled()) {
     throw new Error("Box persistence is not configured, so session state cannot be saved.");
@@ -2986,7 +2992,13 @@ export async function saveBoxTradingSession(record: BoxSessionRecord): Promise<v
       new Date(record.updated_at),
       // The ATTEMPT budget must round-trip, or a restart would hand it back — which is exactly the
       // "restart for another attempt" hole the budget exists to close.
-      record.entry_attempts, record.max_entry_attempts,
+      //
+      // COERCED, symmetrically with the defaulting on read above. A record built by an older caller
+      // (or by hand) carries `undefined` here, which `pg` sends as NULL and the NOT NULL constraint
+      // then rejects — turning a missing optional field into a failed WRITE, which for a consumption
+      // write means entry closes until it lands. Defaulting to 0 on the way out as well as on the way
+      // in keeps a partial record saveable without ever inventing spent attempts.
+      nonNegativeInt(record.entry_attempts), nonNegativeInt(record.max_entry_attempts),
     ],
   );
 }
