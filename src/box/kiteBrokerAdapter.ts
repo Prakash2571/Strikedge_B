@@ -863,31 +863,45 @@ export class KiteBrokerAdapter implements BrokerAdapter {
       price: observedPrice,
     });
     const regressed = observedQuantity.present && (observedQuantity.value ?? 0) < known.filled_quantity;
-    if (regressed) {
-      this.streamObservationsIgnored++;
-      return clone(known);
-    }
+    // A QUANTITY REGRESSION MUST NOT DISCARD THE WHOLE OBSERVATION.
+    //
+    // This used to `return clone(known)` immediately, dropping the update entirely. But quantity is
+    // not the only thing an order update carries: Kite can report `CANCELLED` alongside a
+    // `filled_quantity` that reflects a pre-fill snapshot, and a REST poll can overtake a stream
+    // event and arrive with an older figure on a newer label. Discarding the whole observation threw
+    // away the CANCELLATION of the remainder along with the stale number — so the order stayed
+    // "working" in the session snapshot and its waiters were never woken.
+    //
+    // The quantity is therefore PINNED to what we already hold (monotonic, never rewound) and the
+    // status label is resolved against that accepted quantity. The stale number touches nothing.
+    const acceptedFilled = regressed ? known.filled_quantity : verdict.filledQuantity;
 
     const merged = clone(known);
-    merged.filled_quantity = verdict.filledQuantity;
-    merged.pending_quantity = Math.max(0, known.quantity - verdict.filledQuantity);
-    if (verdict.averagePrice !== null) merged.average_price = verdict.averagePrice;
-    merged.execution_evidence = verdict.quality;
+    merged.filled_quantity = acceptedFilled;
+    merged.pending_quantity = Math.max(0, known.quantity - acceptedFilled);
+    // A stale observation's average price describes a SMALLER fill than we already hold, so it is not
+    // better evidence and is not adopted.
+    if (verdict.averagePrice !== null && !regressed) merged.average_price = verdict.averagePrice;
+    if (!regressed) merged.execution_evidence = verdict.quality;
     if (update.brokerOrderId) merged.broker_order_id = update.brokerOrderId;
-    merged.state = verdict.sufficient
-      ? kiteState(label, verdict.filledQuantity, known.quantity)
-      : known.state;
-    if (!verdict.sufficient) merged.reject_reason = verdict.detail;
+    merged.state = verdict.sufficient ? kiteState(label, acceptedFilled, known.quantity) : known.state;
+    if (!verdict.sufficient && !regressed) merged.reject_reason = verdict.detail;
     if (isBrokerOrderTerminal(known.state) && !isBrokerOrderTerminal(merged.state)) {
       merged.state = known.state;
     }
-    if (verdict.filledQuantity > 0 && merged.fills.length === 0) {
+    if (acceptedFilled > 0 && merged.fills.length === 0) {
       merged.fills = [{
-        fill_id: `kite:stream:${merged.broker_order_id ?? update.clientOrderId}:${verdict.filledQuantity}:${verdict.averagePrice ?? "unpriced"}`,
-        quantity: verdict.filledQuantity,
-        price: verdict.averagePrice,
+        fill_id: `kite:stream:${merged.broker_order_id ?? update.clientOrderId}:${acceptedFilled}:${merged.average_price ?? "unpriced"}`,
+        quantity: acceptedFilled,
+        price: merged.average_price,
         at: update.observedAtWall ?? this.clock.now(),
       }];
+    }
+    // When the quantity went backwards AND the label resolves to the state we are already in, the
+    // observation genuinely carries nothing on any track. Only then is it ignored outright.
+    if (regressed && merged.state === known.state) {
+      this.streamObservationsIgnored++;
+      return clone(known);
     }
     merged.updated_at = update.observedAtWall ?? this.clock.now();
     this.orders.set(update.clientOrderId, merged);

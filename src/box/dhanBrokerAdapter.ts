@@ -435,15 +435,23 @@ export class DhanBrokerAdapter implements BrokerAdapter {
       price: observedPrice,
     });
 
-    // A regression carries no new information. Ignoring it (rather than merging it) is what keeps
-    // a delayed lower cumulative quantity from touching either the snapshot or the waiters.
+    // A regression carries no new QUANTITY. It may still carry a newer STATUS: Dhan can report
+    // `CANCELLED` with `TradedQty` reflecting a pre-fill snapshot, and a REST poll can overtake a
+    // stream alert and arrive with an older figure on a newer label. Discarding the whole observation
+    // (which is what the early return below used to do) threw away the CANCELLATION of the remainder
+    // along with the stale number, leaving the order "working" in the snapshot with its waiters never
+    // woken. So the quantity is PINNED to what we already hold — never rewound — and the label is
+    // resolved against that accepted quantity.
     const regressed = observedQuantity.present && (observedQuantity.value ?? 0) < known.filled_quantity;
+    const acceptedFilled = regressed ? known.filled_quantity : verdict.filledQuantity;
 
     const merged: BrokerOrder = cloneOrder(known);
-    merged.filled_quantity = verdict.filledQuantity;
-    merged.pending_quantity = Math.max(0, known.quantity - verdict.filledQuantity);
-    if (verdict.averagePrice !== null) merged.average_price = verdict.averagePrice;
-    merged.execution_evidence = verdict.quality;
+    merged.filled_quantity = acceptedFilled;
+    merged.pending_quantity = Math.max(0, known.quantity - acceptedFilled);
+    // A stale observation's average price describes a SMALLER fill than we already hold, so it is not
+    // better evidence and is not adopted.
+    if (verdict.averagePrice !== null && !regressed) merged.average_price = verdict.averagePrice;
+    if (!regressed) merged.execution_evidence = verdict.quality;
     if (update.brokerOrderId) {
       merged.broker_order_id = update.brokerOrderId;
       this.clientByBroker.set(update.brokerOrderId, update.clientOrderId);
@@ -452,24 +460,26 @@ export class DhanBrokerAdapter implements BrokerAdapter {
     // contradictory label (TRADED with a short fill, CANCELLED with a fill) resolves the same way
     // whichever source reported it.
     merged.state = verdict.sufficient
-      ? dhanOrderState(label, verdict.filledQuantity, known.quantity)
+      ? dhanOrderState(label, acceptedFilled, known.quantity)
       : known.state;
-    if (!verdict.sufficient) merged.reject_reason = verdict.detail;
+    if (!verdict.sufficient && !regressed) merged.reject_reason = verdict.detail;
     // NEVER regress a terminal state to a working one on a late event.
     if (isBrokerOrderTerminal(known.state) && !isBrokerOrderTerminal(merged.state)) {
       merged.state = known.state;
     }
-    if (verdict.filledQuantity > 0 && merged.fills.length === 0) {
+    if (acceptedFilled > 0 && merged.fills.length === 0) {
       merged.fills = [{
-        fill_id: `dhan:stream:${merged.broker_order_id ?? update.clientOrderId}:${verdict.filledQuantity}:${verdict.averagePrice ?? "unpriced"}`,
-        quantity: verdict.filledQuantity,
-        price: verdict.averagePrice,
+        fill_id: `dhan:stream:${merged.broker_order_id ?? update.clientOrderId}:${acceptedFilled}:${merged.average_price ?? "unpriced"}`,
+        quantity: acceptedFilled,
+        price: merged.average_price,
         at: update.observedAtWall ?? Date.now(),
       }];
     }
     merged.updated_at = update.observedAtWall ?? Date.now();
 
-    if (regressed) {
+    // When the quantity went backwards AND the label resolves to the state we are already in, the
+    // observation genuinely carries nothing on any track. Only then is it ignored outright.
+    if (regressed && merged.state === known.state) {
       this.streamObservationsIgnored++;
       return cloneOrder(known);
     }
