@@ -2947,6 +2947,12 @@ export async function loadBoxTradingSession(): Promise<
         established_trade_ids: stringIds(row.established_trade_ids),
         completed_trade_ids: stringIds(row.completed_trade_ids),
         aborted_attempts: Number.isFinite(num(row.aborted_attempts)) ? num(row.aborted_attempts) : 0,
+        // ATTEMPT BUDGET (migration 010). A row written before that migration has NULL here, and
+        // `num(null)` is not finite, so both default to 0 — "unbounded ceiling, none spent", the only
+        // safe reading: inventing a ceiling the operator never armed under would refuse entry they
+        // legitimately authorised, and inventing spent attempts would do the same.
+        entry_attempts: Number.isFinite(num(row.entry_attempts)) ? num(row.entry_attempts) : 0,
+        max_entry_attempts: Number.isFinite(num(row.max_entry_attempts)) ? num(row.max_entry_attempts) : 0,
         arm_count: Number.isFinite(num(row.arm_count)) ? num(row.arm_count) : 0,
         updated_at: updatedAt ? updatedAt.getTime() : 0,
       },
@@ -2964,18 +2970,23 @@ export async function saveBoxTradingSession(record: BoxSessionRecord): Promise<v
   await query(
     `INSERT INTO box_trading_session
        (id, session_id, armed_at, armed_by, max_completed_trades, established_trade_ids,
-        completed_trade_ids, aborted_attempts, arm_count, updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8,$9,$10)
+        completed_trade_ids, aborted_attempts, arm_count, updated_at,
+        entry_attempts, max_entry_attempts)
+     VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8,$9,$10,$11,$12)
      ON CONFLICT (id) DO UPDATE SET
        session_id = $2, armed_at = $3, armed_by = $4, max_completed_trades = $5,
        established_trade_ids = $6::jsonb, completed_trade_ids = $7::jsonb,
-       aborted_attempts = $8, arm_count = $9, updated_at = $10`,
+       aborted_attempts = $8, arm_count = $9, updated_at = $10,
+       entry_attempts = $11, max_entry_attempts = $12`,
     [
       TRADING_SESSION_ID, record.session_id,
       record.armed_at === null ? null : new Date(record.armed_at), record.armed_by,
       record.max_completed_trades, jsonb([...record.established_trade_ids]),
       jsonb([...record.completed_trade_ids]), record.aborted_attempts, record.arm_count,
       new Date(record.updated_at),
+      // The ATTEMPT budget must round-trip, or a restart would hand it back — which is exactly the
+      // "restart for another attempt" hole the budget exists to close.
+      record.entry_attempts, record.max_entry_attempts,
     ],
   );
 }
