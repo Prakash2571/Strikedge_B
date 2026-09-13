@@ -729,6 +729,11 @@ export function buildEconomicPicture(args: {
   readonly requests: readonly BoxCapitalOrderLike[];
   readonly now: number;
   readonly availableFundsRupees?: number | null;
+  /**
+   * How the spendable-funds figure was derived from the broker's raw fields (see
+   * box/fundsSemantics.ts). Surfaced in the figure's note so a refusal explains its own arithmetic.
+   */
+  readonly availableFundsBasis?: string | null;
   readonly availableFundsAged: AgedEvidence;
   readonly availableFundsObservedAtWall?: number | null;
   readonly availableFundsObservedAtMono?: number | null;
@@ -758,7 +763,13 @@ export function buildEconomicPicture(args: {
     aged: args.availableFundsAged,
     observedAtWall: args.availableFundsObservedAtWall ?? null,
     observedAtMono: args.availableFundsObservedAtMono ?? null,
-    confirmedNote: "broker-confirmed available funds for this account/session",
+    // The note carries HOW the figure was derived from the broker's fields, because "available
+    // funds ₹X" is not self-explanatory when the broker's own semantics decide whether the
+    // encumbrance has already been taken out. An operator reading a refusal needs to see the
+    // arithmetic, and — when the semantics are unverified — that the conservative reading was used.
+    confirmedNote:
+      args.availableFundsBasis ??
+      "broker-confirmed available funds for this account/session",
   });
   const planned_margin = brokerFigure({
     valueRupees: args.plannedMarginRupees ?? null,
@@ -1157,6 +1168,25 @@ export function evaluateEconomicAdmission(args: {
   }
 
   const stageFundingRequired = args.requireStageFunding === true;
+  /*
+   * STAGE FUNDING IMPLIES THE FUNDS-COVER CHECK. This is structural, not a configuration
+   * convention, because the configuration convention was silently violable.
+   *
+   * THE CONTRADICTORY COMBINATION: BOX_LIVE_REQUIRE_STAGE_FUNDING=true with
+   * BOX_LIVE_REQUIRE_FUNDS_COVER=false. The stage block below verifies that every stage of the real
+   * hedge-first sequence has an establishable requirement and that the sequence is genuinely
+   * hedge-first — and then stops. The comparison of the resulting requirement against the account's
+   * usable funds lives ENTIRELY inside the `requireFundsCover` block, so with that flag off the
+   * deployment computed a precise stage requirement, satisfied itself the sequence was safe, and
+   * never once checked that the account could pay for it. A configuration that reads as the
+   * strictest available while omitting the only check that involves money is worse than one that
+   * reads as lax, because it is trusted.
+   *
+   * Asking for the stage model IS asking to be held to it, so the funds comparison is now implied.
+   * `controls.funds_check_enabled` below reports the EFFECTIVE value, so the published control
+   * surface cannot claim the check is off while it is running.
+   */
+  const fundsCoverRequired = args.requireFundsCover || stageFundingRequired;
   if (stageFundingRequired) {
     const funding = picture.funding;
     if (!funding) {
@@ -1184,7 +1214,7 @@ export function evaluateEconomicAdmission(args: {
     }
   }
 
-  if (args.requireFundsCover) {
+  if (fundsCoverRequired) {
     if (picture.available_funds.provenance === "invalid") {
       reasons.push("funds_evidence_invalid");
       details.push(`available-funds evidence is INVALID: ${picture.available_funds.note}`);
@@ -1233,7 +1263,9 @@ export function evaluateEconomicAdmission(args: {
     picture,
     controls: {
       gross_cap_enabled: grossCapEnabled,
-      funds_check_enabled: args.requireFundsCover,
+      // The EFFECTIVE value, so the published control surface cannot claim the funds check is
+      // off while stage funding is silently running it.
+      funds_check_enabled: fundsCoverRequired,
       margin_evidence_required: args.requireMarginEvidence,
       stage_funding_required: stageFundingRequired,
     },

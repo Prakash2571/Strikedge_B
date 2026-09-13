@@ -74,6 +74,7 @@ import type {
   BoxExecutionSimulator,
 } from "./executionSimulator.js";
 import { entrySideFor, exitSideFor, round2 } from "./math.js";
+import { usableFundsRupees } from "./fundsSemantics.js";
 import { buildOrderPricing, touchPrice, walkDepth } from "./orderPricing.js";
 import { outstandingRoles, type BoxOpenPosition } from "./positions.js";
 import { singleLotCandidateViolation } from "./singleLotInvariant.js";
@@ -253,7 +254,23 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
      * observedAt — makes the economic gate treat funds as unavailable and REFUSE rather than
      * assume the account can fund the entry. Only consulted when a control needs it.
      */
-    funds?: () => Promise<{ availableRupees: number | null; observedAt: number } | null>;
+    /**
+     * FRESH broker-confirmed funds evidence.
+     *
+     * `utilisedRupees` is the ACCOUNT ENCUMBRANCE — funds already blocked by other open orders and
+     * positions — read from the SAME funds response as `availableRupees`, so the two can never
+     * disagree with each other. It was previously read from the broker and discarded, which left the
+     * stage-funding model with no encumbrance and therefore no establishable requirement.
+     *
+     * Both fields are `null` for MISSING and never for zero. A reported zero is a real figure; an
+     * absent one must refuse. `Number.isFinite(0)` is true, so presence is the provider's job to
+     * signal and is never inferred from the value.
+     */
+    funds?: () => Promise<{
+      availableRupees: number | null;
+      utilisedRupees?: number | null;
+      observedAt: number;
+    } | null>;
     /**
      * FRESH broker-confirmed planned-margin evidence for the four-leg entry (Task 8).
      *
@@ -1497,10 +1514,25 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     });
 
     const marginValue = marginObs.value;
+    // Resolve what the broker's funds figures actually MEAN before using them as money. Uses the
+    // identity captured after the reads settled, so a broker switch in flight cannot have this
+    // resolved against the wrong broker's semantics.
+    const usableFunds = usableFundsRupees({
+      broker: currentIdentity?.broker ?? null,
+      availableRupees: fundsObs.value?.availableRupees ?? null,
+      utilisedRupees: fundsObs.value?.utilisedRupees ?? null,
+    });
     const picture = buildEconomicPicture({
       requests,
       now: evaluatedAt.wall,
-      availableFundsRupees: fundsObs.value?.availableRupees ?? null,
+      // SPENDABLE funds, derived through the DECLARED per-broker semantics rather than by assuming
+      // what the broker's "available" figure means. Whether `available` is already net of the
+      // encumbrance decides the arithmetic completely, and the two possible mistakes are not
+      // symmetric: understating refuses affordable entries (safe), overstating admits an entry the
+      // account cannot fund and leaves partially-executed exposure to recover from. So an unverified
+      // broker gets the conservative reading and says so in the refusal. See box/fundsSemantics.ts.
+      availableFundsRupees: usableFunds.value_rupees,
+      availableFundsBasis: usableFunds.basis,
       availableFundsAged: fundsAged,
       availableFundsObservedAtWall: fundsObs.at?.wall ?? null,
       availableFundsObservedAtMono: fundsObs.at?.mono ?? null,
@@ -1520,7 +1552,13 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
               transportOrder: entrySubmissionOrder(direction),
               initialMarginRupees: marginValue.initialMarginRupees ?? null,
               finalMarginRupees: marginValue.finalMarginRupees ?? null,
-              encumbranceRupees: marginValue.encumbranceRupees ?? null,
+              // THE ENCUMBRANCE, PREFERRED FROM THE FUNDS ENDPOINT. The basket-margin endpoint prices
+              // a hypothetical basket and does not report what is already blocked on the account, so
+              // it supplied null and the stage model could never establish a requirement. The funds
+              // endpoint does report it, from the same response that supplies `available`. Missing is
+              // preserved as null so the funding gate refuses rather than assuming the account is
+              // otherwise idle — other applications trading the same account are exactly that hazard.
+              encumbranceRupees: fundsObs.value?.utilisedRupees ?? marginValue.encumbranceRupees ?? null,
               recoveryReserveRupees: this.deps.cfg.liveRecoveryReserveRupees,
             },
           }
@@ -1550,7 +1588,12 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
           marginMaxAgeMs: this.deps.cfg.liveMarginFreshnessMaxAgeMs,
           planFingerprint,
           identity: currentIdentity,
-          fundsRequired: requireFundsCover,
+          // Mirror the evaluator's IMPLICATION: stage funding requires the funds comparison, so the
+          // SEND-BOUNDARY re-check must also treat the funds evidence as load-bearing. Without this,
+          // a stage-funding deployment would re-validate the margin evidence at the boundary but let
+          // the funds evidence expire unchecked — re-opening at the send boundary exactly the hole
+          // that was just closed at admission.
+          fundsRequired: requireFundsCover || requireStageFunding,
           marginRequired: requireMarginEvidence || requireStageFunding,
         }
       : null;
