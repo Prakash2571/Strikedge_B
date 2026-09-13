@@ -438,6 +438,21 @@ export class OrderStreamConsumer {
       this.lastStreamEventAtWall = stamped.observedAtWall ?? this.now();
     }
 
+    // AN IMPOSSIBLE QUANTITY IS A RECONCILIATION CONDITION, NOT A NO-OP.
+    //
+    // The projection refuses a non-finite or NEGATIVE cumulative quantity as `malformed` before the
+    // ledger ever sees it — correctly, since such a figure is not information and must never touch
+    // exposure. But refusing it silently would mean a broker sending impossible numbers looked exactly
+    // like a broker sending nothing. It is counted here so it is visible and auditable.
+    //
+    // HONEST LIMITATION: a malformed observation is rejected before attribution, so there is no
+    // clientOrderId to target a reconcile at. The periodic account-wide reconcile is the backstop, and
+    // the counter is what tells an operator to go looking.
+    if (result.rejection === "malformed") {
+      this.invalidQuantityObservations++;
+      return result;
+    }
+
     if (!result.attributed || result.clientOrderId === null) return result;
 
     if (result.quantityEvidence === "absent") {
@@ -502,8 +517,9 @@ export class OrderStreamConsumer {
     const sameEventRedelivered = outcome === "duplicate_event";
     const change = this.classifyNonQuantityChange(result.clientOrderId, stamped);
 
-    // An IMPOSSIBLE quantity is not information and must never be applied — but it IS a discrepancy
-    // that wants human/REST resolution rather than silence.
+    // An IMPOSSIBLE quantity that reached the ledger (rather than being caught as `malformed` above)
+    // is not information and must never be applied — but it IS a discrepancy that wants REST
+    // resolution rather than silence. Here we DO have an attributed order to target.
     if (outcome === "invalid") {
       this.invalidQuantityObservations++;
       this.scheduleReconciliation(result.clientOrderId);
