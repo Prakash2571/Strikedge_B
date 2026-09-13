@@ -131,6 +131,7 @@ import {
 } from "./operationalReadiness.js";
 import type { OrderStreamHealth } from "./orderUpdateProjection.js";
 import { OrderStreamConsumer } from "./orderStreamConsumer.js";
+import { createDhanOrderStreamHandlers } from "./dhanOrderStreamWiring.js";
 import { MarketDataStateMachine, marketDataPermissions, entryPermittedFromStreams, type MarketDataState, type OrderStreamLifecycleState } from "./streamHealthPolicy.js";
 import { StagePipeline } from "./boundedQueue.js";
 import { parseKiteOrderFrame, zerodhaOrderStreamEnabledFromEnv, zerodhaTextFramesConsumed } from "../brokers/zerodha/orderUpdates.js";
@@ -811,8 +812,17 @@ export class BoxEngine {
         // path is invented here.
         restReconcile: async (_clientOrderId) => {
           try {
-            await this.orderManager?.reconcile();
-            consumer.markSynchronized();
+            const manager = this.orderManager;
+            if (!manager) return;
+            await manager.reconcile();
+            // A TARGETED reconcile is NOT account-wide synchronization. This used to call
+            // `consumer.markSynchronized()`, which promoted the whole stream to READY off the back of
+            // resolving ONE order's missing quantity — an account-wide readiness claim from
+            // single-order evidence, and an accidental back door out of RECONCILING that masked the
+            // missing Dhan sweep wiring. What this REST round trip does legitimately prove is that
+            // the SESSION is authorised, so that is all it records; leaving RECONCILING remains the
+            // exclusive job of the checked gap-repair sweep.
+            consumer.noteRestVerifiedSession();
           } catch {
             // Fail-open: a reconciliation failure leaves the stream DEGRADED/RECONCILING and REST
             // polling continues; it must never throw into the ingestion path.
@@ -826,7 +836,67 @@ export class BoxEngine {
         // `_ingestRest` funnel is available for recovered observations that must also land in the
         // consumer's own projection; the manager's reconcile is the durable authority.
         reconcileSweep: async (_ingestRest) => {
-          await this.orderManager?.reconcile();
+          // RETURN A CHECKED VERDICT, NOT SILENCE. Resolving without throwing is not synchronization:
+          // a sweep that ran perfectly and DISCOVERED a durable order the broker has never heard of
+          // has proven the opposite of consistency. Previously this returned void on any resolution,
+          // so `runReconnectReconciliation` promoted to READY on "did not throw" alone — and, because
+          // of the optional chaining below, promoted even when there was no order manager at all and
+          // literally nothing had been examined.
+          const manager = this.orderManager;
+          if (!manager) {
+            return {
+              synchronized: false,
+              reason:
+                "no live order manager is constructed, so no durable order or position could be " +
+                "reconciled against the broker; nothing has been proven about the account",
+            };
+          }
+          const report = await manager.reconcile();
+          if (!report) {
+            return {
+              synchronized: false,
+              reason: "the reconcile produced no report, so its result could not be checked",
+            };
+          }
+          // INCONSISTENCIES THAT ARE ABOUT *OUR* STATE BLOCK NEW ENTRY. A durable order the broker
+          // cannot find, or a position that disagrees with the ledger, means our view of our own
+          // exposure is wrong — precisely the condition under which adding exposure is unsafe. These
+          // are also already routed to `onReconciliationIssue` → RECOVERY, so blocking here is
+          // consistent with how the manager treats them.
+          const discrepancies = report.missingAtBroker.length + report.positionMismatches.length;
+          if (discrepancies > 0) {
+            const parts: string[] = [];
+            if (report.missingAtBroker.length > 0) {
+              parts.push(`${report.missingAtBroker.length} durable order(s) unknown at the broker`);
+            }
+            if (report.positionMismatches.length > 0) {
+              parts.push(`${report.positionMismatches.length} position mismatch(es) vs the ledger`);
+            }
+            return {
+              synchronized: false,
+              reason: `reconciliation found the account inconsistent: ${parts.join("; ")}`,
+              discrepancies,
+              unresolvedOrders: report.missingAtBroker.length,
+            };
+          }
+          // ORPHAN ORDERS ARE REPORTED BUT DO NOT BLOCK. An order at the broker that is not ours is
+          // normal on a shared account (manual activity), and treating it as an inconsistency would
+          // hand any manual order the power to disable this strategy's entry indefinitely. It is NOT
+          // ignored: it is surfaced in the diagnostics below, and the funds it encumbers are the
+          // funding gate's concern, not the stream's. See docs/BROKER_STREAM_DOCS.md for the residual
+          // risk this leaves (external activity we cannot attribute).
+          return {
+            synchronized: true,
+            unresolvedOrders: 0,
+            discrepancies: 0,
+            ...(report.orphanOrders.length > 0
+              ? {
+                  reason:
+                    `${report.orphanOrders.length} order(s) at the broker are not attributable to ` +
+                    `this strategy (shared-account activity); entry is not blocked on them`,
+                }
+              : {}),
+          };
         },
         // EXPECTED-IDLE BOUND (D5). A connected order stream that delivers nothing for longer than
         // this WHILE a working order is outstanding is demoted to DEGRADED. Silence on an account
@@ -5554,7 +5624,15 @@ export class BoxEngine {
   orderStreamState(): OrderStreamLifecycleState {
     const consumer = this.orderStreamConsumer;
     if (!consumer) return "DISABLED";
-    consumer.evaluateIdle(this.executionClock.wall());
+    const nowWall = this.executionClock.wall();
+    consumer.evaluateIdle(nowWall);
+    // DRIVE AN OWED RECONCILIATION TOWARDS COMPLETION FROM A PLACE THAT IS ACTUALLY CALLED.
+    // A connection edge is the only other trigger, and on a stable socket that edge may not recur for
+    // hours — so a sweep that failed once (a transient REST error, a throttle) would otherwise leave
+    // the stream stuck refusing entry with no path back. This is cheap, self-guarding, coalesced onto
+    // any sweep already running, and rate-limited by the consumer's bounded backoff, so polling it
+    // from the gate/status path cannot turn recovery into a REST flood.
+    consumer.ensureReconciled(nowWall);
     return consumer.lifecycleState();
   }
 
@@ -5840,20 +5918,18 @@ export class BoxEngine {
     }
     // Dhan: open the dedicated order-update socket via the registry-provided factory.
     if (broker === "dhan" && dhanOrderStreamEnabledFromEnv() && this.deps.createDhanOrderFeed && !this.dhanOrderFeed) {
-      const feed = this.deps.createDhanOrderFeed({
-        onObservation: (obs) => consumer.ingestStreamObservation(obs),
-        onConnecting: () => consumer.onConnecting(),
-        onConnected: (args) => {
-          // The transport signals socket-open + optimistic auth in one event (Dhan sends no
-          // auth-ack). Drive the machine through both steps so it never reads READY on open.
-          consumer.onSocketOpen();
-          if (args.authorised) consumer.onAuthenticated();
-        },
-        onDisconnected: () => consumer.onDisconnected(),
-        onSessionLost: (reason) => consumer.onSessionLost(reason),
-        nowMono: () => this.executionClock.mono(),
-        nowWall: () => this.executionClock.wall(),
-      });
+      // THE LIFECYCLE WIRING IS THE ONE IN box/dhanOrderStreamWiring.ts, not a copy of it.
+      // It was inline here, and what it omitted was any call to `runReconnectReconciliation()` — so
+      // every Dhan connection entered RECONCILING (which `onAuthenticated` always owes) and never
+      // left, because `markSynchronized` is the only exit. Live entry was therefore refused forever
+      // with `feed_unhealthy`. It is extracted so a test can drive the EXACT production handlers with
+      // a fake socket; a test could not reach this method, which is why the gap went unnoticed.
+      const feed = this.deps.createDhanOrderFeed(
+        createDhanOrderStreamHandlers(consumer, {
+          nowMono: () => this.executionClock.mono(),
+          nowWall: () => this.executionClock.wall(),
+        }),
+      );
       if (feed) {
         this.dhanOrderFeed = feed;
         feed.start();

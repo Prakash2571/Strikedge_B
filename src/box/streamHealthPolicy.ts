@@ -96,6 +96,57 @@ export type OrderStreamLifecycleState =
   | "DISCONNECTED"
   | "AUTH_EXPIRED";
 
+/**
+ * HOW STRONGLY THE STREAM SESSION'S AUTHORISATION IS ACTUALLY ESTABLISHED.
+ *
+ * Deliberately separate from {@link OrderStreamLifecycleState}, because "we sent credentials" and
+ * "the broker confirmed the credentials" are different facts and only one of them is evidence.
+ *
+ *  - `none`              — nothing has been submitted, or the session has since been dropped/lost.
+ *  - `login_submitted`   — the login frame was written to the socket and has not (yet) been
+ *                          rejected. This is ALL that Dhan's order-update socket can support: it
+ *                          publishes no authentication acknowledgement, so a rejected login surfaces
+ *                          only later, as a close with an auth code. It is an ASSUMPTION, not proof,
+ *                          and on its own it must never authorise new exposure.
+ *  - `broker_acknowledged` — the protocol delivered a positive authentication response.
+ *  - `rest_verified`     — a REST call on the SAME session succeeded. This is genuine positive proof
+ *                          that the credentials are live, and it is how a Dhan stream's authorisation
+ *                          becomes established: the reconciliation sweep is that REST call.
+ *
+ * Ordered weakest → strongest by {@link strongerAuthEvidence}; evidence is never silently downgraded
+ * within a connection epoch, and is reset to `none` when the epoch ends.
+ */
+export type OrderStreamAuthEvidence =
+  | "none"
+  | "login_submitted"
+  | "broker_acknowledged"
+  | "rest_verified";
+
+const AUTH_EVIDENCE_RANK: Readonly<Record<OrderStreamAuthEvidence, number>> = {
+  none: 0,
+  login_submitted: 1,
+  broker_acknowledged: 2,
+  rest_verified: 3,
+};
+
+/** Keep the strongest of two evidence readings. Never downgrades within an epoch. */
+export function strongerAuthEvidence(
+  a: OrderStreamAuthEvidence,
+  b: OrderStreamAuthEvidence,
+): OrderStreamAuthEvidence {
+  return AUTH_EVIDENCE_RANK[b] > AUTH_EVIDENCE_RANK[a] ? b : a;
+}
+
+/**
+ * Whether this evidence, ON ITS OWN, may be treated as an authorised session for the purpose of
+ * authorising NEW exposure. `login_submitted` deliberately does not qualify: an unacknowledged login
+ * is an assumption. It does not block entry by itself (the lifecycle state does that) — it exists so
+ * that a surface which claims "authorised" cannot be built on a send.
+ */
+export function authEvidenceEstablishesSession(evidence: OrderStreamAuthEvidence): boolean {
+  return evidence === "broker_acknowledged" || evidence === "rest_verified";
+}
+
 /** The four operation classes whose permission differs by health. */
 export interface OperationPermissions {
   /** Create NEW exposure (a fresh four-leg box entry). */
@@ -310,6 +361,30 @@ export class OrderStreamStateMachine {
   private current: OrderStreamLifecycleState;
   private everConnected = false;
   private reconcileOwed = false;
+  /**
+   * CONNECTION GENERATION (epoch). Advanced on every event that changes the IDENTITY or VALIDITY of
+   * the underlying session: a new authorisation, a disconnect, a lost session, and a disable. It
+   * exists so a reconciliation sweep that was started under connection N and resolves LATE — after
+   * a drop, or after connection N+1 has already been established — cannot mark the NEWER connection
+   * synchronized. `markSynchronized` takes the generation the sweep was started under and refuses to
+   * apply when it no longer matches. Without this, a slow sweep from a superseded socket promotes a
+   * connection whose gap it never examined, which is a fabricated readiness claim.
+   *
+   * This mirrors the generation discipline the market-data machine already uses per instrument.
+   */
+  private gen = 0;
+  /**
+   * HOW WELL THE SESSION BEHIND THIS STREAM IS ACTUALLY KNOWN TO BE AUTHORISED.
+   *
+   * Sending a login frame is NOT evidence that the login was accepted. Dhan's order-update socket
+   * publishes no authentication acknowledgement at all (verified against the current DhanHQ v2
+   * documentation — see docs/BROKER_STREAM_DOCS.md), so for Dhan the only thing the transport can
+   * honestly report on open is `login_submitted`. Positive proof arrives out-of-band, when a REST
+   * call on the SAME session succeeds — which is exactly what the reconciliation sweep is. Keeping
+   * this distinct from the lifecycle state means the operator-facing surface can say "assumed, not
+   * acknowledged" instead of silently implying the broker agreed.
+   */
+  private authEvidence: OrderStreamAuthEvidence = "none";
 
   constructor(enabled: boolean) {
     this.current = enabled ? "DISCONNECTED" : "DISABLED";
@@ -329,10 +404,27 @@ export class OrderStreamStateMachine {
     return this.everConnected;
   }
 
+  /**
+   * The current connection epoch. A caller starting asynchronous work that may only be applied to
+   * THIS connection captures this first and passes it back to {@link markSynchronized}.
+   */
+  generation(): number {
+    return this.gen;
+  }
+
+  /** What is actually known about this session's authorisation. Never upgraded by a mere send. */
+  authenticationEvidence(): OrderStreamAuthEvidence {
+    return this.authEvidence;
+  }
+
   setEnabled(enabled: boolean): void {
     if (!enabled) {
+      // Intentionally disabled is NOT broken. The epoch advances so any sweep in flight for the
+      // previously-enabled stream cannot land after the stream has been switched off.
+      this.gen++;
       this.current = "DISABLED";
       this.reconcileOwed = false;
+      this.authEvidence = "none";
       return;
     }
     if (this.current === "DISABLED") this.current = "DISCONNECTED";
@@ -340,29 +432,94 @@ export class OrderStreamStateMachine {
 
   onConnecting(): void {
     if (this.current === "DISABLED") return;
+    // Do not REGRESS a connection that is already established. A duplicate "connecting" report for a
+    // live socket would otherwise throw away readiness (and re-owe a reconciliation) for a connection
+    // that never actually dropped. A genuinely new connection always passes through
+    // onDisconnected/onSessionLost first, so this guard cannot hide a real reconnect.
+    if (this.isEstablished()) return;
     this.current = "CONNECTING";
   }
 
   /** Socket open — a route exists, nothing more. Never READY. */
   onSocketOpen(): void {
     if (this.current === "DISABLED") return;
+    if (this.isEstablished()) return;
     this.current = "AUTHENTICATING";
   }
 
-  /** Authorised — but a reconciliation is always owed before entry resumes. */
-  onAuthenticated(): void {
+  /**
+   * Whether this connection has already progressed past authentication, so its epoch has been
+   * allocated and its reconciliation is either owed or already proven.
+   */
+  private isEstablished(): boolean {
+    return this.current === "RECONCILING" || this.current === "READY" || this.current === "DEGRADED";
+  }
+
+  /**
+   * The login frame has been SUBMITTED and, as far as the transport can tell, the session is usable.
+   * A reconciliation is always owed before entry resumes — on a first connect as much as a reconnect.
+   *
+   * `evidence` records how strong that "as far as the transport can tell" actually is. It defaults to
+   * `login_submitted`, the honest answer for a protocol with no auth acknowledgement: we sent
+   * credentials and the socket has not yet rejected them. Only a broker acknowledgement or a
+   * successful REST call on the same session upgrades it, and neither is inferred from a send.
+   *
+   * IDEMPOTENT PER EPOCH. A transport that fires duplicate connection callbacks (Dhan's `onopen` can
+   * be followed by another `onConnected` for the same socket) must not advance the epoch twice and
+   * must not re-owe a reconciliation that is already owed and already in flight. So a repeat call
+   * while already RECONCILING in the same epoch is a no-op.
+   */
+  onAuthenticated(evidence: OrderStreamAuthEvidence = "login_submitted"): void {
     if (this.current === "DISABLED") return;
+    if (this.isEstablished()) {
+      // DUPLICATE CONNECTION CALLBACK for a connection whose epoch is already allocated. Keep the
+      // strongest evidence seen, but change nothing else:
+      //   - advancing the generation would invalidate the sweep already running for THIS connection,
+      //     stranding the machine in RECONCILING with nothing left to promote it;
+      //   - re-owing a reconciliation would drop readiness for a connection that never dropped.
+      // A genuinely new connection reaches here only after onDisconnected/onSessionLost, which reset
+      // the state, so no real reconnect is swallowed by this branch.
+      this.authEvidence = strongerAuthEvidence(this.authEvidence, evidence);
+      return;
+    }
     this.everConnected = true;
     this.reconcileOwed = true;
+    this.authEvidence = evidence;
+    this.gen++;
     this.current = "RECONCILING";
   }
 
-  /** The reconciliation sweep completed and is consistent. The ONLY path to READY. */
-  markSynchronized(): void {
+  /**
+   * Record positive, out-of-band proof that the session behind this stream is genuinely authorised —
+   * a REST call on the same credentials succeeded. This never changes the lifecycle state on its
+   * own (a working REST session says nothing about whether the SOCKET is delivering); it only
+   * upgrades what we may honestly claim about authorisation.
+   */
+  noteRestVerifiedSession(): void {
     if (this.current === "DISABLED") return;
+    this.authEvidence = strongerAuthEvidence(this.authEvidence, "rest_verified");
+  }
+
+  /**
+   * The reconciliation sweep completed AND its result was checked and found consistent. The ONLY
+   * path to READY.
+   *
+   * `atGeneration`, when supplied, is the epoch the sweep was started under. If the epoch has moved
+   * on — the socket dropped, the session was lost, the stream was disabled, or a newer connection
+   * authorised — the result describes a connection that no longer exists and is DISCARDED: it
+   * neither promotes nor clears the owed reconciliation. Returns whether the result was applied, so
+   * a caller can tell "synchronized" from "too late to matter".
+   */
+  markSynchronized(atGeneration?: number): boolean {
+    if (this.current === "DISABLED") return false;
+    if (atGeneration !== undefined && atGeneration !== this.gen) return false;
     this.reconcileOwed = false;
+    // A completed sweep is a successful REST round trip on this session, so authorisation is now
+    // positively established rather than merely assumed.
+    this.authEvidence = strongerAuthEvidence(this.authEvidence, "rest_verified");
     // Only promote to READY from a connected-and-authorised state; never from a dropped one.
     if (this.current === "RECONCILING" || this.current === "DEGRADED") this.current = "READY";
+    return true;
   }
 
   /** Connected but not delivering usable events within the expected idle bound. */
@@ -372,13 +529,19 @@ export class OrderStreamStateMachine {
 
   onDisconnected(): void {
     if (this.current === "DISABLED" || this.current === "AUTH_EXPIRED") return;
+    // The epoch ends here: a sweep still in flight for the connection that just dropped must not be
+    // allowed to promote whatever connection comes next.
+    this.gen++;
     this.reconcileOwed = true;
+    this.authEvidence = "none";
     this.current = "DISCONNECTED";
   }
 
   onSessionLost(): void {
     if (this.current === "DISABLED") return;
+    this.gen++;
     this.reconcileOwed = true;
+    this.authEvidence = "none";
     this.current = "AUTH_EXPIRED";
   }
 
