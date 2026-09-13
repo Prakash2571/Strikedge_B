@@ -241,6 +241,37 @@ function describeLifecycle(
   }
 }
 
+/**
+ * The minimum an adapter's returned order must expose for SETTLEMENT to be decided from the
+ * adapter's own normalization rather than from a re-parsed broker label.
+ */
+interface BrokerOrderLike {
+  readonly state?: string;
+}
+
+/**
+ * The adapter-normalized states after which an order can produce no further events.
+ *
+ * These are `BrokerOrderState` values produced by the ADAPTERS (kiteState / dhanOrderState), NOT raw
+ * broker labels — which is the point. `TRADED` (Dhan) and `COMPLETE` (Kite) and `CLOSED` and
+ * `EXPIRED` all mean different things at different brokers; each adapter already resolves its own
+ * vocabulary, including the contradictory cases (a `TRADED` label with a short fill becomes
+ * PARTIALLY_FILLED, not COMPLETE). Consuming the resolved state keeps that difference in the
+ * adapters and stops a second, drifting status mapper appearing here.
+ */
+const TERMINAL_ORDER_STATES: ReadonlySet<string> = new Set([
+  "COMPLETE",
+  "CANCELLED",
+  "REJECTED",
+]);
+
+/** Compare status labels as opaque, trimmed, upper-cased strings. No vocabulary interpretation. */
+function normaliseStatusLabel(raw: string | null | undefined): string | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim().toUpperCase();
+  return trimmed === "" ? null : trimmed;
+}
+
 export class OrderStreamConsumer {
   private readonly proj = new OrderUpdateProjection();
   private readonly machine: OrderStreamStateMachine;
@@ -285,6 +316,28 @@ export class OrderStreamConsumer {
   private sweepsStarted = 0;
   private sweepsSynchronized = 0;
   private sweepsDiscardedStaleEpoch = 0;
+  /**
+   * THE NON-QUANTITY MEMO — what order management has already been told about each order, on the two
+   * tracks the cumulative ledger does not own: the status LABEL and the average price. It exists so a
+   * genuine transition always propagates while an unchanged re-poll does not, WITHOUT the consumer
+   * having to interpret either broker's status vocabulary. Bounded by the number of registered orders.
+   */
+  private readonly lastForwarded = new Map<
+    string,
+    { status: string | null; price: number | null; terminal: boolean }
+  >();
+  /** Forwards that carried a status change with no quantity change — the class that used to vanish. */
+  private statusOnlyForwards = 0;
+  /** Forwards that carried only an average-price enrichment. Must never create a fill. */
+  private priceOnlyForwards = 0;
+  /** Orders settled because the ADAPTER reported a terminal state (including zero-fill terminals). */
+  private terminalSettlements = 0;
+  /** Observations whose quantity was impossible (non-finite/negative). Escalated, never applied. */
+  private invalidQuantityObservations = 0;
+  /** Observations where the broker reported more filled than requested. Applied and escalated. */
+  private overfillObservations = 0;
+  /** Non-terminal labels observed after a terminal one. Counted and reconciled, never adopted. */
+  private contradictoryTerminalObservations = 0;
 
   constructor(opts: OrderStreamConsumerOptions) {
     this.opts = opts;
@@ -392,29 +445,189 @@ export class OrderStreamConsumer {
       // targeted REST reconciliation, and wake the adapter's waiter with an ABSENT quantity so a
       // status-only frame does not stall the loop but also does not fabricate a fill.
       this.absentEvidenceEvents++;
-      this.applyToAdapter(result.clientOrderId, stamped, /* quantityAbsent */ true);
+      const merged = this.applyToAdapter(result.clientOrderId, stamped, /* quantityAbsent */ true);
+      this.noteForwarded(result.clientOrderId, stamped);
+      this.settleIfTerminal(result.clientOrderId, merged, result);
       this.scheduleReconciliation(result.clientOrderId);
       return result;
     }
 
-    // A confirmed quantity that the ledger actually advanced (or a fresh confirmed zero) is handed
-    // to the adapter to wake waiters. A duplicate/stale event carries nothing new, so it need not
-    // disturb the adapter — the ledger already deduplicated it.
-    if (result.apply && (result.apply.outcome === "applied" || result.apply.outcome === "applied_overfill")) {
-      this.applyToAdapter(result.clientOrderId, stamped, /* quantityAbsent */ false);
+    /*
+     * ───────────────────────────────────────────────────────────────────────────────────────────
+     * THREE INDEPENDENT TRACKS, ONE OBSERVATION.
+     * ───────────────────────────────────────────────────────────────────────────────────────────
+     * This used to be a single condition:
+     *
+     *     if (result.apply.outcome === "applied" || outcome === "applied_overfill") applyToAdapter(...)
+     *
+     * i.e. an observation reached order management ONLY when the cumulative FILLED QUANTITY had
+     * increased. Quantity is not the only thing an order update carries, so that conflation silently
+     * dropped whole classes of update:
+     *
+     *   - OPEN(0) → CANCELLED(0): the cumulative is 0 both times, so the ledger returns
+     *     `stale_cumulative` and the CANCELLATION never reached order management. The order stayed
+     *     "working" until a REST poll happened to notice, and the leg's waiter was never woken.
+     *   - OPEN(0) → REJECTED(0): identical, and worse — a rejection is precisely the event a caller
+     *     is waiting on to stop.
+     *   - PARTIAL(q) → CANCELLED(q): same cumulative q, so the cancellation of the REMAINDER
+     *     vanished while the fill was (correctly) kept.
+     *   - A later average-price enrichment at unchanged quantity was dropped entirely.
+     *
+     * So the three tracks are now scored separately:
+     *   1. EXECUTED QUANTITY — owned exclusively by the cumulative ledger above. Monotonic,
+     *      idempotent, and the ONLY thing that may create exposure.
+     *   2. LIFECYCLE / STATUS — a change in the broker's status LABEL is meaningful state even when
+     *      the quantity is untouched.
+     *   3. EXECUTION ENRICHMENT — a change in average price for quantity we already hold.
+     *
+     * FORWARDING A STATUS CHANGE CANNOT CREATE A FILL. `applyToAdapter` passes the SAME confirmed
+     * cumulative the ledger just deduplicated, and every adapter's `applyOrderUpdate` is
+     * cumulative-monotonic (it refuses a quantity below what it already holds and never re-adds a
+     * delta). So track 2 and track 3 move status and price only. That is what keeps requirement
+     * "price enrichment at unchanged quantity must not create another fill" true by construction
+     * rather than by care.
+     *
+     * NOTE ON INTERPRETATION. This class deliberately does NOT parse broker status vocabularies —
+     * `TRADED`, `PART_TRADED`, `COMPLETE`, `CLOSED` and `EXPIRED` mean different things at the two
+     * brokers, and that normalization belongs in the adapters (kiteState / dhanOrderState), which
+     * already do it. Here the status is compared as an opaque string, and the adapter's OWN
+     * normalized `state` on the value it returns is what decides settlement below. No second,
+     * drifting status mapper is introduced.
+     */
+    const outcome = result.apply?.outcome ?? null;
+    const quantityAdvanced = outcome === "applied" || outcome === "applied_overfill";
+    // The SAME broker event, redelivered. By definition it carries nothing new, on any track, so it
+    // must not reach order management: that is what stops a redelivery from duplicating a fill, a
+    // recovery action or a P&L entry.
+    const sameEventRedelivered = outcome === "duplicate_event";
+    const change = this.classifyNonQuantityChange(result.clientOrderId, stamped);
+
+    // An IMPOSSIBLE quantity is not information and must never be applied — but it IS a discrepancy
+    // that wants human/REST resolution rather than silence.
+    if (outcome === "invalid") {
+      this.invalidQuantityObservations++;
+      this.scheduleReconciliation(result.clientOrderId);
+      return result;
+    }
+    // The broker says MORE filled than we asked for. Applied (broker truth wins) and escalated: our
+    // own quantity model was wrong, which is a reconciliation condition, not a rounding note.
+    if (outcome === "applied_overfill") {
+      this.overfillObservations++;
+      this.scheduleReconciliation(result.clientOrderId);
+    }
+    // A non-terminal status observed AFTER a terminal one is contradictory. The adapter refuses to
+    // regress its own terminal state, so this cannot corrupt the lifecycle; it is counted and
+    // reconciled so a genuine broker disagreement is not merely absorbed.
+    if (change.contradictsTerminal) {
+      this.contradictoryTerminalObservations++;
+      this.scheduleReconciliation(result.clientOrderId);
     }
 
-    // WORKING-ORDER SETTLEMENT (D5). When the ledger reports this order fully filled, it no longer
-    // expects events, so it leaves the working set — a subsequent quiet period is then normal.
-    if (result.apply && result.apply.remaining <= 0) {
-      this.workingOrders.delete(result.clientOrderId);
+    if (!sameEventRedelivered && (quantityAdvanced || change.statusChanged || change.priceChanged)) {
+      const merged = this.applyToAdapter(result.clientOrderId, stamped, /* quantityAbsent */ false);
+      if (change.statusChanged) this.statusOnlyForwards += quantityAdvanced ? 0 : 1;
+      if (change.priceChanged && !change.statusChanged && !quantityAdvanced) this.priceOnlyForwards++;
+      this.noteForwarded(result.clientOrderId, stamped);
+      this.settleIfTerminal(result.clientOrderId, merged, result);
+      return result;
     }
+
+    // Nothing new on any track. Still let a fully-filled order settle, since a re-poll of an order
+    // that completed while we were not looking is a legitimate way to learn it is done.
+    this.settleIfTerminal(result.clientOrderId, undefined, result);
     return result;
   }
 
-  private applyToAdapter(clientOrderId: string, obs: NormalizedOrderObservation, quantityAbsent: boolean): void {
+  /**
+   * Compare an observation's NON-QUANTITY content against the last thing forwarded for this order.
+   *
+   * Pure comparison, no broker vocabulary interpretation. The point of the memo is to answer "does
+   * order management already know this?" so that a REST poll repeating an unchanged snapshot every
+   * second does not wake waiters and inflate counters, while a genuine transition always does.
+   *
+   * After a RESTART the memo is empty, so the first observation of each order forwards. That is
+   * correct rather than merely tolerable: a fresh process has told the adapter nothing, and the
+   * forward is idempotent because the adapter is cumulative-monotonic. Deduplication across a restart
+   * is carried by the broker's own cumulative quantity (re-established by the reconciliation sweep),
+   * not by remembered event ids — which is why no new persistence is required here.
+   */
+  private classifyNonQuantityChange(
+    clientOrderId: string,
+    obs: NormalizedOrderObservation,
+  ): { statusChanged: boolean; priceChanged: boolean; contradictsTerminal: boolean } {
+    const status = normaliseStatusLabel(obs.rawStatus);
+    const price = obs.averagePrice != null && Number.isFinite(obs.averagePrice) ? obs.averagePrice : null;
+    const prior = this.lastForwarded.get(clientOrderId);
+    if (!prior) {
+      return {
+        statusChanged: status !== null,
+        priceChanged: price !== null,
+        contradictsTerminal: false,
+      };
+    }
+    return {
+      statusChanged: status !== null && status !== prior.status,
+      // A price only counts as new when it is actually a different number. Re-reporting the same
+      // average price is not enrichment.
+      priceChanged: price !== null && price !== prior.price,
+      contradictsTerminal: prior.terminal && status !== null && status !== prior.status,
+    };
+  }
+
+  private noteForwarded(clientOrderId: string, obs: NormalizedOrderObservation): void {
+    const status = normaliseStatusLabel(obs.rawStatus);
+    const prior = this.lastForwarded.get(clientOrderId);
+    this.lastForwarded.set(clientOrderId, {
+      status: status ?? prior?.status ?? null,
+      price:
+        obs.averagePrice != null && Number.isFinite(obs.averagePrice)
+          ? obs.averagePrice
+          : (prior?.price ?? null),
+      // Terminality is sticky: once order management has been told this order reached a terminal
+      // state, a later non-terminal label is a contradiction to report, not a state to adopt.
+      terminal: prior?.terminal === true,
+    });
+  }
+
+  /**
+   * Remove an order from the WORKING set once it can produce no further events.
+   *
+   * TWO independent grounds, because the old single ground was wrong:
+   *   - the ADAPTER's own normalized state is terminal. This is what makes OPEN(0) → CANCELLED(0)
+   *     and OPEN(0) → REJECTED(0) settle correctly: a zero-fill terminal leaves `remaining` at the
+   *     full requested quantity, so the old `remaining <= 0` test never fired and the idle detector
+   *     went on expecting events for an order that was already dead — eventually demoting a
+   *     perfectly healthy stream to DEGRADED and refusing new entry for it.
+   *   - the ledger reports nothing outstanding (a full fill).
+   *
+   * The terminal ground uses the state the ADAPTER computed, so the per-broker vocabulary difference
+   * stays in the adapter where it belongs.
+   */
+  private settleIfTerminal(
+    clientOrderId: string,
+    merged: BrokerOrderLike | undefined,
+    result: IngestResult,
+  ): void {
+    const state = merged?.state;
+    if (typeof state === "string" && TERMINAL_ORDER_STATES.has(state)) {
+      const memo = this.lastForwarded.get(clientOrderId);
+      if (memo) this.lastForwarded.set(clientOrderId, { ...memo, terminal: true });
+      this.workingOrders.delete(clientOrderId);
+      this.terminalSettlements++;
+      return;
+    }
+    if (result.apply && result.apply.remaining <= 0) {
+      this.workingOrders.delete(clientOrderId);
+    }
+  }
+
+  private applyToAdapter(
+    clientOrderId: string,
+    obs: NormalizedOrderObservation,
+    quantityAbsent: boolean,
+  ): BrokerOrderLike | undefined {
     const adapter = this.opts.adapter;
-    if (!adapter?.applyOrderUpdate) return;
+    if (!adapter?.applyOrderUpdate) return undefined;
     const update: ExternalOrderUpdate = {
       clientOrderId,
       brokerOrderId: obs.brokerOrderId ?? null,
@@ -429,8 +642,12 @@ export class OrderStreamConsumer {
       const merged = adapter.applyOrderUpdate(update);
       this.streamEventsApplied++;
       if (merged) this.streamEventsWokeAdapter++;
+      // Returned so the caller can read the ADAPTER's normalized order state for settlement, rather
+      // than re-deriving terminality from a broker status label here.
+      return merged as BrokerOrderLike | undefined;
     } catch {
       // A single order's apply fault must never break stream ingestion for the others.
+      return undefined;
     }
   }
 
@@ -856,6 +1073,18 @@ export class OrderStreamConsumer {
     sweepsSynchronized: number;
     /** Results that arrived for a superseded connection and were refused. */
     sweepsDiscardedStaleEpoch: number;
+    /** Updates that changed STATUS with no quantity change — the class that used to be dropped. */
+    statusOnlyForwards: number;
+    /** Updates that carried only an average-price enrichment. These must never create a fill. */
+    priceOnlyForwards: number;
+    /** Orders settled on the adapter's terminal state, including zero-fill cancels/rejects. */
+    terminalSettlements: number;
+    /** Impossible quantities seen: escalated to reconciliation, never applied. */
+    invalidQuantityObservations: number;
+    /** Broker-reported overfills: applied (broker truth) and escalated. */
+    overfillObservations: number;
+    /** Non-terminal labels seen after a terminal one: counted and reconciled, never adopted. */
+    contradictoryTerminalObservations: number;
     /** Consecutive failures currently driving the bounded retry backoff. */
     sweepAttempts: number;
     /** Why the last sweep did not synchronize, if it did not. */
@@ -877,6 +1106,12 @@ export class OrderStreamConsumer {
       sweepsStarted: this.sweepsStarted,
       sweepsSynchronized: this.sweepsSynchronized,
       sweepsDiscardedStaleEpoch: this.sweepsDiscardedStaleEpoch,
+      statusOnlyForwards: this.statusOnlyForwards,
+      priceOnlyForwards: this.priceOnlyForwards,
+      terminalSettlements: this.terminalSettlements,
+      invalidQuantityObservations: this.invalidQuantityObservations,
+      overfillObservations: this.overfillObservations,
+      contradictoryTerminalObservations: this.contradictoryTerminalObservations,
       sweepAttempts: this.sweepAttempts,
       lastSweepFailure: this.lastSweepFailure,
       lastSweepUnresolvedOrders: this.lastSweepUnresolvedOrders,

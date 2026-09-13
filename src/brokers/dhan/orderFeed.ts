@@ -284,7 +284,13 @@ export function parseDhanOrderAlert(raw: string): NormalizedOrderObservation | n
   // No per-alert sequence number is provided. LastUpdatedTime + cumulative qty distinguishes
   // two genuinely-distinct alerts for the same order; the monotonic ledger handles ordering.
   const stamp = str(data.LastUpdatedTime) ?? str(data.ExchOrderTime);
-  const eventId = orderNo && stamp ? `${orderNo}:${stamp}:${traded ?? "?"}` : null;
+  // THE STATUS IS PART OF THE EVENT IDENTITY. Without it, a `PENDING` alert with no traded quantity
+  // and the `CANCELLED` alert that follows it share an identity whenever Dhan stamps both with the
+  // same LastUpdatedTime — so the ledger would discard the cancellation as a redelivery of the
+  // pending alert and the leg would never learn it was cancelled. Including the status keeps a
+  // genuine TRANSITION distinct while still deduplicating a true redelivery, which repeats the
+  // status too.
+  const eventId = orderNo && stamp ? `${orderNo}:${stamp}:${traded ?? "?"}:${status ?? ""}` : null;
 
   return {
     ownerTag: correlationId ?? "",

@@ -120,7 +120,14 @@ export function parseKiteOrderFrame(raw: string): KiteParsedTextFrame {
   // rule handles that); it only distinguishes two genuinely distinct updates.
   const eventStamp =
     str(data.exchange_update_timestamp) ?? str(data.exchange_timestamp) ?? str(data.order_timestamp);
-  const eventId = orderId && eventStamp ? `${orderId}:${eventStamp}:${filled ?? "?"}` : null;
+  // THE STATUS IS PART OF THE EVENT IDENTITY. Without it, `OPEN` with 0 filled and `CANCELLED` with
+  // 0 filled share an identity whenever the broker stamps them within the same second — and Kite's
+  // timestamps are 1-second granular, so that is the common case, not the corner case. The ledger
+  // would then discard the cancellation as a redelivery of the open, and the leg would never be told
+  // it had been cancelled. Including the status keeps a genuine TRANSITION distinct while still
+  // deduplicating a true redelivery, which repeats the status too.
+  const eventId =
+    orderId && eventStamp ? `${orderId}:${eventStamp}:${filled ?? "?"}:${status ?? ""}` : null;
 
   const observation: NormalizedOrderObservation = {
     ownerTag: tag ?? "",
