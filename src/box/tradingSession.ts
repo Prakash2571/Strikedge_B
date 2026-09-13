@@ -110,6 +110,33 @@ export interface BoxSessionRecord {
   readonly completed_trade_ids: readonly string[];
   /** Entry attempts that ended with no Box. Visibility only; never gates anything. */
   readonly aborted_attempts: number;
+  /**
+   * EVERY entry attempt ADMITTED by this session, whether it established a Box or not.
+   *
+   * WHY THIS IS SEPARATE FROM THE CYCLE BUDGET. `established_trade_ids` counts attempts that
+   * produced a full four-leg Box, and an aborted attempt deliberately does NOT consume a cycle —
+   * burning an operator's single permitted trade on an attempt that left no position would be
+   * indefensible, and that reasoning is sound.
+   *
+   * But it left NOTHING bounding attempts at all. An attempt that submits orders, partially fills,
+   * and is then unwound or recovered has taken real exposure, paid real charges and consumed real
+   * rate-limit budget — and under the cycle budget alone it is free. A deployment configured for
+   * "one bounded trial trade" could therefore submit orders indefinitely, as long as none of the
+   * attempts ever completed a Box, while still reporting one cycle remaining.
+   *
+   * So the two budgets are independent and BOTH gate entry: a cycle is spent by SUCCEEDING, an
+   * attempt is spent by STARTING. Counted at admission, before any broker POST, so a failure after
+   * submission cannot hand the attempt back.
+   */
+  readonly entry_attempts: number;
+  /**
+   * The attempt ceiling SNAPSHOT taken at arm time. `0` means UNBOUNDED (the control is off), which
+   * is the default so that arming behaves exactly as before unless an operator asks for the bound.
+   *
+   * Snapshotted for the same reason as `max_completed_trades`: changing the env var and restarting
+   * must not retroactively widen a session an operator already armed under a tighter limit.
+   */
+  readonly max_entry_attempts: number;
   /** How many times an operator has explicitly re-armed. Monotonic; audit aid. */
   readonly arm_count: number;
   readonly updated_at: number;
@@ -125,6 +152,8 @@ export function idleSessionRecord(now: number): BoxSessionRecord {
     established_trade_ids: [],
     completed_trade_ids: [],
     aborted_attempts: 0,
+    entry_attempts: 0,
+    max_entry_attempts: 0,
     arm_count: 0,
     updated_at: now,
   };
@@ -162,10 +191,32 @@ export function isBudgetExhausted(record: BoxSessionRecord): boolean {
   return consumedCycles(record) >= record.max_completed_trades;
 }
 
+/**
+ * Attempts still permitted. `null` means UNBOUNDED (`max_entry_attempts === 0`), deliberately not
+ * `Infinity` so it serialises to JSON honestly.
+ */
+export function remainingEntryAttempts(record: BoxSessionRecord): number | null {
+  if (record.max_entry_attempts <= 0) return null;
+  return Math.max(0, record.max_entry_attempts - record.entry_attempts);
+}
+
+/**
+ * True when the session's ATTEMPT budget is exhausted.
+ *
+ * Independent of the cycle budget: a cycle is spent by SUCCEEDING, an attempt by STARTING. Without
+ * this, repeated failed or recovered attempts took real exposure, paid real charges and burned real
+ * rate-limit budget indefinitely while the cycle budget still reported room.
+ */
+export function isAttemptBudgetExhausted(record: BoxSessionRecord): boolean {
+  if (record.max_entry_attempts <= 0) return false;
+  return record.entry_attempts >= record.max_entry_attempts;
+}
+
 /** The reason new entry is refused by the session layer, or null when it permits entry. */
 export type BoxSessionBlockReason =
   | "session_not_armed"
   | "session_budget_exhausted"
+  | "session_attempt_budget_exhausted"
   | "session_recovery";
 
 /**
@@ -202,6 +253,19 @@ export function evaluateSessionEntry(args: {
         `BOX_SESSION_MAX_COMPLETED_TRADES=${max} and ${consumedCycles(args.record)} cycle(s) have been ` +
         "consumed by this session. Monitoring, exit, residual flattening and reconciliation continue; " +
         "only new entry is refused.",
+    };
+  }
+  if (isAttemptBudgetExhausted(args.record)) {
+    return {
+      allowed: false,
+      reason: "session_attempt_budget_exhausted",
+      detail:
+        `BOX_SESSION_MAX_ENTRY_ATTEMPTS=${args.record.max_entry_attempts} and ${args.record.entry_attempts} ` +
+        "attempt(s) have been started by this session. This bounds ATTEMPTS, not completions: an " +
+        "attempt that submitted orders and was then unwound or recovered still took exposure, paid " +
+        "charges and consumed rate-limit budget, so it spends the attempt budget even though it " +
+        "spent no cycle. Monitoring, exit, residual flattening and reconciliation continue; only " +
+        "new entry is refused.",
     };
   }
   return { allowed: true, reason: null, detail: null };
@@ -279,19 +343,31 @@ export function canArm(args: {
 export function armSession(args: {
   readonly sessionId: string;
   readonly maxCompletedTrades: number;
+  /** Attempt ceiling for this session. Omitted or 0 ⇒ unbounded, preserving prior behaviour. */
+  readonly maxEntryAttempts?: number;
   readonly armedBy: string | null;
   readonly previous: BoxSessionRecord;
   readonly now: number;
 }): BoxSessionRecord {
   const max = Number.isFinite(args.maxCompletedTrades) ? Math.max(0, Math.floor(args.maxCompletedTrades)) : 0;
+  const maxAttempts =
+    args.maxEntryAttempts !== undefined && Number.isFinite(args.maxEntryAttempts)
+      ? Math.max(0, Math.floor(args.maxEntryAttempts))
+      : 0;
   return {
     session_id: args.sessionId,
     armed_at: args.now,
     armed_by: args.armedBy,
     max_completed_trades: max,
+    // SNAPSHOT, for the same reason as max_completed_trades: an operator who armed under a tighter
+    // attempt bound must not have it widened by an env change plus a restart.
+    max_entry_attempts: maxAttempts,
     established_trade_ids: [],
     completed_trade_ids: [],
     aborted_attempts: 0,
+    // Reset per ARM, so the counter measures THIS session's attempts. Re-arming is already guarded
+    // by canArm(), which refuses while consumed cycles have not reached FLAT.
+    entry_attempts: 0,
     arm_count: args.previous.arm_count + 1,
     updated_at: args.now,
   };
@@ -347,6 +423,35 @@ export function recordAbortedAttempt(record: BoxSessionRecord, now: number): Box
 }
 
 /**
+ * Record that an entry attempt has STARTED. Consumes an attempt from the attempt budget.
+ *
+ * Called at ADMISSION, before any broker POST, and never at completion — an attempt that is
+ * admitted and then fails has still taken the risk the budget exists to bound. Counting at the end
+ * would let a run of failures proceed unbounded, which is the whole defect.
+ */
+export function recordEntryAttemptStarted(record: BoxSessionRecord, now: number): BoxSessionRecord {
+  return { ...record, entry_attempts: record.entry_attempts + 1, updated_at: now };
+}
+
+/**
+ * Normalise a record read from durable storage, filling fields a record written by an older build
+ * does not carry.
+ *
+ * MISSING BECOMES 0, WHICH IS "UNBOUNDED" FOR THE CEILING AND "NONE SPENT" FOR THE COUNTER. That is
+ * the only safe reading of an old record: inventing a ceiling an operator never armed under would
+ * refuse entry they had legitimately authorised, and inventing spent attempts would do the same. The
+ * bound therefore takes effect from the next ARM, which is where the snapshot is taken.
+ */
+export function normaliseSessionRecord(record: BoxSessionRecord): BoxSessionRecord {
+  const entryAttempts = Number.isFinite(record.entry_attempts) ? Math.max(0, Math.floor(record.entry_attempts)) : 0;
+  const maxEntryAttempts = Number.isFinite(record.max_entry_attempts)
+    ? Math.max(0, Math.floor(record.max_entry_attempts))
+    : 0;
+  if (entryAttempts === record.entry_attempts && maxEntryAttempts === record.max_entry_attempts) return record;
+  return { ...record, entry_attempts: entryAttempts, max_entry_attempts: maxEntryAttempts };
+}
+
+/**
  * Close out cycles that reached FLAT while this process was not running.
  *
  * Called at boot with the durable status of every established-but-not-completed trade id.
@@ -391,6 +496,11 @@ export function sessionStatus(
   current_trade_id: string | null;
   in_flight_trade_ids: readonly string[];
   aborted_attempts: number;
+  /** ATTEMPTS started by this session — the budget that bounds risk-taking, not just success. */
+  entry_attempts: number;
+  max_entry_attempts: number;
+  /** Null ⇒ the attempt bound is not configured for this session. */
+  remaining_entry_attempts: number | null;
   arm_count: number;
   block_reason: string | null;
 } {
@@ -410,6 +520,9 @@ export function sessionStatus(
     current_trade_id: inFlight.length === 1 ? (inFlight[0] as string) : null,
     in_flight_trade_ids: inFlight,
     aborted_attempts: record.aborted_attempts,
+    entry_attempts: record.entry_attempts,
+    max_entry_attempts: record.max_entry_attempts,
+    remaining_entry_attempts: remainingEntryAttempts(record),
     arm_count: record.arm_count,
     block_reason: blockReason,
   };

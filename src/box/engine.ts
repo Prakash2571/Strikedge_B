@@ -1175,6 +1175,9 @@ export class BoxEngine {
         flatTradeIds: (ids) => loadFlatBoxTradeIds(ids),
       },
       configuredMaxCompletedTrades: () => this.cfg.sessionMaxCompletedTrades,
+      // THE ATTEMPT CEILING. Bounds attempts STARTED, not trades completed — see the field comment
+      // in config.ts for why the cycle budget alone left repeated failed attempts unbounded.
+      configuredMaxEntryAttempts: () => this.cfg.sessionMaxEntryAttempts,
       // Distinguishes "no Box database in this deployment" from "Mongo is down". The first must
       // leave the session layer inert; the second must fail entry closed.
       persistenceAvailable: () => isBoxDbEnabled(),
@@ -1198,6 +1201,12 @@ export class BoxEngine {
       activeUnderlyings: () => this.activeUnderlyings(),
       // The session cycle budget. ENTRY only; every reduction path bypasses it.
       sessionEntryGate: () => this.session.evaluateEntry(this.recoveryActive()),
+      // CONSUME AN ATTEMPT AT ADMISSION. Called by the coordinator after every cheap gate has
+      // passed and BEFORE any reservation or broker POST, so an attempt that then fails has still
+      // spent its budget — which is the entire point of bounding attempts rather than completions.
+      // Returning ok:false refuses the entry, because an attempt that could not be durably counted
+      // would be an unbounded one.
+      sessionConsumeAttempt: () => this.session.recordAttemptStarted(),
     });
     this.execution = this.coordinator;
 
@@ -5322,11 +5331,14 @@ export class BoxEngine {
   /** Arm a trading session (Part 7). Full-admin only; enforced by the route. */
   async armTradingSession(args: {
     maxCompletedTrades?: number;
+    /** Attempt ceiling for this session. Omitted ⇒ the configured default. */
+    maxEntryAttempts?: number;
     actor: string | null;
   }): Promise<{ ok: true; session: unknown } | { ok: false; code: number; error: string }> {
     const live = this.orderManager?.status() ?? null;
     const armed = await this.session.arm({
       ...(args.maxCompletedTrades === undefined ? {} : { maxCompletedTrades: args.maxCompletedTrades }),
+      ...(args.maxEntryAttempts === undefined ? {} : { maxEntryAttempts: args.maxEntryAttempts }),
       armedBy: args.actor,
       openBoxes: this.positions.size,
       residualLegs: this.residualLegCount(),
@@ -5335,7 +5347,9 @@ export class BoxEngine {
     if (!armed.ok) return { ok: false, code: 409, error: armed.reason };
     console.warn(
       `[Box] trading session armed by ${args.actor ?? "unknown"} with a limit of ` +
-        `${armed.record.max_completed_trades === 0 ? "UNLIMITED" : armed.record.max_completed_trades} cycle(s).`,
+        `${armed.record.max_completed_trades === 0 ? "UNLIMITED" : armed.record.max_completed_trades} cycle(s) ` +
+        `and ${armed.record.max_entry_attempts === 0 ? "UNLIMITED" : armed.record.max_entry_attempts} entry attempt(s). ` +
+        `Attempts bound RISK-TAKING: an attempt that submits and is then unwound still spends one.`,
     );
     return { ok: true, session: this.sessionStatusPayload() };
   }

@@ -29,8 +29,10 @@ import {
   idleSessionRecord,
   inFlightCycleIds,
   isArmed,
+  normaliseSessionRecord,
   recordAbortedAttempt,
   recordCompletedBox,
+  recordEntryAttemptStarted,
   recordEstablishedBox,
   reconcileCompletions,
   sessionStatus,
@@ -51,6 +53,14 @@ export interface TradingSessionManagerDeps {
   readonly persistence: TradingSessionPersistence;
   /** The configured cycle budget, used when an operator arms without specifying one. */
   readonly configuredMaxCompletedTrades: () => number;
+  /**
+   * The configured ATTEMPT ceiling, used when an operator arms without specifying one. 0 ⇒ unbounded.
+   *
+   * Separate from the cycle budget because the two bound different things: a cycle is spent by
+   * SUCCEEDING, an attempt by STARTING. Absent ⇒ treated as 0, so an existing deployment sees no
+   * behaviour change.
+   */
+  readonly configuredMaxEntryAttempts?: () => number;
   /**
    * Whether durable Box persistence exists at all.
    *
@@ -155,7 +165,13 @@ export class BoxTradingSessionManager {
     }
     this.loaded = true;
     this.loadError = null;
-    this.record = loaded.record ?? idleSessionRecord(this.now());
+    // NORMALISE what came off disk. A record written by a build that predates the attempt budget
+    // carries no entry_attempts/max_entry_attempts, and `undefined` in an arithmetic comparison would
+    // silently disable the bound. Missing becomes 0 — "unbounded ceiling, none spent" — which is the
+    // only safe reading: inventing a ceiling the operator never armed under would refuse entry they
+    // legitimately authorised, and inventing spent attempts would do the same. The bound therefore
+    // takes effect from the next ARM, which is where the snapshot is taken.
+    this.record = normaliseSessionRecord(loaded.record ?? idleSessionRecord(this.now()));
 
     // Cycles that went flat during downtime. Without this an exited Box would stay "in flight"
     // forever, the session would never report COMPLETED, and `canArm` would refuse to arm again
@@ -224,9 +240,13 @@ export class BoxTradingSessionManager {
    */
   private enforcing(): boolean {
     if (this.deps.configuredMaxCompletedTrades() > 0) return true;
+    // The ATTEMPT bound enforces on its own. A trial configured with an attempt ceiling but no cycle
+    // ceiling must still be bounded — otherwise the one control that stops repeated failed attempts
+    // from taking risk indefinitely would be silently inert.
+    if ((this.deps.configuredMaxEntryAttempts?.() ?? 0) > 0) return true;
     // An ARMED session with a positive snapshot still enforces, even if the env var was later
     // changed to 0: the operator armed under a limit and that limit stands for the session.
-    return isArmed(this.record) && this.record.max_completed_trades > 0;
+    return isArmed(this.record) && (this.record.max_completed_trades > 0 || this.record.max_entry_attempts > 0);
   }
 
   /**
@@ -276,6 +296,7 @@ export class BoxTradingSessionManager {
   /** Arm (or re-arm) a session. Refused while any consumed cycle still has live exposure. */
   async arm(args: {
     readonly maxCompletedTrades?: number;
+    readonly maxEntryAttempts?: number;
     readonly armedBy: string | null;
     readonly openBoxes: number;
     readonly residualLegs: number;
@@ -293,9 +314,11 @@ export class BoxTradingSessionManager {
     if (!permitted.ok) return { ok: false, reason: permitted.reason };
 
     const max = args.maxCompletedTrades ?? this.deps.configuredMaxCompletedTrades();
+    const maxAttempts = args.maxEntryAttempts ?? this.deps.configuredMaxEntryAttempts?.() ?? 0;
     const next = armSession({
       sessionId: this.mintSessionId(),
       maxCompletedTrades: max,
+      maxEntryAttempts: maxAttempts,
       armedBy: args.armedBy,
       previous: this.record,
       now: this.now(),
@@ -350,6 +373,44 @@ export class BoxTradingSessionManager {
   }
 
   /** Record an entry attempt that ended with no Box. Visibility only; consumes nothing. */
+  /**
+   * CONSUME AN ATTEMPT. Called at ADMISSION, before any broker POST.
+   *
+   * Returns false when the attempt could not be durably consumed, and the caller MUST then refuse
+   * the entry. That is the opposite of `recordEstablished`, which never rolls back because the Box
+   * already exists whether or not the write landed — here nothing has been sent yet, so the safe
+   * answer is to not send.
+   *
+   * A ROLLBACK on write failure is therefore correct AND the budget is still protected: `commit`
+   * with rollback restores the in-memory record, we report failure, and the caller does not submit.
+   * Nothing was risked, so nothing needed to be counted.
+   */
+  async recordAttemptStarted(): Promise<{ ok: boolean; detail: string | null }> {
+    if (!this.enforcing() || !this.deps.persistenceAvailable()) {
+      // The bound is not configured, or there is nowhere to record it. Nothing to consume, and
+      // `evaluateEntry` has already returned "no opinion" for the same reason.
+      return { ok: true, detail: null };
+    }
+    if (!this.loaded || !isArmed(this.record)) {
+      // Unreadable or unarmed sessions are already refused by evaluateEntry; reaching here means the
+      // caller did not consult it. Refuse rather than silently proceed unbounded.
+      return {
+        ok: false,
+        detail: "the trading session is not armed or its durable state is unreadable, so an entry attempt cannot be accounted for",
+      };
+    }
+    const next = recordEntryAttemptStarted(this.record, this.now());
+    if (!(await this.commit(next, "entry attempt started", true))) {
+      return {
+        ok: false,
+        detail:
+          "the entry attempt could not be durably recorded, so it was NOT started. Counting attempts " +
+          "is what bounds repeated failed attempts, and an unrecorded attempt would be unbounded.",
+      };
+    }
+    return { ok: true, detail: null };
+  }
+
   async recordAborted(): Promise<void> {
     if (!this.deps.persistenceAvailable() || !this.loaded || !isArmed(this.record)) return;
     await this.commit(recordAbortedAttempt(this.record, this.now()), "aborted attempt", true);

@@ -588,6 +588,17 @@ export interface BoxConfig {
    */
   sessionMaxCompletedTrades: number;
   /**
+   * Maximum ENTRY ATTEMPTS a single armed session may start. 0 ⇒ unbounded (the default).
+   *
+   * Bounds RISK-TAKING rather than success. `sessionMaxCompletedTrades` counts cycles CONSUMED at
+   * establishment, so an attempt that submitted orders, partially filled and was then unwound or
+   * recovered spends no cycle — correctly, because burning a permitted trade on an attempt that left
+   * no position would be indefensible. But that left nothing bounding attempts at all: a trial
+   * configured for one trade could submit orders indefinitely as long as no attempt ever completed.
+   * This is the ceiling that stops it, counted at admission before any broker POST.
+   */
+  sessionMaxEntryAttempts: number;
+  /**
    * Paper mirror of {@link liveMaxBoxCapitalRupees}, for `live_parity` validation. `0`
    * disables. LIVE remains the authoritative safety gate; this exists so a paper run can
    * exercise the same admission arithmetic.
@@ -1178,6 +1189,7 @@ export function loadBoxConfig(): BoxConfig {
 
     oneActiveBoxPerUnderlying: bool("BOX_ONE_ACTIVE_BOX_PER_UNDERLYING", false),
     sessionMaxCompletedTrades: clampInt("BOX_SESSION_MAX_COMPLETED_TRADES", 0, 0, 10_000),
+    sessionMaxEntryAttempts: clampInt("BOX_SESSION_MAX_ENTRY_ATTEMPTS", 0, 0, 10_000),
     paperMaxBoxCapitalRupees: clampInt("BOX_PAPER_MAX_BOX_CAPITAL_RUPEES", 0, 0, 1_000_000_000),
 
     legExecutionMode:
@@ -1359,6 +1371,7 @@ export function configSnapshot(cfg: BoxConfig): BoxScannerConfigSnapshot {
     live_max_box_capital_rupees: cfg.liveMaxBoxCapitalRupees,
     one_active_box_per_underlying: cfg.oneActiveBoxPerUnderlying,
     session_max_completed_trades: cfg.sessionMaxCompletedTrades,
+    session_max_entry_attempts: cfg.sessionMaxEntryAttempts,
     // Executable-order-pricing knobs, frozen so a paper_legging fill stays
     // interpretable after the defaults are retuned.
     leg_max_chase_ticks: cfg.legMaxChaseTicks,

@@ -259,6 +259,15 @@ export interface CoordinatorDeps {
    * cancel, a residual flatten or a reconciliation-driven reduction.
    */
   sessionEntryGate?: () => { allowed: boolean; reason: string | null; detail: string | null };
+  /**
+   * CONSUME one entry attempt from the session's ATTEMPT budget, durably.
+   *
+   * Called after the cheap gates pass and BEFORE any reservation or broker POST. `ok: false` refuses
+   * the entry: an attempt that could not be durably counted would be an unbounded one, and the
+   * attempt budget is precisely what stops a run of failed-and-recovered attempts from taking risk
+   * indefinitely. Nothing has been sent at this point, so refusing costs nothing.
+   */
+  sessionConsumeAttempt?: () => Promise<{ ok: boolean; detail: string | null }>;
   now?: () => number;
   /** Injected so tests can drive waiting deterministically. */
   sleep?: (ms: number) => Promise<void>;
@@ -768,6 +777,37 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
           sessionGate.detail ??
           `${sessionGate.reason ?? "session_limit_reached"}: the armed trading session refused entry`,
       };
+    }
+
+    // ── SESSION ATTEMPT BUDGET: CONSUMED HERE, BEFORE ANYTHING IS RISKED ───────────────
+    //
+    // The gate above asked "may I attempt?". This SPENDS the attempt. It sits before the reservation
+    // and long before any broker POST, so an attempt that is admitted and then fails — rejected,
+    // partially filled and unwound, or recovered — has still consumed its budget. Counting at
+    // completion instead is what let a trial configured for one trade submit orders indefinitely,
+    // provided no attempt ever completed a Box.
+    //
+    // A failure to record REFUSES the entry rather than proceeding: nothing has been sent yet, so the
+    // safe answer is to not send, and an uncounted attempt would be an unbounded one.
+    if (this.deps.sessionConsumeAttempt) {
+      const consumed = await this.deps.sessionConsumeAttempt();
+      if (!consumed.ok) {
+        this.stats.sessionLimitRefusals++;
+        this.log({
+          execution: executionId,
+          broker,
+          underlying: candidate.underlying,
+          status: "suppressed_session_limit",
+          reason: "session_attempt_unaccountable",
+        });
+        return {
+          ok: false,
+          reason: "session_limit_reached",
+          detail:
+            consumed.detail ??
+            "the entry attempt could not be durably counted against the session attempt budget, so it was not started",
+        };
+      }
     }
 
     // ── UNDERLYING LOCK, LAYER 1a: DURABLE POSITION OWNERSHIP ──────────────────────────

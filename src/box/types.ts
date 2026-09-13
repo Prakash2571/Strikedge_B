@@ -1509,6 +1509,15 @@ export interface BoxScannerConfigSnapshot {
   one_active_box_per_underlying?: boolean;
   /** The session cycle budget in force. 0 = unlimited. */
   session_max_completed_trades?: number;
+  /**
+   * Attempt ceiling for one armed session. 0 = unbounded.
+   *
+   * Bounds RISK-TAKING rather than success: `session_max_completed_trades` counts cycles consumed at
+   * establishment, so an attempt that submitted orders and was then unwound or recovered spends no
+   * cycle. This ceiling is counted at admission, before any broker POST, so such an attempt still
+   * spends it.
+   */
+  session_max_entry_attempts?: number;
   /** Executable-order-pricing knobs a paper_legging fill was taken under. */
   leg_max_chase_ticks?: number;
   unwind_max_chase_ticks?: number;

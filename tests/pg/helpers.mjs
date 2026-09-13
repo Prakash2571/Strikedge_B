@@ -13,7 +13,7 @@
  * it and closes the pool.
  */
 
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import pg from "pg";
@@ -22,7 +22,23 @@ const BASE_URL = (process.env.DATABASE_URL ?? "postgres://strikedge:strikedge@12
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS_DIR = resolve(HERE, "..", "..", "migrations");
-const MIGRATIONS = ["001_outbox.sql", "002_box_core.sql", "003_box_pnl_settings_session.sql", "004_reservations.sql", "008_trade_margin_source.sql"];
+/**
+ * EVERY migration, discovered from disk in lexical order — deliberately NOT a hardcoded list.
+ *
+ * It WAS a hardcoded list, and that is a maintenance trap rather than a convenience: a new migration
+ * silently did not reach the test schema, so the suite exercised a schema the production migration
+ * runner would never produce. It cost exactly that here — migration 010 added a column, the
+ * repository wrote it, and the test failed with `column "entry_attempts" does not exist`, which looks
+ * like a code defect and is not one. Worse, the failure mode is asymmetric: a migration that only
+ * ADDS a table nothing in the suite touches would have been missed with no failure at all, leaving
+ * the suite quietly green against the wrong schema.
+ *
+ * The lexical order of the `NNN_` prefix is the apply order, which is the same ordering
+ * `src/pg/migrate.ts` uses, so the test schema is now built the way production builds it.
+ */
+const MIGRATIONS = readdirSync(MIGRATIONS_DIR)
+  .filter((f) => f.endsWith(".sql"))
+  .sort();
 
 /** A connection string that defaults every connection to `schema`. */
 function urlForSchema(schema) {
