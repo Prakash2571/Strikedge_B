@@ -54,7 +54,13 @@ function makeMachine(instruments = [1, 2, 3, 4], opts = {}) {
   };
 }
 
-test("READY is unreachable by socket-open alone; needs auth + subs + fresh depth per instrument", () => {
+test("READY is unreachable by socket-open alone; needs auth AND depth actually flowing", () => {
+  // CHANGED DELIBERATELY. The final step used to require depth for EVERY desired instrument, which
+  // in production meant the whole streamed universe and therefore an outage from one dead strike
+  // (see the header of tests/box/candidateMarketData.test.mjs). The properties this test exists to
+  // protect — a socket that has merely opened is never READY, and authentication alone is never
+  // READY — are unchanged and still asserted. Per-instrument admissibility is asserted per candidate
+  // in candidateMarketData.test.mjs, where it applies to the instruments that actually matter.
   const { machine } = makeMachine([10, 20]);
   assert.equal(machine.state(), "DISCONNECTED");
 
@@ -65,20 +71,24 @@ test("READY is unreachable by socket-open alone; needs auth + subs + fresh depth
   assert.equal(machine.state(), "AUTHENTICATING", "socket open is a route only, never READY");
 
   machine.onAuthenticated();
-  assert.equal(machine.state(), "SYNCHRONIZING", "authenticated still owes subs + depth");
+  assert.equal(machine.state(), "SYNCHRONIZING", "authenticated still owes real depth");
 
   machine.onSubscriptionsConfirmed([10, 20]);
   assert.equal(machine.state(), "SYNCHRONIZING", "subs confirmed but no usable depth yet ⇒ not READY");
-
-  // First usable depth for one of the two: still not enough.
-  machine.onUsableDepth(10);
-  assert.equal(machine.state(), "SYNCHRONIZING", "one of two instruments fresh ⇒ still not READY");
   assert.equal(machine.permissions().newEntry, false);
 
-  // The last instrument confirms — now, and only now, READY.
+  // First usable depth proves the pipeline is genuinely delivering end to end.
+  machine.onUsableDepth(10);
+  assert.equal(machine.state(), "READY", "the TRANSPORT is delivering depth");
+  assert.equal(machine.permissions().newEntry, true);
+  // But instrument 20 is still individually inadmissible, and coverage says so. A candidate whose
+  // leg is instrument 20 is refused by the candidate-scoped gate, not by the transport state.
+  assert.equal(machine.isInstrumentReady(20), false);
+  assert.equal(machine.coverage().missing, 1);
+
   machine.onUsableDepth(20);
   assert.equal(machine.state(), "READY");
-  assert.equal(machine.permissions().newEntry, true);
+  assert.equal(machine.coverage().missing, 0);
 });
 
 test("a socket that opens but supplies no usable data is never READY", () => {
@@ -160,12 +170,23 @@ test("reconnect advances the generation and drops prior-generation readiness", (
   const gen2 = machine.generation();
   assert.ok(gen2 > gen1, "a reconnect must advance the generation");
 
-  // Depth observed under the OLD generation must not count. Re-confirm subs but only feed ONE.
+  // Depth observed under the OLD generation must not count. This is the load-bearing property and it
+  // is asserted PER INSTRUMENT, which is where it belongs: immediately after the reconnect, before
+  // anything re-ticks, NEITHER instrument is admissible even though both were fresh a moment ago.
   machine.onSubscriptionsConfirmed([100, 200]);
+  assert.equal(machine.isInstrumentReady(100), false, "prior-generation depth is not evidence");
+  assert.equal(machine.isInstrumentReady(200), false, "prior-generation depth is not evidence");
+  assert.equal(machine.coverage().missing, 2, "the whole set is un-evidenced after a reconnect");
+  assert.equal(machine.state(), "SYNCHRONIZING", "and the transport has not yet proven it delivers");
+
   machine.onUsableDepth(100);
-  assert.equal(machine.state(), "SYNCHRONIZING", "instrument 200 not yet fresh THIS generation");
+  assert.equal(machine.state(), "READY", "the transport is delivering again");
+  assert.equal(machine.isInstrumentReady(100), true, "but only THIS instrument is re-evidenced");
+  assert.equal(machine.isInstrumentReady(200), false, "instrument 200 is not fresh THIS generation");
+
   machine.onUsableDepth(200);
   assert.equal(machine.state(), "READY");
+  assert.equal(machine.coverage().missing, 0);
 });
 
 test("heartbeat gap degrades a READY machine; fresh data recovers it", () => {

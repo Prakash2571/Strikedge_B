@@ -282,20 +282,37 @@ test("a RECONNECT advances the generation and invalidates every leg's prior dept
   w.machine.onConnecting();
   w.machine.onSocketOpen();
   w.machine.onAuthenticated();
-  w.machine.setDesiredInstruments(w.legTokens);
+  w.machine.setDesiredInstruments([...w.legTokens, 9999]);
   w.machine.onFrame(w.now);
+  w.machine.onHeartbeat(w.now);
   assert.notEqual(w.machine.generation(), genBefore, "the generation advanced");
 
-  // The books in the store are byte-identical and still look fresh, but they belong to the old
-  // generation, so the candidate is NOT admissible.
-  const verdict = evaluateCandidateMarketData(w.cand, deps(w.machine, w));
-  assert.equal(verdict.eligible, false);
-  assert.ok(
-    verdict.blockers.some((b) => b.code === "leg_no_depth_this_generation"),
-    "prior-generation depth is not evidence for the new connection",
+  // STAGE 1 — nothing has re-ticked, so the transport has not yet proven it delivers. That is a
+  // SHARED failure and it short-circuits: reporting four derived per-leg blockers here would bury
+  // the one fact that matters.
+  const justReconnected = evaluateCandidateMarketData(w.cand, deps(w.machine, w));
+  assert.equal(justReconnected.eligible, false);
+  assert.equal(justReconnected.sharedFailure, true, "a transport that has not proven delivery is a shared failure");
+  assert.equal(justReconnected.blockers[0].code, "transport_not_ready");
+
+  // STAGE 2 — an UNRELATED instrument re-ticks. The transport is now demonstrably delivering (so the
+  // shared failure clears and READY is reached), but this candidate's own four legs still have no
+  // depth in the new generation. The refusal must now be PER LEG, and must not be masked by the fact
+  // that the store still holds byte-identical, apparently-fresh books from the old generation.
+  w.machine.onUsableDepth(9999, w.now);
+  w.machine.evaluate();
+  assert.equal(w.machine.state(), "READY", "the transport recovered on an unrelated instrument");
+
+  const perLeg = evaluateCandidateMarketData(w.cand, deps(w.machine, w));
+  assert.equal(perLeg.eligible, false, "a recovered TRANSPORT does not re-evidence this candidate");
+  assert.equal(perLeg.sharedFailure, false);
+  assert.equal(
+    perLeg.blockers.filter((b) => b.code === "leg_no_depth_this_generation").length,
+    4,
+    "all four legs are refused: prior-generation depth is not evidence for the new connection",
   );
 
-  // Once the legs re-tick under the NEW generation, the candidate is admissible again.
+  // STAGE 3 — once the legs themselves re-tick under the NEW generation, the candidate is admissible.
   for (const t of w.legTokens) w.machine.onUsableDepth(t, w.now);
   w.machine.evaluate();
   assert.equal(evaluateCandidateMarketData(w.cand, deps(w.machine, w)).eligible, true);
