@@ -553,10 +553,11 @@ for (const b of BROKERS) {
 }
 
 
+
 /* ═══════════════ 12. the REAL adapters: a quantity regression must not discard the STATUS ═══════════════ */
 
 /**
- * The cases above use an adapter that MODELS the production contract. These two drive the REAL
+ * The cases above use an adapter that MODELS the production contract. These drive the REAL
  * KiteBrokerAdapter and DhanBrokerAdapter, because the defect they pin lived in those files:
  *
  *     const regressed = observedQuantity.present && observedQuantity.value < known.filled_quantity;
@@ -566,58 +567,115 @@ for (const b of BROKERS) {
  * `EXPIRED` alongside a pre-fill quantity snapshot — or a REST poll overtaking a stream event and
  * arriving with an older figure on a newer label — therefore lost the cancellation of the remainder
  * along with the stale number. The order stayed working in the session snapshot with its waiters
- * never woken, which is the same conflation of "quantity" with "the whole update" one layer down.
+ * never woken: the same conflation of "quantity" with "the whole update", one layer below the
+ * consumer.
+ *
+ * The order is seeded through the adapters' REAL `adoptOrder` — the production crash-recovery
+ * adoption path — rather than through `submitOrder`, so these tests exercise `applyOrderUpdate`
+ * without also driving the resolution waiter (which would need a clock to be advanced and is already
+ * covered by tests/box/orderStreamRealWaiter.test.mjs).
  */
 
-const { KiteBrokerAdapter } = await import("../../dist/box/kiteBrokerAdapter.js");
-const { DhanBrokerAdapter } = await import("../../dist/box/dhanBrokerAdapter.js");
+import { KiteBrokerAdapter } from "../../dist/box/kiteBrokerAdapter.js";
+import { DhanBrokerAdapter } from "../../dist/box/dhanBrokerAdapter.js";
 
-function fakeClock() {
-  let t = 0;
-  return { now: () => t, wait: () => Promise.resolve(), advance: (ms) => { t += ms; } };
-}
+const LIVE_ADAPTER_CONFIG = {
+  executionMode: "live",
+  enabled: true,
+  brokerMinIntervalMs: 1000,
+  ackTimeoutMs: 60_000,
+  workingTimeoutMs: 60_000,
+  partialTimeoutMs: 60_000,
+  cancelTimeoutMs: 5_000,
+  maxChaseTicks: 3,
+  maxModifications: 3,
+};
 
-function kiteAdapterConfig() {
-  return {
-    executionMode: "live",
-    enabled: true,
-    brokerMinIntervalMs: 1000,
-    ackTimeoutMs: 60_000,
-    workingTimeoutMs: 60_000,
-    partialTimeoutMs: 60_000,
-    cancelTimeoutMs: 5_000,
-    maxChaseTicks: 3,
-    maxModifications: 3,
+/** The durable intent and the broker snapshot `adoptOrder` matches against. */
+function adoption(brokerOrderId, { tag = null } = {}) {
+  const clientOrderId = "BOX:regress:ENTRY:k1_ce:attempt-1";
+  const intent = {
+    client_order_id: clientOrderId,
+    broker_order_id: brokerOrderId,
+    broker_tag: tag,
+    role: "k1_ce",
+    trade_id: "T-regress",
+    attempt_id: "attempt-1",
+    purpose: "ENTRY",
+    phase: "entry",
+    exchange: "NFO",
+    tradingsymbol: "NIFTY26OCT25000CE",
+    token: 1001,
+    side: "BUY",
+    quantity: 75,
+    reference_price: 12,
+    tick_size: 0.05,
+    max_chase_ticks: 3,
+    limit_price: 12.15,
   };
+  const snapshot = {
+    client_order_id: clientOrderId,
+    broker_order_id: brokerOrderId,
+    tag,
+    role: "k1_ce",
+    trade_id: "T-regress",
+    attempt_id: "attempt-1",
+    purpose: "ENTRY",
+    phase: "entry",
+    exchange: "NFO",
+    tradingsymbol: "NIFTY26OCT25000CE",
+    token: 1001,
+    side: "BUY",
+    quantity: 75,
+    filled_quantity: 0,
+    pending_quantity: 75,
+    average_price: null,
+    state: "OPEN",
+    limit_price: 12.15,
+    pricing: {
+      order_type: "LIMIT",
+      reference_price: 12,
+      tick_size: 0.05,
+      max_chase_ticks: 3,
+      limit_price: 12.15,
+    },
+    fills: [],
+    reject_reason: null,
+    created_at: 0,
+    updated_at: 0,
+  };
+  return { clientOrderId, intent, snapshot };
 }
 
-function kiteTransport() {
-  return {
-    async placeOrder(req, opts) { opts?.beforeSend?.(); return { order_id: "K-9" }; },
-    async cancelOrder() {},
-    async modifyOrder() {},
-    async getOrder() { return { order_id: "K-9", status: "OPEN", filled_quantity: 0, quantity: 75, average_price: 0 }; },
-    async listOrders() { return []; },
-    async listPositions() { return []; },
-    async health() { return { authenticated: true, message: null, checked_at: 0 }; },
-  };
-}
+const INERT_TRANSPORT = {
+  async placeOrder() { return { order_id: "K-9" }; },
+  async cancelOrder() {},
+  async modifyOrder() {},
+  async getOrder() { return { order_id: "K-9", status: "OPEN", filled_quantity: 0, quantity: 75, average_price: 0 }; },
+  async listOrders() { return []; },
+  async listPositions() { return []; },
+  async health() { return { authenticated: true, message: null, checked_at: 0 }; },
+};
+
+const INERT_DHAN_CLIENT = {
+  async placeOrder() { return { orderId: "D-9", orderStatus: "TRANSIT" }; },
+  async cancelOrder() { return { orderId: "D-9", orderStatus: "CANCELLED" }; },
+  async modifyOrder() { return { orderId: "D-9", orderStatus: "PENDING" }; },
+  async getOrder() { return { orderId: "D-9", orderStatus: "PENDING", filledQty: 0, quantity: 75, averageTradedPrice: 0 }; },
+  async getOrderByCorrelation() { return null; },
+  async listOrders() { return []; },
+  async listPositions() { return []; },
+  async getTradesForOrder() { return []; },
+  async health() { return { authenticated: true, message: null, checked_at: 0 }; },
+};
 
 test("[REAL KiteBrokerAdapter] CANCELLED carrying a STALE quantity still cancels the remainder", async () => {
-  const clock = fakeClock();
-  const adapter = new KiteBrokerAdapter(kiteTransport(), kiteAdapterConfig(), clock);
-  const clientOrderId = "BOX:regress:ENTRY:k1_ce:attempt-1";
-
-  // Get a real order into the adapter's session snapshot, then partially fill it on the stream.
-  const submitted = adapter.submitOrder({
-    client_order_id: clientOrderId,
-    role: "k1_ce", purpose: "ENTRY", phase: "entry",
-    exchange: "NFO", tradingsymbol: "NIFTY26OCT25000CE", token: 1001,
-    side: "BUY", quantity: 75,
-    pricing: { order_type: "LIMIT", reference_price: 12, tick_size: 0.05, max_chase_ticks: 3, limit_price: 12.15 },
+  const adapter = new KiteBrokerAdapter(INERT_TRANSPORT, LIVE_ADAPTER_CONFIG, {
+    now: () => 1000,
+    wait: () => Promise.resolve(),
   });
-  await Promise.resolve();
-  await Promise.resolve();
+  const { clientOrderId, intent, snapshot } = adoption("K-9");
+  await adapter.adoptOrder(intent, snapshot);
 
   const partial = adapter.applyOrderUpdate({
     clientOrderId, brokerOrderId: "K-9",
@@ -639,61 +697,36 @@ test("[REAL KiteBrokerAdapter] CANCELLED carrying a STALE quantity still cancels
     "CANCELLED",
     "but the CANCELLATION of the remainder is applied — it used to be discarded with the stale quantity",
   );
-  await submitted.catch(() => undefined);
 });
 
-test("[REAL KiteBrokerAdapter] a regression that brings NO state change is still ignored outright", async () => {
-  const clock = fakeClock();
-  const adapter = new KiteBrokerAdapter(kiteTransport(), kiteAdapterConfig(), clock);
-  const clientOrderId = "BOX:regress2:ENTRY:k1_ce:attempt-1";
-  const submitted = adapter.submitOrder({
-    client_order_id: clientOrderId,
-    role: "k1_ce", purpose: "ENTRY", phase: "entry",
-    exchange: "NFO", tradingsymbol: "NIFTY26OCT25000CE", token: 1001,
-    side: "BUY", quantity: 75,
-    pricing: { order_type: "LIMIT", reference_price: 12, tick_size: 0.05, max_chase_ticks: 3, limit_price: 12.15 },
+test("[REAL KiteBrokerAdapter] a regression bringing NO state change is still ignored outright", async () => {
+  const adapter = new KiteBrokerAdapter(INERT_TRANSPORT, LIVE_ADAPTER_CONFIG, {
+    now: () => 1000,
+    wait: () => Promise.resolve(),
   });
-  await Promise.resolve();
-  await Promise.resolve();
+  const { clientOrderId, intent, snapshot } = adoption("K-9");
+  await adapter.adoptOrder(intent, snapshot);
 
-  adapter.applyOrderUpdate({ clientOrderId, brokerOrderId: "K-9", cumulativeQty: 40, averagePrice: 12.2, rawStatus: "OPEN", observedAtWall: 1000 });
+  adapter.applyOrderUpdate({
+    clientOrderId, brokerOrderId: "K-9",
+    cumulativeQty: 40, averagePrice: 12.2, rawStatus: "OPEN", observedAtWall: 1000,
+  });
   const before = adapter.streamObservationStats();
   // Same OPEN label, lower quantity: nothing new on any track.
-  adapter.applyOrderUpdate({ clientOrderId, brokerOrderId: "K-9", cumulativeQty: 10, averagePrice: 11.0, rawStatus: "OPEN", observedAtWall: 1500 });
+  adapter.applyOrderUpdate({
+    clientOrderId, brokerOrderId: "K-9",
+    cumulativeQty: 10, averagePrice: 11.0, rawStatus: "OPEN", observedAtWall: 1500,
+  });
   const after = adapter.streamObservationStats();
 
   assert.equal(after.ignored, before.ignored + 1, "a pure regression with no state change is ignored, as before");
   assert.equal(after.applied, before.applied, "and is NOT counted as applied");
-  await submitted.catch(() => undefined);
 });
 
 test("[REAL DhanBrokerAdapter] CANCELLED carrying a STALE TradedQty still cancels the remainder", async () => {
-  const client = {
-    async placeOrder() { return { orderId: "D-9", orderStatus: "TRANSIT" }; },
-    async cancelOrder() { return { orderId: "D-9", orderStatus: "CANCELLED" }; },
-    async modifyOrder() { return { orderId: "D-9", orderStatus: "PENDING" }; },
-    async getOrder() { return { orderId: "D-9", orderStatus: "PENDING", filledQty: 0, quantity: 75, averageTradedPrice: 0 }; },
-    async getOrderByCorrelation() { return null; },
-    async listOrders() { return []; },
-    async listPositions() { return []; },
-    async getTradesForOrder() { return []; },
-    async health() { return { authenticated: true, message: null, checked_at: 0 }; },
-  };
-  const adapter = new DhanBrokerAdapter(client, {
-    executionMode: "live", enabled: true, brokerMinIntervalMs: 1000,
-    ackTimeoutMs: 60_000, workingTimeoutMs: 60_000, partialTimeoutMs: 60_000,
-    cancelTimeoutMs: 5_000, maxChaseTicks: 3, maxModifications: 3,
-  });
-  const clientOrderId = "BOX:dregress:ENTRY:k1_ce:attempt-1";
-  const submitted = adapter.submitOrder({
-    client_order_id: clientOrderId,
-    role: "k1_ce", purpose: "ENTRY", phase: "entry",
-    exchange: "NFO", tradingsymbol: "NIFTY26OCT25000CE", token: 1001,
-    side: "BUY", quantity: 75,
-    pricing: { order_type: "LIMIT", reference_price: 12, tick_size: 0.05, max_chase_ticks: 3, limit_price: 12.15 },
-  });
-  await Promise.resolve();
-  await Promise.resolve();
+  const adapter = new DhanBrokerAdapter(INERT_DHAN_CLIENT, LIVE_ADAPTER_CONFIG);
+  const { clientOrderId, intent, snapshot } = adoption("D-9");
+  await adapter.adoptOrder(intent, snapshot);
 
   const partial = adapter.applyOrderUpdate({
     clientOrderId, brokerOrderId: "D-9",
@@ -713,5 +746,4 @@ test("[REAL DhanBrokerAdapter] CANCELLED carrying a STALE TradedQty still cancel
     "CANCELLED",
     "and the cancellation of the remainder is applied rather than discarded with the stale quantity",
   );
-  await submitted.catch(() => undefined);
 });
