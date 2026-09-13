@@ -53,6 +53,7 @@ import {
 import {
   OrderStreamStateMachine,
   type OperationPermissions,
+  type OrderStreamAuthEvidence,
   type OrderStreamLifecycleState,
 } from "./streamHealthPolicy.js";
 import type { BrokerAdapter, ExternalOrderUpdate } from "./brokerAdapter.js";
@@ -100,7 +101,17 @@ export interface OrderStreamConsumerOptions {
    */
   readonly reconcileSweep?: (
     ingestRest: (obs: IncomingObservation) => IngestResult,
-  ) => Promise<void>;
+  ) => Promise<ReconcileSweepOutcome | void>;
+  /**
+   * Bounded-retry shape for a sweep that FAILED or came back inconsistent. A reconciliation that
+   * cannot complete must be retried — otherwise a single transient REST failure strands the stream in
+   * RECONCILING until the next reconnect, which for a stable socket may be never — but it must not be
+   * retried in a tight loop, because the recovery path shares the broker's rate-limit budget with the
+   * cancels and exits that a degraded stream makes MORE likely to be needed. So retries back off
+   * exponentially and are then capped, giving a steady, predictable worst-case call rate.
+   */
+  readonly reconcileRetryBaseMs?: number;
+  readonly reconcileRetryMaxMs?: number;
   /**
    * Expected-idle bound (ms). A connected stream that delivers NO event for longer than this WHILE
    * a working order is outstanding is demoted to DEGRADED by {@link evaluateIdle} (D5). Silence on
@@ -118,6 +129,30 @@ export type IncomingObservation = Omit<NormalizedOrderObservation, "source"> & {
   readonly observedAtWall?: number | null;
   readonly observedAtMono?: number | null;
 };
+
+/**
+ * THE VERDICT OF A RECONCILIATION SWEEP — not merely "did the promise resolve".
+ *
+ * A sweep that ran to completion has still proven nothing if what it FOUND was a durable order the
+ * broker has never heard of, or a position that disagrees with our ledger. Resolving without throwing
+ * is not synchronization; it is only the absence of a transport error. So the sweep reports an
+ * explicit verdict and the consumer refuses to leave RECONCILING unless that verdict says the account
+ * is genuinely consistent.
+ *
+ * A sweep may also return nothing at all (`void`). That is treated as a consistent verdict for
+ * backwards compatibility with callers that predate this type, and is why the PRODUCTION sweep in
+ * `engine.ts` returns an explicit object: silence must not be how production claims readiness.
+ */
+export interface ReconcileSweepOutcome {
+  /** Whether the account is genuinely consistent and the stream may be trusted for new entry. */
+  readonly synchronized: boolean;
+  /** Operator-readable reason when `synchronized` is false. Never a secret. */
+  readonly reason?: string;
+  /** Durable orders the sweep could not resolve against the broker. */
+  readonly unresolvedOrders?: number;
+  /** Inconsistencies the sweep observed (missing orders, position mismatches). */
+  readonly discrepancies?: number;
+}
 
 /**
  * SECTION 7 — THE ONE MAPPING from the governing lifecycle to the published order-stream state.
@@ -154,8 +189,27 @@ export function publishedStateForLifecycle(lifecycle: OrderStreamLifecycleState)
   }
 }
 
-/** Operator-readable sentence for a lifecycle state, used when it supersedes the projection's. */
-function describeLifecycle(lifecycle: OrderStreamLifecycleState): string {
+/**
+ * Operator-readable sentence for a lifecycle state, used when it supersedes the projection's.
+ *
+ * `evidence` and `sweepFailure` are woven into the RECONCILING/AUTHENTICATING sentences on purpose.
+ * The published `health` object is a CLOSED contract schema, so the honest reporting of
+ * authentication uncertainty and of a stalled reconciliation has to travel through the free-form
+ * `detail` field rather than through new fields that no frontend has agreed to yet. An operator
+ * reading "authorisation is ASSUMED (Dhan publishes no acknowledgement)" is being told the truth that
+ * `authorised: true` on its own would hide.
+ */
+function describeLifecycle(
+  lifecycle: OrderStreamLifecycleState,
+  evidence: OrderStreamAuthEvidence = "none",
+  sweepFailure: string | null = null,
+): string {
+  const assumed =
+    evidence === "login_submitted"
+      ? " Authorisation is ASSUMED, not acknowledged: the login frame was sent and has not been " +
+        "rejected, but this protocol publishes no authentication response, so only a successful " +
+        "REST round trip can establish the session."
+      : "";
   switch (lifecycle) {
     case "DISABLED":
       return "Order-update stream disabled — fills are observed by REST polling only.";
@@ -164,7 +218,11 @@ function describeLifecycle(lifecycle: OrderStreamLifecycleState): string {
     case "AUTHENTICATING":
       return "Order-update socket open but not yet authorised — a route is not readiness.";
     case "RECONCILING":
-      return "Order-update stream connected — a REST reconciliation is owed before it is trusted.";
+      return (
+        "Order-update stream connected — a REST reconciliation is owed before it is trusted." +
+        assumed +
+        (sweepFailure === null ? "" : ` Reconciliation is not complete: ${sweepFailure}`)
+      );
     case "READY":
       return "Order-update stream live — fills observed here first, REST reconciles.";
     case "DEGRADED":
@@ -204,6 +262,23 @@ export class OrderStreamConsumer {
   /** Wall-clock ms of the last event delivered by the STREAM (never a REST poll). */
   private lastStreamEventAtWall: number | null = null;
   private readonly expectedIdleMs: number;
+  /**
+   * The single in-flight reconciliation sweep, or null. Present so duplicate connection callbacks and
+   * the status-path poll driver COALESCE onto one sweep per broker account instead of each launching
+   * their own — which would multiply REST load on exactly the path that also has to serve recovery.
+   */
+  private sweepInFlight: Promise<void> | null = null;
+  /** Consecutive failed/inconsistent sweeps, driving the bounded exponential backoff. */
+  private sweepAttempts = 0;
+  /** Earliest wall time at which another sweep may be attempted. Null ⇒ no restriction. */
+  private nextSweepNotBeforeWall: number | null = null;
+  /** Why the last sweep did not synchronize. Operator-visible; never a secret. */
+  private lastSweepFailure: string | null = null;
+  private lastSweepUnresolvedOrders = 0;
+  private lastSweepDiscrepancies = 0;
+  private sweepsStarted = 0;
+  private sweepsSynchronized = 0;
+  private sweepsDiscardedStaleEpoch = 0;
 
   constructor(opts: OrderStreamConsumerOptions) {
     this.opts = opts;
@@ -376,11 +451,31 @@ export class OrderStreamConsumer {
     this.machine.onSocketOpen();
   }
 
-  /** Authorised. Always enters RECONCILING (a gap is owed, even on first connect). */
-  onAuthenticated(): void {
+  /**
+   * The login frame has been submitted and the transport believes the session is usable. Always
+   * enters RECONCILING (a gap is owed, even on first connect).
+   *
+   * `evidence` says how strong that belief is. It defaults to `login_submitted` — the honest reading
+   * for Dhan, whose order-update socket sends no authentication acknowledgement, so "authorised" on
+   * open is an assumption that only a successful REST round trip can upgrade. Passing
+   * `broker_acknowledged` is reserved for a transport that genuinely received one.
+   *
+   * A repeat call for a connection already being reconciled is absorbed by the machine, so duplicate
+   * transport callbacks cannot advance the epoch out from under the sweep they just triggered.
+   */
+  onAuthenticated(evidence: OrderStreamAuthEvidence = "login_submitted"): void {
     const reconnect = this.machine.isReconnect();
-    this.machine.onAuthenticated();
+    const priorGeneration = this.machine.generation();
+    this.machine.onAuthenticated(evidence);
+    if (this.machine.generation() === priorGeneration) {
+      // Duplicate callback for the epoch already in flight: no new gap, nothing to re-arm.
+      return;
+    }
     this.proj.onStreamConnected({ authorised: true, reconnect });
+    // A new epoch invalidates any backoff earned by the previous connection's failures: this
+    // connection deserves an immediate first attempt.
+    this.sweepAttempts = 0;
+    this.nextSweepNotBeforeWall = null;
     // A fresh (re)connect resets the idle clock: silence is measured from when the socket became
     // authorised, not from a stale pre-disconnect event.
     this.lastStreamEventAtWall = this.now();
@@ -389,10 +484,29 @@ export class OrderStreamConsumer {
   /**
    * The reconnect reconciliation sweep is complete and consistent. ONLY path to READY. The caller
    * invokes this AFTER it has fed every reconciled REST observation back via ingestRestObservation.
+   *
+   * `atGeneration` scopes the claim to one connection epoch. A caller that did asynchronous work
+   * MUST pass the generation it captured before starting, so a late result cannot promote a newer
+   * connection whose gap it never examined. Returns whether the claim was actually applied.
    */
-  markSynchronized(): void {
-    this.machine.markSynchronized();
-    this.proj.markReconciled();
+  markSynchronized(atGeneration?: number): boolean {
+    const applied = this.machine.markSynchronized(atGeneration);
+    if (applied) this.proj.markReconciled();
+    return applied;
+  }
+
+  /** The current connection epoch, for a caller that must scope an asynchronous claim to it. */
+  connectionGeneration(): number {
+    return this.machine.generation();
+  }
+
+  /**
+   * Record positive proof that the session behind the stream is authorised, obtained out-of-band from
+   * a successful REST call on the same credentials. Does not change the lifecycle state: a working
+   * REST session is not evidence that the SOCKET is delivering.
+   */
+  noteRestVerifiedSession(): void {
+    this.machine.noteRestVerifiedSession();
   }
 
   /**
@@ -409,21 +523,146 @@ export class OrderStreamConsumer {
    * Idempotent and safe to poll: it is a no-op unless a reconciliation is actually owed.
    */
   async runReconnectReconciliation(): Promise<void> {
+    // COALESCE DUPLICATE CONNECTION CALLBACKS INTO BOUNDED WORK. A transport may report the same
+    // connection more than once (Dhan's onopen fires per socket, and the engine also polls this from
+    // the status path). Every one of those callers must be able to call this unconditionally, so the
+    // second and subsequent callers join the sweep already running instead of starting another one
+    // against the same broker account.
+    const inFlight = this.sweepInFlight;
+    if (inFlight) return inFlight;
     if (!this.reconcilePending()) return;
     const sweep = this.opts.reconcileSweep;
     if (!sweep) {
       // No explicit sweep supplied: nothing can prove consistency, so stay RECONCILING. This is
       // deliberately conservative — a gap that cannot be repaired must not silently read READY.
+      this.lastSweepFailure =
+        "no reconciliation sweep is wired, so nothing can prove the account is synchronized";
       return;
     }
+    // CAPTURE THE EPOCH BEFORE THE AWAIT. Everything below is asynchronous and the socket may drop,
+    // the session may be rejected, or a NEWER connection may authorise while it runs. The result is
+    // only allowed to apply to the connection it actually examined.
+    const startedAtGeneration = this.machine.generation();
+    // PUBLISH THE IN-FLIGHT BARRIER SYNCHRONOUSLY, before any of the sweep's own code can run. If the
+    // barrier were only installed after `executeSweep` had already reached its first await, a
+    // re-entrant call — from inside the sweep, or from a socket callback the sweep provokes — would
+    // find no sweep in flight and launch a second one against the same broker account. That is the
+    // re-entrant sweep loop this must not have.
+    let release: () => void = () => {};
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.sweepInFlight = barrier;
     try {
-      await sweep((obs) => this.ingestRestObservation(obs, "reconciliation"));
-      // The sweep completed and every recovered observation is in the single projection. NOW the
-      // machine may leave RECONCILING.
-      this.markSynchronized();
-    } catch {
-      // Fail-open: leave RECONCILING/DISCONNECTED as-is; the next poll retries. Never throw.
+      await this.executeSweep(sweep, startedAtGeneration);
+    } finally {
+      if (this.sweepInFlight === barrier) this.sweepInFlight = null;
+      release();
     }
+  }
+
+  private async executeSweep(
+    sweep: NonNullable<OrderStreamConsumerOptions["reconcileSweep"]>,
+    startedAtGeneration: number,
+  ): Promise<void> {
+    this.sweepsStarted++;
+    let outcome: ReconcileSweepOutcome | void;
+    try {
+      outcome = await sweep((obs) => this.ingestRestObservation(obs, "reconciliation"));
+    } catch (err) {
+      // Fail-CLOSED for readiness, fail-open for control flow: the machine stays RECONCILING (no new
+      // entry) and REST polling continues, but this never throws into a socket callback.
+      this.noteSweepFailure(
+        startedAtGeneration,
+        `reconciliation sweep failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return;
+    }
+
+    // STALE-EPOCH GUARD. If the connection this sweep examined is gone, its verdict — good or bad —
+    // describes a session that no longer exists. Discard it rather than let it promote whatever
+    // connection happens to be current now.
+    if (startedAtGeneration !== this.machine.generation()) {
+      this.sweepsDiscardedStaleEpoch++;
+      this.lastSweepFailure =
+        "a reconciliation result arrived for a superseded connection and was discarded; " +
+        "the current connection still owes its own reconciliation";
+      return;
+    }
+
+    // CHECK THE RESULT, NOT JUST THE PROMISE. `undefined` is the legacy "no verdict" shape and is
+    // treated as consistent; production supplies an explicit verdict.
+    if (outcome && outcome.synchronized !== true) {
+      const detail = outcome.reason ?? "the reconciliation sweep reported the account inconsistent";
+      this.noteSweepFailure(startedAtGeneration, detail, outcome);
+      return;
+    }
+
+    // The sweep completed, its verdict is consistent, and every recovered observation is in the
+    // single projection. NOW the machine may leave RECONCILING — and only for THIS epoch.
+    const applied = this.machine.markSynchronized(startedAtGeneration);
+    if (!applied) {
+      this.sweepsDiscardedStaleEpoch++;
+      return;
+    }
+    this.proj.markReconciled();
+    this.sweepsSynchronized++;
+    this.sweepAttempts = 0;
+    this.nextSweepNotBeforeWall = null;
+    this.lastSweepFailure = null;
+    this.lastSweepUnresolvedOrders = outcome?.unresolvedOrders ?? 0;
+    this.lastSweepDiscrepancies = outcome?.discrepancies ?? 0;
+  }
+
+  /** Record a failed/inconsistent sweep and arm a bounded, backed-off retry for the same epoch. */
+  private noteSweepFailure(
+    atGeneration: number,
+    reason: string,
+    outcome?: ReconcileSweepOutcome,
+  ): void {
+    this.lastSweepFailure = reason;
+    if (outcome) {
+      this.lastSweepUnresolvedOrders = outcome.unresolvedOrders ?? 0;
+      this.lastSweepDiscrepancies = outcome.discrepancies ?? 0;
+    }
+    // Only schedule a retry for a connection that still exists. A drop/loss already re-owes a
+    // reconciliation and will drive a fresh one on the next connect.
+    if (atGeneration !== this.machine.generation()) return;
+    this.sweepAttempts++;
+    const base = Math.max(250, this.opts.reconcileRetryBaseMs ?? 2_000);
+    const max = Math.max(base, this.opts.reconcileRetryMaxMs ?? 60_000);
+    const delay = Math.min(max, base * 2 ** Math.min(8, this.sweepAttempts - 1));
+    this.nextSweepNotBeforeWall = this.now() + delay;
+  }
+
+  /**
+   * POLL-SAFE RECONCILIATION DRIVER — the piece that makes "reconcile on initial connection and every
+   * relevant reconnect" true even when a sweep fails.
+   *
+   * The engine calls this wherever it already reads order-stream state, so a reconciliation that is
+   * owed is always being driven towards completion by SOMETHING, rather than depending on a connection
+   * edge that may not recur for hours on a stable socket. It is cheap and self-guarding:
+   *   - it does nothing unless a reconciliation is actually owed;
+   *   - it does nothing while the socket is down or the session is rejected (there is nothing to
+   *     synchronize a dead connection against, and hammering REST there would burn the rate-limit
+   *     budget that exits and cancels need);
+   *   - it respects the bounded backoff armed by the previous failure, so the worst-case REST call
+   *     rate from recovery is capped.
+   *
+   * It deliberately does NOT await: it is called from status/gate reads that must not block.
+   */
+  ensureReconciled(nowWall?: number): void {
+    if (!this.reconcilePending()) return;
+    if (this.sweepInFlight) return;
+    if (!this.opts.reconcileSweep) return;
+    const state = this.machine.state();
+    // Only a live, authorised connection can be synchronized. DISCONNECTED/AUTH_EXPIRED/DISABLED all
+    // owe a reconciliation, but it is the next successful connect that must drive it.
+    if (state !== "RECONCILING" && state !== "DEGRADED" && state !== "READY") return;
+    const now = nowWall ?? this.now();
+    const notBefore = this.nextSweepNotBeforeWall;
+    if (notBefore !== null && now < notBefore) return;
+    void this.runReconnectReconciliation();
   }
 
   /** Connected but not delivering usable events within the expected idle bound. */
@@ -454,7 +693,13 @@ export class OrderStreamConsumer {
     if (connected) {
       this.onConnecting();
       this.onSocketOpen();
-      this.onAuthenticated();
+      // ZERODHA'S AUTHORISATION IS ACKNOWLEDGED BY THE HANDSHAKE ITSELF. The Kite quote socket
+      // carries `api_key` + `access_token` in the connection request and the broker REFUSES the
+      // handshake when they are invalid, so an OPEN socket is a positive acceptance of the
+      // credentials — materially stronger evidence than Dhan's unacknowledged login frame. This is
+      // the one place a `broker_acknowledged` claim is justified, and it is justified by the
+      // transport's own semantics rather than by an assumption.
+      this.onAuthenticated("broker_acknowledged");
       return this.runReconnectReconciliation();
     }
     this.onDisconnected();
@@ -542,15 +787,24 @@ export class OrderStreamConsumer {
     const lifecycle = this.machine.state();
     const projected = this.proj.orderStreamHealth();
     const state = publishedStateForLifecycle(lifecycle);
+    const evidence = this.machine.authenticationEvidence();
+    // A RECONCILING stream whose sweep keeps failing must SAY so. Otherwise the operator sees a state
+    // that looks like a transient step in a handshake, when in fact it is a stalled recovery that will
+    // refuse new entry indefinitely — the exact failure mode that made the missing Dhan wiring silent.
+    const lifecycleSentence = describeLifecycle(lifecycle, evidence, this.lastSweepFailure);
     return {
       ...projected,
       state,
       lifecycle,
       // Either holder owing a reconciliation means one is owed. Never the narrower answer.
       reconcilePending: this.reconcilePending(),
-      // Keep the projection's own sentence when the two agree; otherwise the lifecycle wins and
-      // says so, because a stale sentence next to a corrected state is its own small lie.
-      detail: state === projected.state ? projected.detail : describeLifecycle(lifecycle),
+      // Keep the projection's own sentence when the two agree AND there is nothing extra to disclose;
+      // otherwise the lifecycle wins and says so, because a stale sentence next to a corrected state
+      // is its own small lie.
+      detail:
+        state === projected.state && this.lastSweepFailure === null && evidence !== "login_submitted"
+          ? projected.detail
+          : lifecycleSentence,
     };
   }
 
@@ -561,18 +815,47 @@ export class OrderStreamConsumer {
 
   diagnostics(): {
     lifecycle: OrderStreamLifecycleState;
+    /** The connection epoch. Advances on every authorisation, drop, session loss and disable. */
+    generation: number;
+    /** What is actually KNOWN about this session's authorisation — never upgraded by a mere send. */
+    authEvidence: OrderStreamAuthEvidence;
     streamEventsApplied: number;
     streamEventsWokeAdapter: number;
     absentEvidenceEvents: number;
     pendingReconciliations: number;
+    /** True while a post-connect/reconnect reconciliation is owed and not yet proven complete. */
+    reconcilePending: boolean;
+    /** True while a sweep is actually running (so duplicate callers coalesced onto it). */
+    reconcileInFlight: boolean;
+    sweepsStarted: number;
+    sweepsSynchronized: number;
+    /** Results that arrived for a superseded connection and were refused. */
+    sweepsDiscardedStaleEpoch: number;
+    /** Consecutive failures currently driving the bounded retry backoff. */
+    sweepAttempts: number;
+    /** Why the last sweep did not synchronize, if it did not. */
+    lastSweepFailure: string | null;
+    lastSweepUnresolvedOrders: number;
+    lastSweepDiscrepancies: number;
     projection: ReturnType<OrderUpdateProjection["diagnostics"]>;
   } {
     return {
       lifecycle: this.machine.state(),
+      generation: this.machine.generation(),
+      authEvidence: this.machine.authenticationEvidence(),
       streamEventsApplied: this.streamEventsApplied,
       streamEventsWokeAdapter: this.streamEventsWokeAdapter,
       absentEvidenceEvents: this.absentEvidenceEvents,
       pendingReconciliations: this.pendingReconciliations.size,
+      reconcilePending: this.reconcilePending(),
+      reconcileInFlight: this.sweepInFlight !== null,
+      sweepsStarted: this.sweepsStarted,
+      sweepsSynchronized: this.sweepsSynchronized,
+      sweepsDiscardedStaleEpoch: this.sweepsDiscardedStaleEpoch,
+      sweepAttempts: this.sweepAttempts,
+      lastSweepFailure: this.lastSweepFailure,
+      lastSweepUnresolvedOrders: this.lastSweepUnresolvedOrders,
+      lastSweepDiscrepancies: this.lastSweepDiscrepancies,
       projection: this.proj.diagnostics(),
     };
   }

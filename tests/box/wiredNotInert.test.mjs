@@ -218,7 +218,106 @@ test("D4: the reconnect gap-repair sweep and reconcile completion are wired", ()
   const consumer = readFileSync(new URL("../../src/box/orderStreamConsumer.ts", import.meta.url), "utf8")
     .replace(/\/\*[\s\S]*?\*\//g, "");
   assert.ok(consumer.includes("runReconnectReconciliation"), "the sweep driver must exist");
-  assert.ok(consumer.includes("this.markSynchronized()"), "the sweep must clear RECONCILING only on consistency");
+  // The sweep must clear RECONCILING only on consistency — and now only for the connection epoch it
+  // actually examined. The promotion is `this.machine.markSynchronized(startedAtGeneration)`: passing
+  // the captured epoch is what stops a late result from promoting a NEWER connection whose gap it
+  // never looked at. An unscoped promotion here would be the stale-sweep hazard back again.
+  assert.ok(
+    consumer.includes("this.machine.markSynchronized(startedAtGeneration)"),
+    "the sweep must clear RECONCILING only on consistency AND only for the epoch it examined",
+  );
+  assert.ok(
+    consumer.includes("startedAtGeneration !== this.machine.generation()"),
+    "the sweep must discard a result whose connection epoch has been superseded",
+  );
+});
+
+test("D4-DHAN: the Dhan connection actually DRIVES the reconciliation sweep (the stranding defect)", () => {
+  // THE DEFECT: engine.ts's Dhan branch called onSocketOpen()/onAuthenticated() and stopped there.
+  // onAuthenticated always OWES a reconciliation and markSynchronized is the only exit, so every Dhan
+  // connection sat in RECONCILING and the live entry checkpoint refused every box forever.
+  const engine = code("engine.ts");
+  const wiring = readFileSync(new URL("../../src/box/dhanOrderStreamWiring.ts", import.meta.url), "utf8")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/.*$/gm, "");
+
+  // The engine must use the extracted production wiring rather than re-implementing the lifecycle,
+  // so the handlers a test drives are the handlers production uses.
+  assert.ok(
+    engine.includes("createDhanOrderStreamHandlers(consumer"),
+    "the Dhan feed must be wired through the extracted production handler factory",
+  );
+  // And that factory must drive the sweep on an authorised connection.
+  assert.ok(
+    wiring.includes("consumer.onAuthenticated("),
+    "the wiring must drive the authenticated transition",
+  );
+  assert.ok(
+    wiring.includes("consumer.runReconnectReconciliation()"),
+    "the wiring MUST start the gap-repair sweep — its absence was the stranding defect",
+  );
+  // Authentication evidence must stay honest: Dhan acknowledges nothing, so the wiring must say
+  // `login_submitted`, never claim the broker agreed.
+  assert.ok(
+    wiring.includes('consumer.onAuthenticated("login_submitted")'),
+    "Dhan's unacknowledged login must be recorded as submitted, not as broker-acknowledged",
+  );
+});
+
+test("D4-DHAN: a targeted single-order reconcile must NOT make an account-wide readiness claim", () => {
+  // The old `restReconcile` called consumer.markSynchronized() after resolving ONE order's missing
+  // quantity, promoting the whole account to READY on single-order evidence — and providing an
+  // accidental back door out of RECONCILING that masked the missing Dhan sweep.
+  const engine = code("engine.ts");
+  const restReconcileStart = engine.indexOf("restReconcile: async (");
+  assert.ok(restReconcileStart > 0, "the targeted REST reconcile callback must exist");
+  const restReconcileBody = engine.slice(restReconcileStart, restReconcileStart + 900);
+  assert.ok(
+    !restReconcileBody.includes("consumer.markSynchronized("),
+    "a targeted single-order reconcile must never claim account-wide synchronization",
+  );
+  assert.ok(
+    restReconcileBody.includes("consumer.noteRestVerifiedSession()"),
+    "what it legitimately proves is that the SESSION is authorised, so that is all it may record",
+  );
+});
+
+test("D4-DHAN: the production sweep returns a CHECKED verdict, not silence", () => {
+  // `runReconnectReconciliation` used to promote on promise resolution alone, and the sweep was
+  // `await this.orderManager?.reconcile()` — so with no order manager the expression resolved to
+  // undefined and the stream went READY having examined precisely nothing.
+  const engine = code("engine.ts");
+  const sweepStart = engine.indexOf("reconcileSweep: async (");
+  assert.ok(sweepStart > 0, "the production sweep must exist");
+  const sweepBody = engine.slice(sweepStart, sweepStart + 3000);
+  assert.ok(
+    sweepBody.includes("synchronized: false"),
+    "the sweep must be able to report the account INCONSISTENT rather than only resolving",
+  );
+  assert.ok(
+    sweepBody.includes("report.missingAtBroker.length") && sweepBody.includes("report.positionMismatches.length"),
+    "the sweep must inspect the reconcile report's discrepancies, not just that it resolved",
+  );
+  assert.ok(
+    !sweepBody.includes("await this.orderManager?.reconcile()"),
+    "an optional-chained reconcile resolves to undefined with no manager and proves nothing",
+  );
+});
+
+test("D4-DHAN: an owed reconciliation is driven from a path that is actually polled", () => {
+  // A connection edge is otherwise the ONLY trigger, so a single transient REST failure would strand
+  // the stream until the next reconnect — on a stable socket, potentially never.
+  const engine = code("engine.ts");
+  assert.ok(
+    engine.includes("consumer.ensureReconciled("),
+    "the engine must drive an owed reconciliation from the status/gate read path",
+  );
+  const consumer = readFileSync(new URL("../../src/box/orderStreamConsumer.ts", import.meta.url), "utf8")
+    .replace(/\/\*[\s\S]*?\*\//g, "");
+  assert.ok(
+    consumer.includes("nextSweepNotBeforeWall"),
+    "the retry must be bounded by a backoff so recovery cannot flood the broker rate limit",
+  );
 });
 
 test("D5: idleness is DRIVEN from a real clock against working-order expectation", () => {
