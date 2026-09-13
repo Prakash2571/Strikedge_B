@@ -1075,7 +1075,27 @@ export class BoxEngine {
         if (!m || typeof m.available !== "number" || !Number.isFinite(m.available)) return null;
         // `observedAt` is stamped HERE, when the broker answer is in hand. The gateway captures its
         // evaluation instant AFTER every read has settled, so this can never produce a negative age.
-        return { availableRupees: m.available, observedAt: Date.now() };
+        return {
+          availableRupees: m.available,
+          // THE ENCUMBRANCE, FROM THE ENDPOINT THAT ACTUALLY REPORTS IT.
+          //
+          // This was being read from the broker and then thrown away. The stage-funding model was
+          // separately handed `encumbranceRupees: null` from the BASKET-MARGIN provider with the
+          // comment "not observable from the basket endpoint" — true of that endpoint, but the FUNDS
+          // endpoint reports it, and this call already had the answer in hand. So strict stage
+          // funding could never establish a requirement and had to be left disabled, which in turn
+          // meant admission fell back to the FINAL (completed-basket, spread-benefit) margin — the
+          // exact figure the stage model exists to stop being used as proof that the account can
+          // fund the sequence that creates the box.
+          //
+          // MISSING IS NOT ZERO. `numberOrNull`/`numericPath` in the adapters yield null when the
+          // field is absent, and that null is preserved here rather than collapsed to 0. A reported
+          // zero utilisation is a real, trustworthy figure and stays 0; an ABSENT one stays null and
+          // makes the funding gate refuse. `Number.isFinite(0)` is true, so presence is decided by
+          // the adapter's null, never inferred from the value.
+          utilisedRupees: typeof m.utilised === "number" && Number.isFinite(m.utilised) ? m.utilised : null,
+          observedAt: Date.now(),
+        };
       },
       plannedMargin: async (requests) => {
         const orders = requests.map((r) => ({
@@ -1105,9 +1125,12 @@ export class BoxEngine {
           observedAt: Date.now(),
           initialMarginRupees: Number.isFinite(basket.initial) ? basket.initial : null,
           finalMarginRupees: Number.isFinite(basket.final) ? basket.final : null,
-          // Not observable from the basket endpoint. NULL means UNKNOWN — with the stage-funding
-          // control enabled this refuses, rather than assuming nothing else is blocked on the
-          // account. Other applications trading the same account are exactly this hazard.
+          // STILL NULL HERE, AND THAT IS NOW CORRECT RATHER THAN A GAP. The basket-margin endpoint
+          // genuinely does not report account encumbrance; it prices a hypothetical basket. The
+          // encumbrance now arrives from the FUNDS provider above, which is the endpoint that reports
+          // it — and which is also where the `available` figure comes from, so the two are read from
+          // one response and cannot disagree with each other. The gateway prefers the funds-derived
+          // value and falls back to this only if a future provider can supply it.
           encumbranceRupees: null,
         };
       },
